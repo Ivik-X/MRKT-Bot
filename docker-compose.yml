@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  mrkt-bot:
+    build: .
+    container_name: mrkt-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./tokens.txt:/app/tokens.txt:ro
+      - ./proxies.txt:/app/proxies.txt:ro
+      - ./logs:/app/logs

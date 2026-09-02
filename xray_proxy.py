@@ -183,7 +183,7 @@ class XrayProcess:
 
     @property
     def socks_url(self) -> str:
-        return f"socks5://127.0.0.1:{self.cfg.local_port}"
+        return f"socks5h://127.0.0.1:{self.cfg.local_port}"
 
     def start(self) -> None:
         xray_cfg = _build_xray_config(self.cfg)

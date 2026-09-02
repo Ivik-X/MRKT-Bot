@@ -1,0 +1,3 @@
+# VLESS прокси — по одному на строку
+# Пример:
+# vless://uuid@host:port?security=reality&sni=example.com&pbk=PUBLIC_KEY&sid=SHORT_ID&type=tcp#proxy1

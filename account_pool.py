@@ -10,6 +10,7 @@ account_pool.py — пул (токен, прокси) слотов.
 
 from __future__ import annotations
 
+import asyncio
 import itertools
 import os
 import threading
@@ -21,7 +22,7 @@ from xray_proxy import XrayProcess, load_proxies
 
 
 # Минимальный интервал между запросами через один слот (секунды)
-SLOT_COOLDOWN = float(os.getenv("SLOT_COOLDOWN", 5.0))
+SLOT_COOLDOWN = float(os.getenv("SLOT_COOLDOWN", 1.5))
 # Кулдаун при 429 (секунды)
 PENALTY_SECONDS = float(os.getenv("PENALTY_SECONDS", 60.0))
 
@@ -35,6 +36,8 @@ class Slot:
     """Один (токен + прокси) слот для API запросов."""
     token: str
     proxy: Optional[XrayProcess] = None
+    disabled: bool = False
+    timeout_count: int = 0
     # Время когда слот снова доступен (monotonic)
     _available_at: float = field(default=0.0, init=False, repr=False)
 
@@ -59,7 +62,8 @@ class Slot:
     def label(self) -> str:
         tok = self.token[:8] + "…"
         prx = self.proxy.cfg.name if self.proxy else "direct"
-        return f"{tok} @ {prx}"
+        status = " [отключён >1.5с]" if self.disabled else ""
+        return f"{tok} @ {prx}{status}"
 
     def mark_used(self) -> None:
         """Помечаем слот использованным — следующий раз не раньше чем через SLOT_COOLDOWN."""
@@ -68,6 +72,16 @@ class Slot:
     def penalize(self, seconds: float = PENALTY_SECONDS) -> None:
         """429 — запрещаем слот на N секунд."""
         self._available_at = time.monotonic() + seconds
+
+    def record_timeout(self) -> None:
+        """Таймаут или ответ >1.5с — отключение слота."""
+        self.timeout_count += 1
+        if self.timeout_count >= 2:
+            self.disabled = True
+
+    def reset_stats(self) -> None:
+        self.timeout_count = 0
+        self.disabled = False
 
     @property
     def available_at(self) -> float:
@@ -80,9 +94,9 @@ class Slot:
 
 class AccountPool:
     """
-    LRU пул слотов. Thread-safe.
-    Всегда выдаёт слот с самым ранним временем доступности.
-    Если все слоты на кулдауне — ждёт самый быстрый.
+    LRU пул слотов. Thread-safe и Async-safe.
+    Всегда выдаёт доступный активный слот (LRU).
+    Пропускает disabled (тормозящие) слоты.
     """
 
     def __init__(self, slots: list[Slot]):
@@ -90,16 +104,39 @@ class AccountPool:
             raise ValueError("AccountPool: список слотов пуст")
         self._slots = slots
         self._lock = threading.Lock()
+        self._async_lock = asyncio.Lock()
+
+    async def next_async(self) -> Slot:
+        """
+        Асинхронно выдаёт следующий доступный активный слот (LRU).
+        Если слот на кулдауне — await asyncio.sleep() без блокировки потока.
+        """
+        async with self._async_lock:
+            active = [s for s in self._slots if not s.disabled]
+            if not active:
+                for s in self._slots:
+                    s.reset_stats()
+                active = self._slots
+
+            now = time.monotonic()
+            best = min(active, key=lambda s: s.available_at)
+            wait = best.available_at - now
+            if wait > 0:
+                await asyncio.sleep(wait)
+            best.mark_used()
+            return best
 
     def next(self) -> Slot:
-        """
-        Возвращает следующий доступный слот (LRU).
-        Если все на кулдауне — ждёт самый «быстрый».
-        """
+        """Синхронный метод получения слота (LRU)."""
         with self._lock:
+            active = [s for s in self._slots if not s.disabled]
+            if not active:
+                for s in self._slots:
+                    s.reset_stats()
+                active = self._slots
+
             now = time.monotonic()
-            # Сортируем по времени доступности
-            best = min(self._slots, key=lambda s: s.available_at)
+            best = min(active, key=lambda s: s.available_at)
             wait = best.available_at - now
             if wait > 0:
                 time.sleep(wait)
@@ -122,9 +159,10 @@ class AccountPool:
         return len(self._slots)
 
     def __repr__(self) -> str:
+        active = sum(1 for s in self._slots if not s.disabled)
         direct = sum(1 for s in self._slots if not s.proxy)
         proxied = len(self._slots) - direct
-        return f"AccountPool({len(self._slots)} слотов: {direct} direct, {proxied} через прокси)"
+        return f"AccountPool({len(self._slots)} слотов [{active} активных]: {direct} direct, {proxied} через прокси)"
 
 
 # ─────────────────────────────────────────────

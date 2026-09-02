@@ -218,3 +218,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# MRKT Bot local secret files and logs
+tokens.txt
+proxies.txt
+logs/
+debug_snapshot.py

@@ -25,6 +25,7 @@ from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
 from curl_cffi import requests as cffi_requests
+from curl_cffi.requests import AsyncSession
 from dotenv import load_dotenv
 
 from account_pool import AccountPool, Slot, build_pool
@@ -35,13 +36,15 @@ load_dotenv()
 #  Конфиг
 # ─────────────────────────────────────────────
 
-MARKET_API_URL      = "https://api.tgmrkt.io/api/v1"
-SCAN_INTERVAL       = int(os.getenv("SCAN_INTERVAL", 30))
-DISCOUNT_THRESHOLD  = float(os.getenv("DISCOUNT_THRESHOLD", 20)) / 100
-BLACK_FLOOR_REFRESH = int(os.getenv("BLACK_FLOOR_REFRESH", 10))
-MAX_RETRIES         = int(os.getenv("MAX_RETRIES", 3))
-PENALTY_429         = float(os.getenv("PENALTY_429", 60.0))
-LOG_DIR             = Path(os.getenv("LOG_DIR", "logs"))
+MARKET_API_URL       = "https://api.tgmrkt.io/api/v1"
+SCAN_INTERVAL        = int(os.getenv("SCAN_INTERVAL", 30))
+MIN_TON_DIFF         = float(os.getenv("MIN_TON_DIFF", 2.5))
+CHEAP_PRICE_THRESHOLD = float(os.getenv("CHEAP_PRICE_THRESHOLD", 3.0))  # абсолютный порог: < N TON → всегда сделка
+BLACK_FLOOR_REFRESH  = int(os.getenv("BLACK_FLOOR_REFRESH", 10))
+REQUEST_TIMEOUT      = float(os.getenv("REQUEST_TIMEOUT", 1.5))       # Таймаут: >1.5с отключает медленный прокси
+MAX_RETRIES          = int(os.getenv("MAX_RETRIES", 3))
+PENALTY_429          = float(os.getenv("PENALTY_429", 60.0))
+LOG_DIR              = Path(os.getenv("LOG_DIR", "logs"))
 
 BLACK_BACKDROPS = {"Black"}
 
@@ -138,6 +141,7 @@ SEPARATOR = "─" * 60
 def log_deal_to_file(deal: dict) -> None:
     """Записывает сделку в deals.jsonl (один JSON объект на строку)."""
     gift = deal["gift"]
+    diff_ton = deal.get("diff_ton", tons(deal["floor"] - deal["price"]))
     row = {
         "ts": datetime.utcnow().isoformat(timespec="seconds") + "Z",
         "type": deal["type"],
@@ -150,6 +154,7 @@ def log_deal_to_file(deal: dict) -> None:
         "price_ton": round(tons(deal["price"]), 4),
         "floor_nanoton": deal["floor"],
         "floor_ton": round(tons(deal["floor"]), 4),
+        "profit_ton": round(diff_ton, 4),
         "discount_pct": round(deal["pct"], 2),
         "floor_src": deal.get("floor_src", ""),
         "url": gift_url(gift),
@@ -158,19 +163,85 @@ def log_deal_to_file(deal: dict) -> None:
     deals_log.info(json.dumps(row, ensure_ascii=False))
 
 
+def log_error_to_file(error_type: str, message: str, slot_label: str = "", endpoint: str = "") -> None:
+    """Записывает событие ошибки в logs/errors.jsonl."""
+    row = {
+        "ts": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "type": error_type,
+        "endpoint": endpoint,
+        "slot": slot_label,
+        "message": str(message),
+    }
+    try:
+        with open(LOG_DIR / "errors.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+class StatsTracker:
+    def __init__(self):
+        self.started_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        self.scans_completed = 0
+        self.new_gifts_found = 0
+        self.deals_found = 0
+        self.errors_count = 0
+        self.errors_by_type: dict[str, int] = {}
+        self.collections_summary: dict[str, int] = {}
+
+    def record_scan(self, new_gifts: list[dict], deals_count: int = 0) -> None:
+        self.scans_completed += 1
+        self.new_gifts_found += len(new_gifts)
+        self.deals_found += deals_count
+        for g in new_gifts:
+            col = g.get("collectionName", "Unknown")
+            self.collections_summary[col] = self.collections_summary.get(col, 0) + 1
+        self.save()
+
+    def record_error(self, err_type: str, msg: str = "", slot_label: str = "", endpoint: str = "") -> None:
+        self.errors_count += 1
+        self.errors_by_type[err_type] = self.errors_by_type.get(err_type, 0) + 1
+        log_error_to_file(err_type, msg, slot_label, endpoint)
+        self.save()
+
+    def save(self) -> None:
+        try:
+            data = {
+                "started_at": self.started_at,
+                "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                "scans_completed": self.scans_completed,
+                "new_gifts_found": self.new_gifts_found,
+                "deals_found": self.deals_found,
+                "errors_count": self.errors_count,
+                "errors_by_type": self.errors_by_type,
+                "top_collections": dict(sorted(self.collections_summary.items(), key=lambda x: x[1], reverse=True)[:30]),
+            }
+            with open(LOG_DIR / "night_stats.json", "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+
+stats_tracker = StatsTracker()
+
+
+class AuthTokenExpiredError(Exception):
+    """Исключение: просроченный или невалидный токен (HTTP 401)."""
+    pass
+
+
 # ─────────────────────────────────────────────
 #  API с retry и логированием
 # ─────────────────────────────────────────────
 
-def api_post(endpoint: str, json_data: dict, pool: AccountPool) -> dict:
+async def api_post_async(endpoint: str, json_data: dict, pool: AccountPool, session: AsyncSession) -> dict:
     """
-    POST запрос с автоматическим retry и обработкой 429.
-    При 429: штрафуем текущий слот и пробуем следующий.
+    Асинхронный POST запрос через AsyncSession с обработкой 429 и отключением медленных прокси (>1.5с).
     """
     last_exc: Exception | None = None
 
     for attempt in range(MAX_RETRIES):
-        slot = pool.next()
+        slot = await pool.next_async()
         t0 = time.monotonic()
 
         log.debug(
@@ -179,14 +250,26 @@ def api_post(endpoint: str, json_data: dict, pool: AccountPool) -> dict:
         )
 
         try:
-            r = cffi_requests.post(
+            r = await session.post(
                 f"{MARKET_API_URL}{endpoint}",
                 headers=slot.headers,
                 json=json_data,
                 proxies=slot.proxies,
-                timeout=15,
+                timeout=REQUEST_TIMEOUT,
             )
             elapsed = time.monotonic() - t0
+
+            if elapsed > REQUEST_TIMEOUT:
+                slot.record_timeout()
+                if slot.disabled:
+                    log.warning("⚠️ Слот [%s] ответил за %.2fс (>%.1fс) — прокси отключён как медленный", slot.label, elapsed, REQUEST_TIMEOUT)
+                    print(f"\n⚠️  Прокси [{slot.label}] отключён (>1.5с, {elapsed:.1f}с)")
+
+            if r.status_code == 401:
+                log.error("HTTP 401 Unauthorized | Токен просрочен (слот: %s)", slot.label)
+                stats_tracker.record_error("HTTP 401", f"Токен просрочен (слот: {slot.label})", slot.label, endpoint)
+                last_exc = AuthTokenExpiredError(f"HTTP 401: Токен просрочен (слот: {slot.label})")
+                continue
 
             if r.status_code == 429:
                 retry_after = float(r.headers.get("Retry-After", PENALTY_429))
@@ -195,6 +278,7 @@ def api_post(endpoint: str, json_data: dict, pool: AccountPool) -> dict:
                     slot.label, retry_after, elapsed,
                 )
                 pool.penalize(slot, retry_after)
+                stats_tracker.record_error("HTTP 429", f"Too Many Requests (penalty {retry_after}s)", slot.label, endpoint)
                 last_exc = Exception(f"HTTP 429 (слот: {slot.label})")
                 continue
 
@@ -205,29 +289,39 @@ def api_post(endpoint: str, json_data: dict, pool: AccountPool) -> dict:
             )
             return r.json()
 
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             elapsed = time.monotonic() - t0
+            err_name = type(e).__name__
+            if "Timeout" in err_name or "timed out" in str(e).lower():
+                slot.record_timeout()
+                if slot.disabled:
+                    log.warning("⚠️ Слот [%s] превысил таймаут %.1fс — прокси временно отключён", slot.label, REQUEST_TIMEOUT)
+                    print(f"\n⚠️  Прокси [{slot.label}] отключён за таймаут (>1.5с)")
             if "429" in str(e):
                 pool.penalize(slot, PENALTY_429)
                 log.warning("429 (из исключения) | слот: %s | штраф: %.0fс", slot.label, PENALTY_429)
+                stats_tracker.record_error("HTTP 429", str(e), slot.label, endpoint)
             else:
                 log.warning(
                     "Ошибка запроса %s | слот: %s | elapsed: %.2fс | %s",
                     endpoint, slot.label, elapsed, e,
                 )
+                stats_tracker.record_error(err_name, str(e), slot.label, endpoint)
             last_exc = e
             if attempt < MAX_RETRIES - 1:
-                time.sleep(1)
+                await asyncio.sleep(0.3)
 
     raise last_exc or RuntimeError("Все попытки исчерпаны")
 
 
 # ─────────────────────────────────────────────
-#  Загрузка листингов
+#  Загрузка листингов (Async)
 # ─────────────────────────────────────────────
 
-def fetch_page(cursor: str, pool: AccountPool) -> dict:
-    return api_post("/gifts/saling", {
+async def fetch_page_async(cursor: str, pool: AccountPool, session: AsyncSession) -> dict:
+    return await api_post_async("/gifts/saling", {
         "collectionNames": [],
         "modelNames": [],
         "backdropNames": [],
@@ -242,21 +336,16 @@ def fetch_page(cursor: str, pool: AccountPool) -> dict:
         "cursor": cursor,
         "query": None,
         "promotedFirst": False,
-    }, pool)
+    }, pool, session)
 
 
-def fetch_new_listings(pool: AccountPool, seen_ids: set, first_run: bool) -> list[dict]:
-    """
-    Загружает новые листинги.
-    Первый запуск: 1 страница, только помечаем (не проверяем).
-    Последующие: 1-3 страницы, стоп при первом виденном ID.
-    """
+async def fetch_new_listings_async(pool: AccountPool, seen_ids: set, first_run: bool, session: AsyncSession) -> list[dict]:
     new_gifts: list[dict] = []
     cursor = ""
     max_pages = 1 if first_run else 3
 
     for page_n in range(1, max_pages + 1):
-        data = fetch_page(cursor, pool)
+        data = await fetch_page_async(cursor, pool, session)
         gifts = data.get("gifts", [])
         log.debug("Страница %d: получено %d подарков", page_n, len(gifts))
 
@@ -282,9 +371,8 @@ def fetch_new_listings(pool: AccountPool, seen_ids: set, first_run: bool) -> lis
     return new_gifts
 
 
-def fetch_black_floor(pool: AccountPool) -> int | None:
-    """Флор чёрного фона (2-я по цене позиция среди Black листингов)."""
-    data = api_post("/gifts/saling", {
+async def fetch_black_floor_async(pool: AccountPool, session: AsyncSession) -> int | None:
+    data = await api_post_async("/gifts/saling", {
         "collectionNames": [],
         "modelNames": [],
         "backdropNames": list(BLACK_BACKDROPS),
@@ -299,7 +387,7 @@ def fetch_black_floor(pool: AccountPool) -> int | None:
         "cursor": "",
         "query": None,
         "promotedFirst": False,
-    }, pool)
+    }, pool, session)
 
     prices = sorted(
         int(g["salePrice"])
@@ -309,6 +397,9 @@ def fetch_black_floor(pool: AccountPool) -> int | None:
     floor = prices[1] if len(prices) >= 2 else (prices[0] if prices else None)
     log.debug("Флор чёрного фона: %s (из %d позиций)", tons_fmt(floor) if floor else "N/A", len(prices))
     return floor
+
+
+
 
 
 # ─────────────────────────────────────────────
@@ -321,34 +412,56 @@ def check_gift(gift: dict, black_floor: int | None) -> list[dict]:
     if not price:
         return deals
     price = int(price)
+    price_ton = tons(price)
 
-    # ── Флор модели ───────────────────────────────────────────────────────
-    model_floor = (
-        gift.get("floorPriceNanoTONsByBackdropModel")
-        or gift.get("floorPriceNanoTONsByCollection")
-    )
-    if model_floor:
-        model_floor = int(model_floor)
-        if price < model_floor * (1 - DISCOUNT_THRESHOLD):
-            pct = (model_floor - price) / model_floor * 100
-            src = "backdrop+model" if gift.get("floorPriceNanoTONsByBackdropModel") else "collection"
+    # ── 1. Абсолютный порог цены (< CHEAP_PRICE_THRESHOLD TON → всегда сделка) ──
+    if price_ton < CHEAP_PRICE_THRESHOLD:
+        coll_floor = gift.get("floorPriceNanoTONsByCollection")
+        floor_val = int(coll_floor) if coll_floor else price
+        diff_ton = tons(floor_val - price)
+        pct = (floor_val - price) / floor_val * 100 if floor_val > 0 else 0.0
+        deals.append({
+            "type": "CHEAP",
+            "gift": gift,
+            "price": price,
+            "floor": floor_val,
+            "pct": pct,
+            "diff_ton": diff_ton,
+            "floor_src": "absolute_threshold",
+        })
+        log.debug(
+            "CHEAP deal: %s %s #%s | %.4f TON < %.2f TON порог",
+            gift.get("collectionName"), gift.get("modelName"),
+            gift.get("number"), price_ton, CHEAP_PRICE_THRESHOLD,
+        )
+        return deals  # уже нашли сделку — дальше проверять не нужно
+
+    # ── 2. Флор коллекции (floorPriceNanoTONsByCollection) ────────────────
+    coll_floor = gift.get("floorPriceNanoTONsByCollection")
+    if coll_floor:
+        coll_floor = int(coll_floor)
+        diff_ton = tons(coll_floor - price)
+        if diff_ton >= MIN_TON_DIFF:
+            pct = (coll_floor - price) / coll_floor * 100
             deals.append({
-                "type": "MODEL",
+                "type": "COLLECTION",
                 "gift": gift,
                 "price": price,
-                "floor": model_floor,
+                "floor": coll_floor,
                 "pct": pct,
-                "floor_src": src,
+                "diff_ton": diff_ton,
+                "floor_src": "collection_floor",
             })
             log.debug(
-                "MODEL deal: %s %s #%s | %.2f TON < флор %.2f TON (%.1f%% скидка)",
+                "COLLECTION deal: %s %s #%s | %.2f TON < флор коллекции %.2f TON (выгода %.2f TON, %.1f%% скидка)",
                 gift.get("collectionName"), gift.get("modelName"),
-                gift.get("number"), tons(price), tons(model_floor), pct,
+                gift.get("number"), price_ton, tons(coll_floor), diff_ton, pct,
             )
 
-    # ── Флор чёрного фона ─────────────────────────────────────────────────
+    # ── 3. Флор чёрного фона ───────────────────────────────────────────────
     if gift.get("backdropName") in BLACK_BACKDROPS and black_floor:
-        if price < black_floor * (1 - DISCOUNT_THRESHOLD):
+        diff_ton = tons(black_floor - price)
+        if diff_ton >= MIN_TON_DIFF:
             pct = (black_floor - price) / black_floor * 100
             deals.append({
                 "type": "BLACK",
@@ -356,12 +469,13 @@ def check_gift(gift: dict, black_floor: int | None) -> list[dict]:
                 "price": price,
                 "floor": black_floor,
                 "pct": pct,
+                "diff_ton": diff_ton,
                 "floor_src": "black_market",
             })
             log.debug(
-                "BLACK deal: %s %s #%s | %.2f TON < флор %.2f TON (%.1f%% скидка)",
+                "BLACK deal: %s %s #%s | %.2f TON < флор %.2f TON (выгода %.2f TON, %.1f%% скидка)",
                 gift.get("collectionName"), gift.get("modelName"),
-                gift.get("number"), tons(price), tons(black_floor), pct,
+                gift.get("number"), price_ton, tons(black_floor), diff_ton, pct,
             )
 
     return deals
@@ -373,11 +487,13 @@ def check_gift(gift: dict, black_floor: int | None) -> list[dict]:
 
 def print_and_log_deal(deal: dict) -> None:
     gift = deal["gift"]
-    tag = "🖤  ЧЁРНЫЙ ФОН" if deal["type"] == "BLACK" else "🔥  ДЕШЁВАЯ МОДЕЛЬ"
+    _tags = {"BLACK": "🖤  ЧЁРНЫЙ ФОН", "CHEAP": "💸  ДЁШЕВО", "COLLECTION": "🔥  НИЖЕ ФЛОРА КОЛЛЕКЦИИ"}
+    tag = _tags.get(deal["type"], "🔥  ВЫГОДНАЯ СДЕЛКА")
+    diff_ton = deal.get("diff_ton", tons(deal["floor"] - deal["price"]))
 
     lines = [
         SEPARATOR,
-        f"  {tag}  —  скидка {deal['pct']:.1f}%",
+        f"  {tag}  —  выгода {diff_ton:.2f} TON (скидка {deal['pct']:.1f}%)",
         f"  📦  {gift.get('collectionName', '?')}  |  модель: {gift.get('modelName', '?')}",
         f"  🎨  Фон: {gift.get('backdropName', '?')}  |  узор: {gift.get('symbolName', '?')}  |  #{gift.get('number', '?')}",
         f"  💰  Цена: {tons_fmt(deal['price'])}  (флор: {tons_fmt(deal['floor'])} [{deal['floor_src']}])",
@@ -389,8 +505,8 @@ def print_and_log_deal(deal: dict) -> None:
 
     # Логируем в scanner.log
     log.info(
-        "DEAL [%s] скидка %.1f%% | %s %s #%s | %.2f TON → флор %.2f TON | %s",
-        deal["type"], deal["pct"],
+        "DEAL [%s] выгода %.2f TON (скидка %.1f%%) | %s %s #%s | %.2f TON → флор %.2f TON | %s",
+        deal["type"], diff_ton, deal["pct"],
         gift.get("collectionName"), gift.get("modelName"), gift.get("number"),
         tons(deal["price"]), tons(deal["floor"]),
         gift_url(gift),
@@ -420,9 +536,9 @@ async def main() -> None:
 
     header_lines = [
         "=" * 60,
-        f"  🚀  MRKT Gift Scanner  (старт: {startup_ts})",
-        f"  Порог скидки:  {DISCOUNT_THRESHOLD * 100:.0f}%",
-        f"  Интервал:      {SCAN_INTERVAL} сек",
+        f"  🚀  MRKT Gift Scanner (Async)  (старт: {startup_ts})",
+        f"  Порог выгоды:  {MIN_TON_DIFF:.2f} TON  |  дёшево < {CHEAP_PRICE_THRESHOLD:.2f} TON",
+        f"  Интервал:      {SCAN_INTERVAL} сек  |  таймаут прокси: {REQUEST_TIMEOUT} сек",
         f"  Штраф 429:     {PENALTY_429:.0f} сек",
         f"  Чёрные фоны:   {', '.join(BLACK_BACKDROPS)}",
         f"  Логи:          {LOG_DIR.resolve()}",
@@ -432,7 +548,7 @@ async def main() -> None:
     for line in header_lines:
         print(line)
     log.info("="*50)
-    log.info("Запуск MRKT Scanner | порог: %.0f%% | интервал: %ds", DISCOUNT_THRESHOLD * 100, SCAN_INTERVAL)
+    log.info("Запуск MRKT Scanner (Async) | порог выгоды: %.2f TON | интервал: %ds", MIN_TON_DIFF, SCAN_INTERVAL)
 
     try:
         pool = build_pool()
@@ -445,79 +561,110 @@ async def main() -> None:
     log.info("Пул: %s", pool)
     print("=" * 60)
 
+    # Настройка моментального завершения по Ctrl+C на уровне asyncio
+    loop = asyncio.get_running_loop()
+    def _sig_handler():
+        log.info("Получен сигнал завершения, останавливаем...")
+        _shutdown.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _sig_handler)
+        except (NotImplementedError, RuntimeError):
+            pass
+
     seen_ids: set = set()
     black_floor: int | None = None
     scan_count = 0
     total_deals = 0
+    consecutive_401_errors = 0
     first_run = True
 
     try:
-        while not _shutdown.is_set():
-            scan_count += 1
-            ts = now_str()
+        async with AsyncSession() as session:
+            while not _shutdown.is_set():
+                scan_count += 1
+                ts = now_str()
 
-            # ── Флор чёрного фона ────────────────────────────────────────────
-            if black_floor is None or scan_count % BLACK_FLOOR_REFRESH == 0:
-                log.debug("Обновляем флор чёрного фона...")
+                # ── Флор чёрного фона ────────────────────────────────────────────
+                if black_floor is None or scan_count % BLACK_FLOOR_REFRESH == 0:
+                    log.debug("Обновляем флор чёрного фона...")
+                    try:
+                        bf = await fetch_black_floor_async(pool, session)
+                        if bf:
+                            black_floor = bf
+                            log.info("Флор чёрного фона: %s", tons_fmt(black_floor))
+                            print(f"[{ts}] 🖤 Флор чёрного фона: {tons_fmt(black_floor)}")
+                        else:
+                            log.warning("Флор чёрного фона не получен (нет Black листингов?)")
+                    except Exception as e:
+                        log.error("Не удалось получить флор чёрного фона: %s", e)
+                        print(f"[{ts}] ⚠️  Флор чёрного: {e}")
+
+                # ── Скан ─────────────────────────────────────────────────────────
+                label = " (первый скан)" if first_run else ""
+                log.debug("Скан #%d начат%s", scan_count, label)
+                print(f"[{ts}] ⟳ Скан #{scan_count}{label}...", end=" ", flush=True)
+
                 try:
-                    bf = fetch_black_floor(pool)
-                    if bf:
-                        black_floor = bf
-                        log.info("Флор чёрного фона: %s", tons_fmt(black_floor))
-                        print(f"[{ts}] 🖤 Флор чёрного фона: {tons_fmt(black_floor)}")
-                    else:
-                        log.warning("Флор чёрного фона не получен (нет Black листингов?)")
+                    t_scan = time.monotonic()
+                    new_gifts = await fetch_new_listings_async(pool, seen_ids, first_run, session)
+                    elapsed = time.monotonic() - t_scan
+                    consecutive_401_errors = 0  # Скан успешен — сбрасываем счётчик ошибки 401
+
+                    for g in new_gifts:
+                        seen_ids.add(g.get("id"))
+
+                    scan_deals_count = 0
+                    if not first_run and new_gifts:
+                        scan_deals: list[dict] = []
+                        for gift in new_gifts:
+                            scan_deals.extend(check_gift(gift, black_floor))
+
+                        if scan_deals:
+                            scan_deals_count = len(scan_deals)
+                            total_deals += scan_deals_count
+                            print(f"\n[{ts}]  ✅ {len(scan_deals)} предложений! (сессия: {total_deals})\n")
+                            log.info("!!! Найдено %d сделок (сессия: %d)", len(scan_deals), total_deals)
+                            for deal in scan_deals:
+                                print_and_log_deal(deal)
+
+                    stats_tracker.record_scan(new_gifts, scan_deals_count)
+
+                    print(f"+{len(new_gifts)} новых  |  в базе: {len(seen_ids)}  |  {elapsed:.1f}с")
+                    log.info(
+                        "Скан #%d: +%d новых | всего в базе: %d | %.1fс",
+                        scan_count, len(new_gifts), len(seen_ids), elapsed,
+                    )
+
+                except AuthTokenExpiredError as e:
+                    consecutive_401_errors += 1
+                    print(f"\n[{ts}] ❌ {e}")
+                    log.error("Просроченный токен (скан #%d) [%d/3 попыток]", scan_count, consecutive_401_errors)
+                    if consecutive_401_errors >= 3:
+                        log.critical("❌ Все токены в пуле просрочены (HTTP 401). Завершение работы сканера во избежание нагрузки.")
+                        print(f"\n🛑 ОСТАНОВКА: Все токены просрочены (HTTP 401). Сканер автоматически завершил работу во избежание бессмысленных запросов.")
+                        break
                 except Exception as e:
-                    log.error("Не удалось получить флор чёрного фона: %s", e)
-                    print(f"[{ts}] ⚠️  Флор чёрного: {e}")
+                    print(f"\n[{ts}] ❌ {e}")
+                    log.error("Ошибка в скане #%d: %s", scan_count, e, exc_info=True)
+                    stats_tracker.record_error(type(e).__name__, str(e))
 
-            # ── Скан ─────────────────────────────────────────────────────────
-            label = " (первый скан)" if first_run else ""
-            log.debug("Скан #%d начат%s", scan_count, label)
-            print(f"[{ts}] ⟳ Скан #{scan_count}{label}...", end=" ", flush=True)
+                first_run = False
 
-            try:
-                t_scan = time.monotonic()
-                new_gifts = fetch_new_listings(pool, seen_ids, first_run)
-                elapsed = time.monotonic() - t_scan
+                # Ждём следующего скана (с поддержкой shutdown)
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(asyncio.ensure_future(_shutdown.wait())),
+                        timeout=SCAN_INTERVAL,
+                    )
+                    break  # shutdown получен
+                except asyncio.TimeoutError:
+                    pass  # нормально, просто истёк интервал
 
-                for g in new_gifts:
-                    seen_ids.add(g.get("id"))
-
-                print(f"+{len(new_gifts)} новых  |  в базе: {len(seen_ids)}  |  {elapsed:.1f}с")
-                log.info(
-                    "Скан #%d: +%d новых | всего в базе: %d | %.1fс",
-                    scan_count, len(new_gifts), len(seen_ids), elapsed,
-                )
-
-                if not first_run and new_gifts:
-                    scan_deals: list[dict] = []
-                    for gift in new_gifts:
-                        scan_deals.extend(check_gift(gift, black_floor))
-
-                    if scan_deals:
-                        total_deals += len(scan_deals)
-                        print(f"\n[{ts}]  ✅ {len(scan_deals)} предложений! (сессия: {total_deals})\n")
-                        log.info("!!! Найдено %d сделок (сессия: %d)", len(scan_deals), total_deals)
-                        for deal in scan_deals:
-                            print_and_log_deal(deal)
-
-            except Exception as e:
-                print(f"\n[{ts}] ❌ {e}")
-                log.error("Ошибка в скане #%d: %s", scan_count, e, exc_info=True)
-
-            first_run = False
-
-            # Ждём следующего скана (с поддержкой shutdown)
-            try:
-                await asyncio.wait_for(
-                    asyncio.shield(asyncio.ensure_future(_shutdown.wait())),
-                    timeout=SCAN_INTERVAL,
-                )
-                break  # shutdown получен
-            except asyncio.TimeoutError:
-                pass  # нормально, просто истёк интервал
-
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        print("\n👋 Сканирование остановлено пользователем (Ctrl+C).")
+        log.info("Остановка пользователем (Ctrl+C).")
     finally:
         log.info("Остановка: сканов: %d, сделок: %d", scan_count, total_deals)
         print(f"\n👋 Остановлено. Сканов: {scan_count}, сделок: {total_deals}")

@@ -1,0 +1,4 @@
+# Токены MRKT — по одному на строку
+# Получить в веб-интерфейсе: F12 → Network → /api/v1/auth → Response → "token"
+your_token_1_here
+your_token_2_here
