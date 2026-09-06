@@ -73,11 +73,22 @@ class Slot:
         """429 — запрещаем слот на N секунд."""
         self._available_at = time.monotonic() + seconds
 
-    def record_timeout(self) -> None:
-        """Таймаут или ответ >1.5с — отключение слота."""
+    def record_success(self) -> None:
+        """Сбрасывает счетчик таймаутов при успешном запросе."""
+        self.timeout_count = 0
+
+    def record_timeout(self) -> bool:
+        """
+        Фиксирует таймаут.
+        При 1-2 таймаутах: временный кулдаун на 10 сек.
+        При 3+ таймаутах подряд: отключает слот и возвращает True (сигнал для авто-замены).
+        """
         self.timeout_count += 1
-        if self.timeout_count >= 2:
+        if self.timeout_count >= 3:
             self.disabled = True
+            return True
+        self._available_at = max(self._available_at, time.monotonic() + 10.0)
+        return False
 
     def reset_stats(self) -> None:
         self.timeout_count = 0
@@ -99,12 +110,29 @@ class AccountPool:
     Пропускает disabled (тормозящие) слоты.
     """
 
-    def __init__(self, slots: list[Slot]):
+    def __init__(self, slots: list[Slot], reserve_proxies: Optional[list[XrayProcess]] = None):
         if not slots:
             raise ValueError("AccountPool: список слотов пуст")
         self._slots = slots
+        self._reserve_proxies = list(reserve_proxies or [])
         self._lock = threading.RLock()
         self._async_lock = asyncio.Lock()
+
+    def replace_slot_proxy(self, slot: Slot) -> Optional[XrayProcess]:
+        """Заменяет проблемный прокси в слоте на следующий быстрый из резерва."""
+        with self._lock:
+            if not self._reserve_proxies:
+                return None
+            old_prx = slot.proxy
+            new_prx = self._reserve_proxies.pop(0)
+            slot.proxy = new_prx
+            slot.reset_stats()
+            if old_prx:
+                try:
+                    old_prx.stop()
+                except Exception:
+                    pass
+            return new_prx
 
     async def next_async(self) -> Slot:
         """
@@ -213,12 +241,16 @@ class AccountPool:
             self._slots = new_slots
 
     def stop_all_proxies(self) -> None:
-        """Останавливает все xray процессы."""
+        """Останавливает все xray процессы (активные и резервные)."""
         seen: set = set()
         for slot in self._slots:
             if slot.proxy and id(slot.proxy) not in seen:
                 seen.add(id(slot.proxy))
                 slot.proxy.stop()
+        for prx in self._reserve_proxies:
+            if id(prx) not in seen:
+                seen.add(id(prx))
+                prx.stop()
 
     def __len__(self) -> int:
         return len(self._slots)
@@ -296,15 +328,17 @@ async def build_pool_async(
 
     # Отбираем самые быстрые прокси под количество токенов (1 токен = 1 самый быстрый ВПН)
     selected_proxies: list[XrayProcess] = []
+    reserve_proxies: list[XrayProcess] = []
     if proxies:
         num_needed = len(tokens)
         selected_proxies = proxies[:num_needed]
-        # Лишние (более медленные) прокси останавливаем, чтобы не тратить ресурсы
-        for extra in proxies[num_needed:]:
-            print(f"  💤 Прокси [{extra.cfg.name}] (пинг: {extra.ping_ms:.0f} мс) остановлен (в резерве)")
+        # До 10 лучших оставшихся держим в горячем резерве для авто-замены при сбоях
+        reserve_proxies = proxies[num_needed:num_needed + 10]
+        for extra in proxies[num_needed + 10:]:
+            print(f"  💤 Прокси [{extra.cfg.name}] остановлен (избыточный резерв)")
             extra.stop()
 
-        print(f"  🎯 Отобрано {len(selected_proxies)} самых быстрых прокси для {len(tokens)} токенов:")
+        print(f"  🎯 Отобрано {len(selected_proxies)} самых быстрых прокси для {len(tokens)} токенов (в горячем резерве: {len(reserve_proxies)}):")
         for idx, (tok, prx) in enumerate(zip(tokens, selected_proxies), 1):
             tok_mask = f"{tok[:8]}…{tok[-4:]}" if len(tok) > 12 else tok
             print(f"     #{idx}: {tok_mask} ⇄ [{prx.cfg.name}] ({prx.ping_ms:.0f} мс)")
@@ -318,7 +352,7 @@ async def build_pool_async(
         for token in tokens:
             slots.append(Slot(token=token))
 
-    return AccountPool(slots)
+    return AccountPool(slots, reserve_proxies=reserve_proxies)
 
 
 def build_pool(

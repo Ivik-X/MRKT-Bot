@@ -48,7 +48,7 @@ PRIMARY_TOKEN        = os.getenv("PRIMARY_TOKEN", "").strip()
 BLACK_FLOOR_REFRESH  = int(os.getenv("BLACK_FLOOR_REFRESH", 40))
 MODEL_FLOOR_REFRESH_HOURS = float(os.getenv("MODEL_FLOOR_REFRESH_HOURS", 12.0))
 MODEL_FLOOR_REFRESH_SECS = MODEL_FLOOR_REFRESH_HOURS * 3600.0
-REQUEST_TIMEOUT      = float(os.getenv("REQUEST_TIMEOUT", 1.5))       # Таймаут: >1.5с отключает медленный прокси
+REQUEST_TIMEOUT      = max(2.5, float(os.getenv("REQUEST_TIMEOUT", 3.0)))       # Таймаут запроса (мин. 2.5с для стабильности)
 MAX_PING_SECONDS     = float(os.getenv("MAX_PING_SECONDS", 3.0))      # Допустимый пинг прокси при первичном тесте
 MAX_RETRIES          = int(os.getenv("MAX_RETRIES", 3))
 PENALTY_429          = float(os.getenv("PENALTY_429", 60.0))
@@ -288,10 +288,15 @@ async def api_request_async(
             elapsed = time.monotonic() - t0
 
             if elapsed > REQUEST_TIMEOUT:
-                slot.record_timeout()
-                if slot.disabled:
-                    log.warning("⚠️ Слот [%s] ответил за %.2fс (>%.1fс) — прокси отключён как медленный", slot.label, elapsed, REQUEST_TIMEOUT)
-                    print(f"\n⚠️  Прокси [{slot.label}] отключён (>1.5с, {elapsed:.1f}с)")
+                needs_replace = slot.record_timeout()
+                if needs_replace:
+                    new_prx = pool.replace_slot_proxy(slot)
+                    if new_prx:
+                        log.warning("⚠️ Слот [%s] ответил за %.2fс — заменён на резервный [%s]", slot.token[:8], elapsed, new_prx.cfg.name)
+                        print(f"\n🔄 Слот [{slot.token[:8]}…] переключён на резервный прокси [{new_prx.cfg.name}]")
+                    else:
+                        log.warning("⚠️ Слот [%s] ответил за %.2fс — отключён (резерв пуст)", slot.label, elapsed)
+                        print(f"\n⚠️  Прокси [{slot.label}] отключён (>%.1fс, {elapsed:.1f}с)" % (REQUEST_TIMEOUT, elapsed))
 
             if r.status_code == 401:
                 log.error("HTTP 401 Unauthorized | Токен просрочен (слот: %s)", slot.label)
@@ -300,7 +305,12 @@ async def api_request_async(
                 continue
 
             if r.status_code == 429:
-                retry_after = float(r.headers.get("Retry-After", PENALTY_429))
+                raw_retry = r.headers.get("Retry-After")
+                try:
+                    retry_val = float(raw_retry) if raw_retry else 0.0
+                except (ValueError, TypeError):
+                    retry_val = 0.0
+                retry_after = retry_val if retry_val > 0 else PENALTY_429
                 log.warning(
                     "429 Too Many Requests | слот: %s | штраф: %.0fс | elapsed: %.2fс",
                     slot.label, retry_after, elapsed,
@@ -311,6 +321,7 @@ async def api_request_async(
                 continue
 
             r.raise_for_status()
+            slot.record_success()
             log.debug(
                 "API ответ: %d | elapsed: %.2fс | слот: %s",
                 r.status_code, elapsed, slot.label,
@@ -323,10 +334,15 @@ async def api_request_async(
             elapsed = time.monotonic() - t0
             err_name = type(e).__name__
             if "Timeout" in err_name or "timed out" in str(e).lower():
-                slot.record_timeout()
-                if slot.disabled:
-                    log.warning("⚠️ Слот [%s] превысил таймаут %.1fс — прокси временно отключён", slot.label, REQUEST_TIMEOUT)
-                    print(f"\n⚠️  Прокси [{slot.label}] отключён за таймаут (>1.5с)")
+                needs_replace = slot.record_timeout()
+                if needs_replace:
+                    new_prx = pool.replace_slot_proxy(slot)
+                    if new_prx:
+                        log.warning("⚠️ Слот [%s] таймаут — заменён на резервный [%s]", slot.token[:8], new_prx.cfg.name)
+                        print(f"\n🔄 Слот [{slot.token[:8]}…] переключён на резервный прокси [{new_prx.cfg.name}]")
+                    else:
+                        log.warning("⚠️ Слот [%s] превысил таймаут %.1fс — отключён (резерв пуст)", slot.label, REQUEST_TIMEOUT)
+                        print(f"\n⚠️  Прокси [{slot.label}] отключён за таймаут (>%.1fс)" % REQUEST_TIMEOUT)
             if "429" in str(e):
                 pool.penalize(slot, PENALTY_429)
                 log.warning("429 (из исключения) | слот: %s | штраф: %.0fс", slot.label, PENALTY_429)
