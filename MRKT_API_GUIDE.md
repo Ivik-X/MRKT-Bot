@@ -240,6 +240,149 @@ curl -X POST 'https://api.tgmrkt.io/api/v1/gifts/models' \
 
 ---
 
+### 3.5. Текущий баланс пользователя (`GET /balance`)
+
+Возвращает информацию о текущих балансах аккаунта (TON/Gram, Stars, бонусы, стейкинг).
+
+- **URL:** `https://api.tgmrkt.io/api/v1/balance`
+- **Метод:** `GET`
+- **Тело запроса:** Отсутствует
+
+#### Пример cURL:
+```bash
+curl 'https://api.tgmrkt.io/api/v1/balance' \
+  -H 'Authorization: bf73c16d-eff6-471e-95fc-fee1ddbcf3a2' \
+  -H 'Cookie: access_token=bf73c16d-eff6-471e-95fc-fee1ddbcf3a2' \
+  -H 'Origin: https://cdn.tgmrkt.io' \
+  -H 'Referer: https://cdn.tgmrkt.io/'
+```
+
+#### Пример ответа:
+```json
+{
+  "soft": 0,
+  "hard": 1374200000,
+  "totalHard": 13400000000,
+  "hardLocked": 0,
+  "stars": 0,
+  "starsFotWithdraw": 0,
+  "spices": 0,
+  "friendsCount": 0,
+  "luckyBuyCards": 0,
+  "stackingPoints": 0,
+  "spaceMonkeysPoints": 0,
+  "nanoUSDs": 0,
+  "nanoUSDsLocked": 0,
+  "giftStakingPoints": 0,
+  "bonus": 0
+}
+```
+
+#### Описание ключевых полей баланса:
+| Поле | Тип | Описание |
+| :--- | :--- | :--- |
+| `hard` | `int` | **Доступный баланс TON в nanoTON** ($1\,374\,200\,000 = 1.3742\text{ TON}$). Именно он используется для покупки подарков. |
+| `totalHard` | `int` | Общий баланс TON пользователя (включая заблокированные средства). |
+| `hardLocked` | `int` | Заблокированные TON (например, активные биды или заморозка). |
+| `stars` | `int` | Баланс Telegram Stars. |
+| `starsFotWithdraw` | `int` | Stars, доступные для вывода. |
+| `spices` | `int` | Внутренняя валюта / очки специй. |
+| `nanoUSDs` | `int` | Баланс в nano-USD (для долларовых расчётов). |
+
+---
+
+### 3.6. Лента событий и история сделок (`POST /feed`)
+
+Возвращает ленту рыночной активности маркетплейса в реальном времени: продажи, новые листинги, изменения цен и снятия лотов.
+
+- **URL:** `https://api.tgmrkt.io/api/v1/feed`
+- **Метод:** `POST`
+
+#### Параметры пагинации и фильтрации (Тело запроса):
+```json
+{
+  "count": 20,
+  "cursor": "2dc37f41-eddd-4fe2-be06-904b0c3a513e",
+  "collectionNames": [],
+  "modelNames": [],
+  "backdropNames": [],
+  "number": null,
+  "type": [],
+  "minPrice": null,
+  "maxPrice": null,
+  "ordering": "Latest",
+  "lowToHigh": false,
+  "query": null
+}
+```
+
+> **Механизм курсора (`cursor`):**
+> Значение `cursor` — это UUID нижнего (самого старого в текущей выборке) события/подарка. Передавая полученный из предыдущего ответа `cursor`, клиент запрашивает следующую страницу истории. Для запроса самых свежих событий передайте `"cursor": null` или опустите его.
+
+#### Типы событий (`type` в элементе ленты):
+- `sale` — подарок успешно куплен покупателем за сумму `amount`.
+- `listing` — подарок выставлен на продажу по цене `amount`.
+- `change_price` — продавец изменил цену лота на `amount`.
+- `unlisting` — подарок снят продавцом с продажи.
+- `lucky_buy` — покупка через механизм Lucky Buy.
+
+#### Пример cURL:
+```bash
+curl -X POST 'https://api.tgmrkt.io/api/v1/feed' \
+  -H 'Authorization: bf73c16d-eff6-471e-95fc-fee1ddbcf3a2' \
+  -H 'Cookie: access_token=bf73c16d-eff6-471e-95fc-fee1ddbcf3a2' \
+  -H 'Content-Type: application/json' \
+  -H 'Origin: https://cdn.tgmrkt.io' \
+  -H 'Referer: https://cdn.tgmrkt.io/' \
+  --data-raw '{"count":20,"cursor":null,"collectionNames":[],"modelNames":[],"backdropNames":[],"number":null,"type":[],"minPrice":null,"maxPrice":null,"ordering":"Latest","lowToHigh":false,"query":null}'
+```
+
+#### Пример ответа:
+```json
+{
+  "items": [
+    {
+      "type": "sale",
+      "id": "03509717-0054-45a2-a0c4-8eb9e14c8ca0",
+      "amount": 33639600000,
+      "date": "2026-09-06T14:15:23.009076Z",
+      "gift": {
+        "id": "3fc62fa7-6120-4e7f-8578-164bbed48102",
+        "giftId": 5810168527520268969,
+        "title": "Genie Lamp",
+        "collectionName": "Genie Lamp",
+        "modelName": "Sahara",
+        "modelTitle": "Sahara",
+        "backdropName": "Steel Grey",
+        "number": 6500,
+        "salePrice": 32585099999,
+        "isOnSale": false
+      }
+    },
+    {
+      "type": "listing",
+      "id": "a10dd6de-13a8-42f2-b415-e1f158f1d905",
+      "amount": 5100000000,
+      "date": "2026-09-06T14:15:26.550113Z",
+      "gift": {
+        "id": "8ea5d49d-58c1-4936-9e25-980ba476ba0b",
+        "giftId": 5859231407821292798,
+        "title": "Snow Mittens",
+        "collectionName": "Snow Mittens",
+        "modelName": "Mistletoe",
+        "backdropName": "Khaki Green",
+        "number": 39798,
+        "salePrice": 5100000000,
+        "isOnSale": true
+      }
+    }
+  ],
+  "cursor": "b8bd0b3c-18e1-47cc-a635-797b8bf8b548"
+}
+```
+
+---
+
 ## 4. Алгоритм расчёта ликвидности и критерии покупки
 
 Подарок признаётся **ликвидным для покупки**, если выполняется хотя бы одно из трёх условий:
