@@ -234,11 +234,21 @@ def load_proxies(path: str = "proxies.txt") -> list[XrayProcess]:
     Запускает xray процесс для каждого прокси.
     Возвращает список XrayProcess.
     """
-    if not os.path.isfile(path):
+    file_to_read = None
+    if os.path.isfile(path):
+        file_to_read = path
+    elif os.path.isdir(path):
+        for candidate in sorted(os.listdir(path)):
+            candidate_path = os.path.join(path, candidate)
+            if os.path.isfile(candidate_path):
+                file_to_read = candidate_path
+                break
+
+    if not file_to_read:
         return []
 
     lines = []
-    with open(path, encoding="utf-8") as f:
+    with open(file_to_read, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line and not line.startswith("#") and line.startswith("vless://"):

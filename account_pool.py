@@ -22,7 +22,7 @@ from xray_proxy import XrayProcess, load_proxies
 
 
 # Минимальный интервал между запросами через один слот (секунды)
-SLOT_COOLDOWN = float(os.getenv("SLOT_COOLDOWN", 1.5))
+SLOT_COOLDOWN = float(os.getenv("SLOT_COOLDOWN", 0.5))
 # Кулдаун при 429 (секунды)
 PENALTY_SECONDS = float(os.getenv("PENALTY_SECONDS", 60.0))
 
@@ -176,8 +176,18 @@ def load_tokens(path: str = "tokens.txt") -> list[str]:
     """
     tokens: list[str] = []
 
+    file_to_read = None
     if os.path.isfile(path):
-        with open(path, encoding="utf-8") as f:
+        file_to_read = path
+    elif os.path.isdir(path):
+        for candidate in sorted(os.listdir(path)):
+            candidate_path = os.path.join(path, candidate)
+            if os.path.isfile(candidate_path):
+                file_to_read = candidate_path
+                break
+
+    if file_to_read:
+        with open(file_to_read, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#"):

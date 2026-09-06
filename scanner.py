@@ -37,7 +37,7 @@ load_dotenv()
 # ─────────────────────────────────────────────
 
 MARKET_API_URL       = "https://api.tgmrkt.io/api/v1"
-SCAN_INTERVAL        = int(os.getenv("SCAN_INTERVAL", 30))
+SCAN_INTERVAL        = float(os.getenv("SCAN_INTERVAL", 0.5))
 MIN_TON_DIFF         = float(os.getenv("MIN_TON_DIFF", 2.5))
 CHEAP_PRICE_THRESHOLD = float(os.getenv("CHEAP_PRICE_THRESHOLD", 3.0))  # абсолютный порог: < N TON → всегда сделка
 BLACK_FLOOR_REFRESH  = int(os.getenv("BLACK_FLOOR_REFRESH", 10))
@@ -538,7 +538,7 @@ async def main() -> None:
         "=" * 60,
         f"  🚀  MRKT Gift Scanner (Async)  (старт: {startup_ts})",
         f"  Порог выгоды:  {MIN_TON_DIFF:.2f} TON  |  дёшево < {CHEAP_PRICE_THRESHOLD:.2f} TON",
-        f"  Интервал:      {SCAN_INTERVAL} сек  |  таймаут прокси: {REQUEST_TIMEOUT} сек",
+        f"  Интервал:      {SCAN_INTERVAL:.2f} сек  |  таймаут прокси: {REQUEST_TIMEOUT:.1f} сек",
         f"  Штраф 429:     {PENALTY_429:.0f} сек",
         f"  Чёрные фоны:   {', '.join(BLACK_BACKDROPS)}",
         f"  Логи:          {LOG_DIR.resolve()}",
@@ -548,7 +548,7 @@ async def main() -> None:
     for line in header_lines:
         print(line)
     log.info("="*50)
-    log.info("Запуск MRKT Scanner (Async) | порог выгоды: %.2f TON | интервал: %ds", MIN_TON_DIFF, SCAN_INTERVAL)
+    log.info("Запуск MRKT Scanner (Async) | порог выгоды: %.2f TON | интервал: %.2fs", MIN_TON_DIFF, SCAN_INTERVAL)
 
     try:
         pool = build_pool()
