@@ -242,7 +242,7 @@ def format_settings_text(state: ScannerState) -> str:
         f"1. <b>Фильтр по балансу:</b> {filter_bal_str}\n"
         f"   <i>(Показывать только подарки, на которые хватает баланса основного аккаунта)</i>\n\n"
         f"2. <b>Мин. оборот/цена для NFT:</b> <code>{turnover_str}</code>\n"
-        f"   <i>(Отсекает мёртвый груз: оборот/цена ≥ X; кроме чёрного фона и подарков < {state.cheap_price_threshold:.1f} TON)</i>\n\n"
+        f"   <i>(Отсекает мёртвый груз: оборот/цена ≥ X; кроме чёрного фона и подарков &lt; {state.cheap_price_threshold:.1f} TON)</i>\n\n"
         f"3. <b>Основной аккаунт:</b> <code>{primary_str}</code>\n"
         f"   <i>(Текущий баланс: <code>{bal_str}</code>; используется для покупок)</i>\n\n"
         f"4. <b>Порог выгоды (MIN_TON_DIFF):</b> <code>{state.min_ton_diff:.2f} TON</code>\n"
