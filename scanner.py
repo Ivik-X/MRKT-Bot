@@ -42,6 +42,7 @@ SCAN_INTERVAL        = float(os.getenv("SCAN_INTERVAL", 0.5))
 MIN_TON_DIFF         = float(os.getenv("MIN_TON_DIFF", 2.5))
 CHEAP_PRICE_THRESHOLD = float(os.getenv("CHEAP_PRICE_THRESHOLD", 3.0))  # абсолютный порог: < N TON → всегда сделка
 MIN_TURNOVER_RATIO   = float(os.getenv("MIN_TURNOVER_RATIO", "0.0"))   # оборот коллекции / цена: >= X для NFT
+LOW_ID_MAX_FLOOR_RATIO = float(os.getenv("LOW_ID_MAX_FLOOR_RATIO", "0.20"))  # ID < 100: цена <= X * floor (20% флора)
 FILTER_BY_BALANCE    = os.getenv("FILTER_BY_BALANCE", "false").lower() in ("1", "true", "yes")
 PRIMARY_TOKEN        = os.getenv("PRIMARY_TOKEN", "").strip()
 BLACK_FLOOR_REFRESH  = int(os.getenv("BLACK_FLOOR_REFRESH", 40))
@@ -532,9 +533,20 @@ def check_gift(
     # Фильтр НЕ распространяется на категории:
     # 1) черный фон (backdropName in BLACK_BACKDROPS)
     # 2) дешевле cheap_threshold TON (price_ton < cheap_threshold)
+    # 3) редкий номер ID < 100 (number < 100)
+    gift_num = gift.get("number") if gift.get("number") is not None else gift.get("num")
+    is_low_id = False
+    low_id_val = None
+    try:
+        if gift_num is not None:
+            low_id_val = int(gift_num)
+            is_low_id = (0 < low_id_val < 100)
+    except (ValueError, TypeError):
+        is_low_id = False
+
     col_vol = (collection_volumes or {}).get(collection_name, 0)
     turnover_ratio = (col_vol / price) if price > 0 else 0.0
-    is_turnover_exempt = (backdrop_name in BLACK_BACKDROPS) or (price_ton < cheap_threshold)
+    is_turnover_exempt = (backdrop_name in BLACK_BACKDROPS) or (price_ton < cheap_threshold) or is_low_id
     if not is_turnover_exempt and min_turnover_ratio > 0 and turnover_ratio < min_turnover_ratio:
         log.debug(
             "Пропуск лота %s (коллекция '%s'): оборот/цена %.1fx < порога %.1fx (оборот: %.0f TON)",
@@ -584,12 +596,30 @@ def check_gift(
             collection_name, model_name, gift.get("number"), price_ton, cheap_threshold, turnover_ratio,
         )
 
-    # ── 3. Флор конкретной модели ──────────────────────────────────────────
+    # ── 3. Флор конкретной модели или Редкий номер ID < 100 ──────────────
     model_floor = model_floors.get(model_key)
     if model_floor:
         diff_ton = tons(model_floor - price)
-        if diff_ton >= min_ton_diff:
-            pct = (model_floor - price) / model_floor * 100
+        pct = (model_floor - price) / model_floor * 100 if model_floor > 0 else 0.0
+        max_allowed_low_id = int(model_floor * LOW_ID_MAX_FLOOR_RATIO) if is_low_id else -1
+
+        if is_low_id and price <= max_allowed_low_id:
+            deals.append({
+                "type": "LOW_ID",
+                "gift": gift,
+                "price": price,
+                "floor": model_floor,
+                "pct": pct,
+                "diff_ton": diff_ton,
+                "floor_src": f"редкий ID #{low_id_val} (≤{LOW_ID_MAX_FLOOR_RATIO*100:.0f}% флора)",
+                "turnover_ratio": turnover_ratio,
+                "collection_volume": col_vol,
+            })
+            log.debug(
+                "LOW_ID deal: %s %s #%s | %.2f TON <= %.0f%% флора %.2f TON (выгода %.2f TON, %.1f%% скидка, оборот %.1fx)",
+                collection_name, model_name, low_id_val, price_ton, LOW_ID_MAX_FLOOR_RATIO * 100, tons(model_floor), diff_ton, pct, turnover_ratio,
+            )
+        elif diff_ton >= min_ton_diff:
             deals.append({
                 "type": "MODEL",
                 "gift": gift,
@@ -615,7 +645,12 @@ def check_gift(
 
 def print_and_log_deal(deal: dict) -> None:
     gift = deal["gift"]
-    _tags = {"BLACK": "🖤  ЧЁРНЫЙ ФОН", "CHEAP": f"💸  ДЁШЕВО (<{CHEAP_PRICE_THRESHOLD:.1f} TON)", "MODEL": "🎯  НИЖЕ ФЛОРА МОДЕЛИ"}
+    _tags = {
+        "BLACK": "🖤  ЧЁРНЫЙ ФОН",
+        "CHEAP": f"💸  ДЁШЕВО (<{CHEAP_PRICE_THRESHOLD:.1f} TON)",
+        "MODEL": "🎯  НИЖЕ ФЛОРА МОДЕЛИ",
+        "LOW_ID": "🏷️  РЕДКИЙ НОМЕР (<100)",
+    }
     tag = _tags.get(deal["type"], "🔥  ВЫГОДНАЯ СДЕЛКА")
     diff_ton = deal.get("diff_ton", tons(deal["floor"] - deal["price"]))
 

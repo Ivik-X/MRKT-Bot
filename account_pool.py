@@ -170,6 +170,12 @@ class AccountPool:
             return proxies
 
     @property
+    def slots(self) -> list[Slot]:
+        """Возвращает копию списка слотов пула."""
+        with self._lock:
+            return list(self._slots)
+
+    @property
     def primary_token(self) -> Optional[str]:
         """Первый токен считается основным (с него читается баланс и делаются покупки)."""
         tokens = self.get_tokens()

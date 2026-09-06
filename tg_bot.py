@@ -714,6 +714,7 @@ async def send_deal_notification(
         "BLACK": "🖤 <b>ВЫГОДНЫЙ ЧЁРНЫЙ ФОН</b>",
         "CHEAP": "💸 <b>СВЕРХДЕШЁВЫЙ ПОДАРОК</b>",
         "MODEL": "🎯 <b>НИЖЕ ФЛОРА МОДЕЛИ</b>",
+        "LOW_ID": "🏷️ <b>РЕДКИЙ НОМЕР (#1 — #99)</b>",
     }
     header = tags.get(deal_type, "🔥 <b>ВЫГОДНАЯ СДЕЛКА!</b>")
 
