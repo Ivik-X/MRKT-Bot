@@ -103,7 +103,7 @@ class AccountPool:
         if not slots:
             raise ValueError("AccountPool: список слотов пуст")
         self._slots = slots
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._async_lock = asyncio.Lock()
 
     async def next_async(self) -> Slot:
@@ -197,9 +197,7 @@ class AccountPool:
             new_slots: list[Slot] = []
 
             if active_proxies:
-                num_slots = max(len(new_tokens), len(active_proxies))
-                for i in range(num_slots):
-                    tok = new_tokens[i % len(new_tokens)]
+                for i, tok in enumerate(new_tokens):
                     prx = active_proxies[i % len(active_proxies)]
                     new_slots.append(Slot(token=tok, proxy=prx))
             else:
@@ -290,13 +288,26 @@ async def build_pool_async(
     else:
         proxies = []
 
-    slots: list[Slot] = []
+    # Отбираем самые быстрые прокси под количество токенов (1 токен = 1 самый быстрый ВПН)
+    selected_proxies: list[XrayProcess] = []
     if proxies:
-        num_slots = max(len(tokens), len(proxies))
-        for i in range(num_slots):
-            tok = tokens[i % len(tokens)]
-            prx = proxies[i % len(proxies)]
-            slots.append(Slot(token=tok, proxy=prx))
+        num_needed = len(tokens)
+        selected_proxies = proxies[:num_needed]
+        # Лишние (более медленные) прокси останавливаем, чтобы не тратить ресурсы
+        for extra in proxies[num_needed:]:
+            print(f"  💤 Прокси [{extra.cfg.name}] (пинг: {extra.ping_ms:.0f} мс) остановлен (в резерве)")
+            extra.stop()
+
+        print(f"  🎯 Отобрано {len(selected_proxies)} самых быстрых прокси для {len(tokens)} токенов:")
+        for idx, (tok, prx) in enumerate(zip(tokens, selected_proxies), 1):
+            tok_mask = f"{tok[:8]}…{tok[-4:]}" if len(tok) > 12 else tok
+            print(f"     #{idx}: {tok_mask} ⇄ [{prx.cfg.name}] ({prx.ping_ms:.0f} мс)")
+
+    slots: list[Slot] = []
+    if selected_proxies:
+        for i, token in enumerate(tokens):
+            prx = selected_proxies[i % len(selected_proxies)]
+            slots.append(Slot(token=token, proxy=prx))
     else:
         for token in tokens:
             slots.append(Slot(token=token))

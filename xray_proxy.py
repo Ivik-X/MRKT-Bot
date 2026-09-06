@@ -179,6 +179,7 @@ class XrayProcess:
     def __init__(self, cfg: VlessConfig, xray_bin: str):
         self.cfg = cfg
         self.xray_bin = xray_bin
+        self.ping_ms: float = 0.0
         self._proc: Optional[subprocess.Popen] = None
         self._cfg_path: Optional[str] = None
 
@@ -341,17 +342,22 @@ async def filter_fast_proxies_async(
 
     for proc, (ok, latency_ms, err) in zip(processes, results):
         if ok and latency_ms <= max_ping_ms:
-            print(f"  ⚡ Прокси [{proc.cfg.name}] пинг: {latency_ms:.0f} мс (OK)")
+            proc.ping_ms = latency_ms
             fast_proxies.append(proc)
         else:
             reason = f"пинг {latency_ms:.0f} мс (> {max_ping_ms:.0f} мс)" if ok else f"{err} ({latency_ms:.0f} мс)"
             print(f"  ❌ Прокси [{proc.cfg.name}] отклонён: {reason}")
             proc.stop()
 
+    # Сортируем от самых быстрых к более медленным
+    fast_proxies.sort(key=lambda p: p.ping_ms)
+
     if not fast_proxies:
         print("  ⚠️  Ни один прокси не прошёл проверку скорости! Работаем напрямую (direct).")
     else:
-        print(f"  🎯 Отобрано быстрых прокси: {len(fast_proxies)} из {len(processes)}")
+        print(f"  🎯 Отобрано быстрых прокси: {len(fast_proxies)} из {len(processes)} (ранжированы по скорости):")
+        for rank, p in enumerate(fast_proxies, 1):
+            print(f"     #{rank} [{p.cfg.name}]: {p.ping_ms:.0f} мс")
 
     return fast_proxies
 

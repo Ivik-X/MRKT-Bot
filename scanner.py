@@ -146,7 +146,7 @@ def now_str() -> str:
     return datetime.now().strftime("%H:%M:%S")
 
 def gift_url(gift: dict) -> str:
-    gid = gift.get("id", "")
+    gid = gift.get("giftId") or gift.get("id", "")
     return f"https://t.me/mrkt?startapp=gift_{gid}" if gid else "https://t.me/mrkt"
 
 SEPARATOR = "─" * 60
@@ -737,7 +737,62 @@ async def main() -> None:
     else:
         print("  ℹ️  Telegram бот отключён (не задан TG_BOT_TOKEN или TG_ADMIN_ID в .env)")
 
-    # Первичная проверка баланса основного аккаунта
+    # Инициализация основного аккаунта (выбор с максимальным балансом, если не задан)
+    async def init_primary_account_async(
+        pool_obj: AccountPool,
+        state_obj: ScannerState,
+        explicit_token: str = "",
+    ) -> None:
+        tokens = pool_obj.get_tokens()
+        if not tokens:
+            state_obj.primary_balance_nano = None
+            return
+
+        if explicit_token and explicit_token in tokens:
+            pool_obj.set_primary_token(explicit_token)
+            slot = next((s for s in pool_obj.slots if s.token == explicit_token), None)
+            proxy = slot.proxy if slot else None
+            ok, msg, bdata = await verify_token_async(explicit_token, proxy=proxy)
+            if ok and "hard" in bdata:
+                state_obj.primary_balance_nano = int(bdata["hard"])
+                bal_text = f"{state_obj.primary_balance_nano / 1e9:.2f} TON"
+            else:
+                bal_text = f"ошибка ({msg})"
+            print(f"  👑 Основной аккаунт (из .env): {_mask_token(explicit_token)} (баланс: {bal_text})")
+            log.info("Основной аккаунт (из .env): %s (баланс: %s)", explicit_token, bal_text)
+            return
+
+        # PRIMARY_TOKEN не указан — опрашиваем балансы всех аккаунтов параллельно
+        # и выбираем аккаунт с НАИБОЛЬШИМ балансом
+        print(f"  👑 Поиск аккаунта с наибольшим балансом среди {len(tokens)} токенов...")
+        tasks = []
+        for tok in tokens:
+            slot = next((s for s in pool_obj.slots if s.token == tok), None)
+            proxy = slot.proxy if slot else None
+            tasks.append(verify_token_async(tok, proxy=proxy))
+
+        results = await asyncio.gather(*tasks)
+
+        best_token = tokens[0]
+        best_balance = -1
+
+        for tok, (ok, msg, bdata) in zip(tokens, results):
+            if ok and "hard" in bdata:
+                bal = int(bdata["hard"])
+                print(f"     • {_mask_token(tok)}: {bal / 1e9:.2f} TON")
+                if bal > best_balance:
+                    best_balance = bal
+                    best_token = tok
+            else:
+                print(f"     • {_mask_token(tok)}: не удалось получить баланс ({msg})")
+
+        pool_obj.set_primary_token(best_token)
+        state_obj.primary_balance_nano = max(0, best_balance) if best_balance >= 0 else None
+        bal_text = f"{best_balance / 1e9:.2f} TON" if best_balance >= 0 else "0.00 TON"
+        print(f"  👑 Автовыбор: {_mask_token(best_token)} выбран основным (баланс: {bal_text})")
+        log.info("Автовыбран основной аккаунт с наибольшим балансом: %s (баланс: %s)", best_token, bal_text)
+
+    # Фоновое обновление баланса текущего основного аккаунта
     async def update_primary_balance_async(pool_obj: AccountPool, state_obj: ScannerState) -> None:
         tok = pool_obj.primary_token
         if not tok:
@@ -755,12 +810,7 @@ async def main() -> None:
         except Exception as err:
             log.warning("Ошибка при обновлении баланса основного аккаунта: %s", err)
 
-    await update_primary_balance_async(pool, scanner_state)
-    primary_tok = pool.primary_token
-    if primary_tok:
-        bal_text = f"{scanner_state.primary_balance_nano / 1e9:.2f} TON" if scanner_state.primary_balance_nano is not None else "не проверен"
-        print(f"  👑 Основной аккаунт: {_mask_token(primary_tok)} (баланс: {bal_text})")
-        log.info("Основной аккаунт: %s (баланс: %s)", primary_tok, bal_text)
+    await init_primary_account_async(pool, scanner_state, explicit_token=PRIMARY_TOKEN)
 
     seen_ids: set = set()
     black_floor: int | None = None

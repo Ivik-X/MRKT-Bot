@@ -741,6 +741,12 @@ async def send_deal_notification(
     if gift_id:
         tg_app_url = f"https://t.me/mrkt?startapp=gift_{gift_id}"
         web_url = f"https://cdn.tgmrkt.io/gift/{gift_id}"
+        text += (
+            f"\n🔗 <b>Ссылки на подарок:</b>\n"
+            f"• 📱 <a href=\"{tg_app_url}\">Открыть в Telegram (Mini App)</a>\n"
+            f"• 🌐 <a href=\"{web_url}\">Открыть в браузере</a>\n"
+            f"• 📋 <code>{tg_app_url}</code>\n"
+        )
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
