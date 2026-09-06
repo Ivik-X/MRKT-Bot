@@ -169,10 +169,25 @@ class AccountPool:
                     proxies.append(s.proxy)
             return proxies
 
+    @property
+    def primary_token(self) -> Optional[str]:
+        """Первый токен считается основным (с него читается баланс и делаются покупки)."""
+        tokens = self.get_tokens()
+        return tokens[0] if tokens else None
+
+    def set_primary_token(self, token: str) -> None:
+        """Перемещает токен на 1-е место, делая его основным, сохраняет в файл и перезагружает пул."""
+        tokens = self.get_tokens()
+        if token in tokens:
+            tokens.remove(token)
+            tokens.insert(0, token)
+            save_tokens(tokens)
+            self.reload_tokens(tokens)
+
     def reload_tokens(self, new_tokens: list[str]) -> None:
         """
         Горячая перезагрузка списка токенов на лету.
-        Пересобирает слоты с сохранением текущих активных прокси.
+        Пересобирает слоты с распределением по ВСЕМ активным прокси.
         """
         if not new_tokens:
             raise ValueError("Список токенов не может быть пустым")
@@ -182,9 +197,11 @@ class AccountPool:
             new_slots: list[Slot] = []
 
             if active_proxies:
-                proxy_cycle = itertools.cycle(active_proxies)
-                for tok in new_tokens:
-                    new_slots.append(Slot(token=tok, proxy=next(proxy_cycle)))
+                num_slots = max(len(new_tokens), len(active_proxies))
+                for i in range(num_slots):
+                    tok = new_tokens[i % len(new_tokens)]
+                    prx = active_proxies[i % len(active_proxies)]
+                    new_slots.append(Slot(token=tok, proxy=prx))
             else:
                 for tok in new_tokens:
                     new_slots.append(Slot(token=tok))
@@ -275,9 +292,11 @@ async def build_pool_async(
 
     slots: list[Slot] = []
     if proxies:
-        proxy_cycle = itertools.cycle(proxies)
-        for token in tokens:
-            slots.append(Slot(token=token, proxy=next(proxy_cycle)))
+        num_slots = max(len(tokens), len(proxies))
+        for i in range(num_slots):
+            tok = tokens[i % len(tokens)]
+            prx = proxies[i % len(proxies)]
+            slots.append(Slot(token=tok, proxy=prx))
     else:
         for token in tokens:
             slots.append(Slot(token=token))

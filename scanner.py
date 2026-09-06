@@ -23,12 +23,13 @@ import time
 from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
+from typing import Any
 
 from curl_cffi import requests as cffi_requests
 from curl_cffi.requests import AsyncSession
 from dotenv import load_dotenv
 
-from account_pool import AccountPool, Slot, build_pool, build_pool_async
+from account_pool import AccountPool, Slot, build_pool, build_pool_async, verify_token_async
 
 load_dotenv()
 
@@ -40,6 +41,9 @@ MARKET_API_URL       = "https://api.tgmrkt.io/api/v1"
 SCAN_INTERVAL        = float(os.getenv("SCAN_INTERVAL", 0.5))
 MIN_TON_DIFF         = float(os.getenv("MIN_TON_DIFF", 2.5))
 CHEAP_PRICE_THRESHOLD = float(os.getenv("CHEAP_PRICE_THRESHOLD", 3.0))  # абсолютный порог: < N TON → всегда сделка
+MIN_TURNOVER_RATIO   = float(os.getenv("MIN_TURNOVER_RATIO", "0.0"))   # оборот коллекции / цена: >= X для NFT
+FILTER_BY_BALANCE    = os.getenv("FILTER_BY_BALANCE", "false").lower() in ("1", "true", "yes")
+PRIMARY_TOKEN        = os.getenv("PRIMARY_TOKEN", "").strip()
 BLACK_FLOOR_REFRESH  = int(os.getenv("BLACK_FLOOR_REFRESH", 40))
 MODEL_FLOOR_REFRESH_HOURS = float(os.getenv("MODEL_FLOOR_REFRESH_HOURS", 12.0))
 MODEL_FLOOR_REFRESH_SECS = MODEL_FLOOR_REFRESH_HOURS * 3600.0
@@ -55,7 +59,7 @@ TG_BOT_TOKEN         = os.getenv("TG_BOT_TOKEN", "").strip()
 TG_ADMIN_ID_RAW      = os.getenv("TG_ADMIN_ID", "").strip()
 TG_ADMIN_IDS         = {int(x.strip()) for x in TG_ADMIN_ID_RAW.split(",") if x.strip().isdigit()}
 
-from tg_bot import ScannerState, run_telegram_bot, send_deal_notification
+from tg_bot import ScannerState, run_telegram_bot, send_deal_notification, _mask_token
 
 
 # ─────────────────────────────────────────────
@@ -430,30 +434,35 @@ async def fetch_black_floor_async(pool: AccountPool, session: AsyncSession) -> i
     return floor
 
 
-async def fetch_all_model_floors_async(pool: AccountPool, session: AsyncSession) -> dict[str, int]:
+async def fetch_all_model_floors_async(pool: AccountPool, session: AsyncSession) -> tuple[dict[str, int], dict[str, int]]:
     """
-    1. GET /gifts/collections -> список всех доступных коллекций.
+    1. GET /gifts/collections -> список всех доступных коллекций и их объёмов.
     2. Батчами (по <=10 коллекций): POST /gifts/models {"collections": [...]}.
-    3. Возвращает карту {"CollectionName:ModelName": floorPriceNanoTons}.
+    3. Возвращает кортеж: (model_floors, collection_volumes).
     """
     model_floors: dict[str, int] = {}
-    log.info("Загрузка списка коллекций для обновления флора моделей...")
+    collection_volumes: dict[str, int] = {}
+    log.info("Загрузка списка коллекций для обновления флора моделей и объёмов...")
     try:
         collections_data = await api_get_async("/gifts/collections", pool, session)
     except Exception as e:
         log.error("Не удалось получить список коллекций: %s", e)
-        return model_floors
+        return model_floors, collection_volumes
 
     if not isinstance(collections_data, list):
         log.error("Некорректный формат ответа /gifts/collections: %s", type(collections_data))
-        return model_floors
+        return model_floors, collection_volumes
 
-    collection_names = [
-        c.get("name")
-        for c in collections_data
-        if isinstance(c, dict) and c.get("name")
-    ]
-    log.info("Получено коллекций: %d. Запрашиваем флор моделей пачками по 10...", len(collection_names))
+    collection_names = []
+    for c in collections_data:
+        if isinstance(c, dict) and c.get("name"):
+            c_name = c["name"]
+            collection_names.append(c_name)
+            vol = c.get("volume")
+            if vol is not None:
+                collection_volumes[c_name] = int(vol)
+
+    log.info("Получено коллекций: %d (объёмов: %d). Запрашиваем флор моделей пачками по 10...", len(collection_names), len(collection_volumes))
 
     # Лимит API: за раз можно указать не более 10 коллекций
     for i in range(0, len(collection_names), 10):
@@ -472,8 +481,8 @@ async def fetch_all_model_floors_async(pool: AccountPool, session: AsyncSession)
         except Exception as e:
             log.warning("Ошибка при загрузке флоров моделей для батча %s: %s", batch, e)
 
-    log.info("Флоры моделей обновлены: загружено %d моделей", len(model_floors))
-    return model_floors
+    log.info("Флоры моделей обновлены: загружено %d моделей, %d коллекций", len(model_floors), len(collection_volumes))
+    return model_floors, collection_volumes
 
 
 # ─────────────────────────────────────────────
@@ -484,14 +493,21 @@ def check_gift(
     gift: dict,
     black_floor: int | None,
     model_floors: dict[str, int],
+    collection_volumes: dict[str, int] | None = None,
     min_ton_diff: float = MIN_TON_DIFF,
     cheap_threshold: float = CHEAP_PRICE_THRESHOLD,
+    min_turnover_ratio: float = 0.0,
+    max_price_nano: int | None = None,
 ) -> list[dict]:
     """
     Подарок считается ликвидным (покупаем) в трёх случаях:
     1. У него черный фон и он стоит на min_ton_diff меньше флора черного фона.
     2. Он стоит меньше cheap_threshold (абсолютный дешевый порог).
     3. Он стоит на min_ton_diff дешевле флора этой конкретной модели.
+
+    Дополнительные фильтры:
+    - filter_by_balance: если max_price_nano задан и цена лота выше баланса — отсекается.
+    - min_turnover_ratio: если задан (>0) и оборот_коллекции / цена < min_turnover_ratio — отсекается (не применяется к лотам с черным фоном и дешевле cheap_threshold).
     """
     deals: list[dict] = []
     price = gift.get("salePrice")
@@ -503,6 +519,28 @@ def check_gift(
     model_name = gift.get("modelName")
     backdrop_name = gift.get("backdropName")
     model_key = f"{collection_name}:{model_name}"
+
+    # ── Фильтр по балансу ────────────────────────────────────────────────
+    if max_price_nano is not None and price > max_price_nano:
+        log.debug(
+            "Пропуск лота %s: цена %.2f TON > баланса %.2f TON",
+            gift.get("number"), price_ton, tons(max_price_nano),
+        )
+        return deals
+
+    # ── Фильтр по обороту (оборот коллекции / цена) для NFT ───────────────
+    # Фильтр НЕ распространяется на категории:
+    # 1) черный фон (backdropName in BLACK_BACKDROPS)
+    # 2) дешевле cheap_threshold TON (price_ton < cheap_threshold)
+    col_vol = (collection_volumes or {}).get(collection_name, 0)
+    turnover_ratio = (col_vol / price) if price > 0 else 0.0
+    is_turnover_exempt = (backdrop_name in BLACK_BACKDROPS) or (price_ton < cheap_threshold)
+    if not is_turnover_exempt and min_turnover_ratio > 0 and turnover_ratio < min_turnover_ratio:
+        log.debug(
+            "Пропуск лота %s (коллекция '%s'): оборот/цена %.1fx < порога %.1fx (оборот: %.0f TON)",
+            gift.get("number"), collection_name, turnover_ratio, min_turnover_ratio, tons(col_vol),
+        )
+        return deals
 
     # ── 1. Флор чёрного фона ───────────────────────────────────────────────
     if backdrop_name in BLACK_BACKDROPS and black_floor:
@@ -517,10 +555,12 @@ def check_gift(
                 "pct": pct,
                 "diff_ton": diff_ton,
                 "floor_src": "черный фон",
+                "turnover_ratio": turnover_ratio,
+                "collection_volume": col_vol,
             })
             log.debug(
-                "BLACK deal: %s %s #%s | %.2f TON < флор черного %.2f TON (выгода %.2f TON, %.1f%% скидка)",
-                collection_name, model_name, gift.get("number"), price_ton, tons(black_floor), diff_ton, pct,
+                "BLACK deal: %s %s #%s | %.2f TON < флор черного %.2f TON (выгода %.2f TON, %.1f%% скидка, оборот %.1fx)",
+                collection_name, model_name, gift.get("number"), price_ton, tons(black_floor), diff_ton, pct, turnover_ratio,
             )
 
     # ── 2. Абсолютный дешевый порог (< cheap_threshold TON) ────────────────
@@ -536,10 +576,12 @@ def check_gift(
             "pct": pct,
             "diff_ton": diff_ton,
             "floor_src": f"дешевле {cheap_threshold:.2f} TON",
+            "turnover_ratio": turnover_ratio,
+            "collection_volume": col_vol,
         })
         log.debug(
-            "CHEAP deal: %s %s #%s | %.4f TON < %.2f TON порог",
-            collection_name, model_name, gift.get("number"), price_ton, cheap_threshold,
+            "CHEAP deal: %s %s #%s | %.4f TON < %.2f TON порог (оборот %.1fx)",
+            collection_name, model_name, gift.get("number"), price_ton, cheap_threshold, turnover_ratio,
         )
 
     # ── 3. Флор конкретной модели ──────────────────────────────────────────
@@ -556,10 +598,12 @@ def check_gift(
                 "pct": pct,
                 "diff_ton": diff_ton,
                 "floor_src": f"модель {model_name}",
+                "turnover_ratio": turnover_ratio,
+                "collection_volume": col_vol,
             })
             log.debug(
-                "MODEL deal: %s %s #%s | %.2f TON < флор модели %.2f TON (выгода %.2f TON, %.1f%% скидка)",
-                collection_name, model_name, gift.get("number"), price_ton, tons(model_floor), diff_ton, pct,
+                "MODEL deal: %s %s #%s | %.2f TON < флор модели %.2f TON (выгода %.2f TON, %.1f%% скидка, оборот %.1fx)",
+                collection_name, model_name, gift.get("number"), price_ton, tons(model_floor), diff_ton, pct, turnover_ratio,
             )
 
     return deals
@@ -575,24 +619,33 @@ def print_and_log_deal(deal: dict) -> None:
     tag = _tags.get(deal["type"], "🔥  ВЫГОДНАЯ СДЕЛКА")
     diff_ton = deal.get("diff_ton", tons(deal["floor"] - deal["price"]))
 
+    tr = deal.get("turnover_ratio")
+    vol_nano = deal.get("collection_volume")
+    tr_line = []
+    if tr is not None and vol_nano is not None:
+        tr_line.append(f"  📊  Оборот/цена: {tr:.1f}x  (объём коллекции: {vol_nano/1e9:,.0f} TON)")
+
     lines = [
         SEPARATOR,
         f"  {tag}  —  выгода {diff_ton:.2f} TON (скидка {deal['pct']:.1f}%)",
         f"  📦  {gift.get('collectionName', '?')}  |  модель: {gift.get('modelName', '?')}",
         f"  🎨  Фон: {gift.get('backdropName', '?')}  |  узор: {gift.get('symbolName', '?')}  |  #{gift.get('number', '?')}",
         f"  💰  Цена: {tons_fmt(deal['price'])}  (флор: {tons_fmt(deal['floor'])} [{deal['floor_src']}])",
+        *tr_line,
         f"  🔗  {gift_url(gift)}",
         "",
     ]
     output = "\n".join(lines)
     print(output)
 
+    tr_info = f" | оборот: {tr:.1f}x" if tr is not None else ""
     # Логируем в scanner.log
     log.info(
-        "DEAL [%s] выгода %.2f TON (скидка %.1f%%) | %s %s #%s | %.2f TON → флор %.2f TON | %s",
+        "DEAL [%s] выгода %.2f TON (скидка %.1f%%) | %s %s #%s | %.2f TON → флор %.2f TON%s | %s",
         deal["type"], diff_ton, deal["pct"],
         gift.get("collectionName"), gift.get("modelName"), gift.get("number"),
         tons(deal["price"]), tons(deal["floor"]),
+        tr_info,
         gift_url(gift),
     )
 
@@ -642,6 +695,9 @@ async def main() -> None:
         print(f"\n❌  {e}")
         sys.exit(1)
 
+    if PRIMARY_TOKEN and pool:
+        pool.set_primary_token(PRIMARY_TOKEN)
+
     print(f"  {pool}")
     log.info("Пул: %s", pool)
     print("=" * 60)
@@ -663,6 +719,8 @@ async def main() -> None:
         is_paused=False,
         min_ton_diff=MIN_TON_DIFF,
         cheap_price_threshold=CHEAP_PRICE_THRESHOLD,
+        min_turnover_ratio=MIN_TURNOVER_RATIO,
+        filter_by_balance=FILTER_BY_BALANCE,
         scan_interval=SCAN_INTERVAL,
         scans_count=0,
         deals_count=0,
@@ -679,10 +737,36 @@ async def main() -> None:
     else:
         print("  ℹ️  Telegram бот отключён (не задан TG_BOT_TOKEN или TG_ADMIN_ID в .env)")
 
+    # Первичная проверка баланса основного аккаунта
+    async def update_primary_balance_async(pool_obj: AccountPool, state_obj: ScannerState) -> None:
+        tok = pool_obj.primary_token
+        if not tok:
+            state_obj.primary_balance_nano = None
+            return
+        try:
+            slot = next((s for s in pool_obj.slots if s.token == tok), None)
+            proxy = slot.proxy if slot else None
+            ok, msg, bdata = await verify_token_async(tok, proxy=proxy)
+            if ok and "hard" in bdata:
+                state_obj.primary_balance_nano = int(bdata["hard"])
+                log.debug("Баланс основного аккаунта обновлён: %.2f TON", state_obj.primary_balance_nano / 1e9)
+            else:
+                log.warning("Не удалось обновить баланс основного аккаунта: %s", msg)
+        except Exception as err:
+            log.warning("Ошибка при обновлении баланса основного аккаунта: %s", err)
+
+    await update_primary_balance_async(pool, scanner_state)
+    primary_tok = pool.primary_token
+    if primary_tok:
+        bal_text = f"{scanner_state.primary_balance_nano / 1e9:.2f} TON" if scanner_state.primary_balance_nano is not None else "не проверен"
+        print(f"  👑 Основной аккаунт: {_mask_token(primary_tok)} (баланс: {bal_text})")
+        log.info("Основной аккаунт: %s (баланс: %s)", primary_tok, bal_text)
+
     seen_ids: set = set()
     black_floor: int | None = None
     model_floors: dict[str, int] = {}
     last_model_refresh: float = 0.0
+    last_balance_refresh: float = time.monotonic()
     scan_count = 0
     total_deals = 0
     consecutive_401_errors = 0
@@ -694,6 +778,11 @@ async def main() -> None:
                 if scanner_state.is_paused:
                     await asyncio.sleep(0.5)
                     continue
+
+                # Периодическое фоновое обновление баланса основного аккаунта (каждые 30 сек)
+                if (time.monotonic() - last_balance_refresh >= 30.0) or (scanner_state.filter_by_balance and scanner_state.primary_balance_nano is None):
+                    last_balance_refresh = time.monotonic()
+                    asyncio.create_task(update_primary_balance_async(pool, scanner_state))
 
                 # Принудительное обновление флоров из Telegram бота
                 if scanner_state.force_refresh_models:
@@ -709,12 +798,14 @@ async def main() -> None:
                     log.info("Обновляем базу флоров моделей...")
                     print(f"[{ts}] 🔄 Обновление флоров моделей (раз в {MODEL_FLOOR_REFRESH_HOURS:.0f}ч)...", end=" ", flush=True)
                     try:
-                        mf = await fetch_all_model_floors_async(pool, session)
+                        mf, cv = await fetch_all_model_floors_async(pool, session)
                         if mf:
                             model_floors = mf
                             last_model_refresh = time.monotonic()
                             scanner_state.model_floors_count = len(model_floors)
-                            print(f"загружено {len(model_floors)} моделей")
+                            if cv:
+                                scanner_state.collection_volumes = cv
+                            print(f"загружено {len(model_floors)} моделей ({len(cv)} коллекций)")
                         else:
                             print("не удалось обновить (используем кэш)")
                     except Exception as e:
@@ -754,14 +845,18 @@ async def main() -> None:
                     scan_deals_count = 0
                     if not first_run and new_gifts:
                         scan_deals: list[dict] = []
+                        max_price_nano = scanner_state.primary_balance_nano if scanner_state.filter_by_balance else None
                         for gift in new_gifts:
                             scan_deals.extend(
                                 check_gift(
                                     gift,
                                     black_floor,
                                     model_floors,
+                                    collection_volumes=scanner_state.collection_volumes,
                                     min_ton_diff=scanner_state.min_ton_diff,
                                     cheap_threshold=scanner_state.cheap_price_threshold,
+                                    min_turnover_ratio=scanner_state.min_turnover_ratio,
+                                    max_price_nano=max_price_nano,
                                 )
                             )
 
@@ -793,9 +888,16 @@ async def main() -> None:
                         print(f"\n🛑 Все токены просрочены (HTTP 401). Ожидание обновления токенов через Telegram бота...")
                         scanner_state.is_paused = True
                 except Exception as e:
-                    print(f"\n[{ts}] ❌ {e}")
-                    log.error("Ошибка в скане #%d: %s", scan_count, e, exc_info=True)
-                    stats_tracker.record_error(type(e).__name__, str(e))
+                    err_str = str(e)
+                    if "429" in err_str:
+                        print(f"\n[{ts}] ⏳ 429 Too Many Requests (все слоты на штрафе), пауза 3с...")
+                        log.warning("Скан #%d: все слоты на штрафе (429). Ждём освобождения...", scan_count)
+                        stats_tracker.record_error("HTTP 429", err_str)
+                        await asyncio.sleep(3.0)
+                    else:
+                        print(f"\n[{ts}] ❌ {e}")
+                        log.error("Ошибка в скане #%d: %s", scan_count, e, exc_info=True)
+                        stats_tracker.record_error(type(e).__name__, str(e))
 
                 first_run = False
 

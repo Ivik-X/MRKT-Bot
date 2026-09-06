@@ -6,6 +6,6 @@ services:
     env_file:
       - .env
     volumes:
-      - ./tokens.txt:/app/tokens.txt:ro
+      - ./tokens.txt:/app/tokens.txt
       - ./proxies.txt:/app/proxies.txt:ro
       - ./logs:/app/logs

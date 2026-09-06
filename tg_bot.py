@@ -56,6 +56,10 @@ class ScannerState:
     model_floors_count: int = 0
     force_refresh_models: bool = False
     last_deal: Optional[dict] = None
+    primary_balance_nano: Optional[int] = None
+    filter_by_balance: bool = False
+    min_turnover_ratio: float = 0.0
+    collection_volumes: dict[str, int] = field(default_factory=dict)
 
     def uptime_str(self) -> str:
         elapsed = int(time.monotonic() - self.start_time)
@@ -77,6 +81,7 @@ class BotStates(StatesGroup):
     waiting_for_min_ton_diff = State()
     waiting_for_cheap_threshold = State()
     waiting_for_scan_interval = State()
+    waiting_for_turnover_ratio = State()
 
 
 # ─────────────────────────────────────────────
@@ -136,6 +141,9 @@ def tokens_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="🔄 Проверить балансы", callback_data="tokens_verify_all"),
             ],
             [
+                InlineKeyboardButton(text="👑 Сменить основной", callback_data="nav_select_primary"),
+            ],
+            [
                 InlineKeyboardButton(text="➕ Добавить токен", callback_data="tokens_add"),
                 InlineKeyboardButton(text="📝 Заменить все", callback_data="tokens_replace"),
             ],
@@ -149,9 +157,13 @@ def tokens_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def settings_keyboard() -> InlineKeyboardMarkup:
+def settings_keyboard(state: ScannerState) -> InlineKeyboardMarkup:
+    bal_toggle_text = "🟢 ВКЛ" if state.filter_by_balance else "🔴 ВЫКЛ"
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text=f"💰 Фильтр по балансу: {bal_toggle_text}", callback_data="toggle_balance_filter")],
+            [InlineKeyboardButton(text="📊 Мин. оборот/цена (NFT)", callback_data="set_turnover_ratio")],
+            [InlineKeyboardButton(text="👑 Сменить основной аккаунт", callback_data="nav_select_primary")],
             [InlineKeyboardButton(text="✏️ Порог выгоды (MIN_TON_DIFF)", callback_data="set_min_diff")],
             [InlineKeyboardButton(text="✏️ Порог дешёвых (CHEAP_THRESHOLD)", callback_data="set_cheap")],
             [InlineKeyboardButton(text="✏️ Интервал сканов (SCAN_INTERVAL)", callback_data="set_interval")],
@@ -188,6 +200,13 @@ def format_main_text(state: ScannerState) -> str:
     active_tokens = len(state.pool.get_tokens()) if state.pool else 0
     active_proxies = len(state.pool.get_proxies()) if state.pool else 0
 
+    primary_tok = state.pool.primary_token if state.pool else None
+    primary_str = _mask_token(primary_tok) if primary_tok else "не задан"
+    bal_str = f"{state.primary_balance_nano / 1e9:.2f} TON" if state.primary_balance_nano is not None else "не проверен"
+    filter_bal_str = "🟢 ВКЛ" if state.filter_by_balance else "🔴 ВЫКЛ"
+    turnover_str = f"≥ {state.min_turnover_ratio:.1f}x" if state.min_turnover_ratio > 0 else "выключен"
+    collections_count = len(state.collection_volumes) if state.collection_volumes else 0
+
     return (
         f"🤖 <b>MRKT Scanner Manager</b>\n\n"
         f"Статус: {status_icon}\n"
@@ -196,13 +215,42 @@ def format_main_text(state: ScannerState) -> str:
         f"⚙️ <b>Параметры:</b>\n"
         f"• Порог выгоды: <code>{state.min_ton_diff:.2f} TON</code>\n"
         f"• Дешёвые подарки: &lt; <code>{state.cheap_price_threshold:.2f} TON</code>\n"
+        f"• Мин. оборот/цена (NFT): <code>{turnover_str}</code>\n"
+        f"• Фильтр по балансу: <b>{filter_bal_str}</b>\n"
         f"• Интервал сканов: <code>{state.scan_interval:.2f} с</code>\n\n"
+        f"👑 <b>Основной аккаунт:</b>\n"
+        f"• Токен: <code>{primary_str}</code>\n"
+        f"• Баланс TON: <code>{bal_str}</code>\n\n"
         f"📦 <b>Рыночные данные:</b>\n"
         f"• Флор чёрного фона: <code>{bf_str}</code>\n"
-        f"• Моделей в кэше: <code>{state.model_floors_count}</code>\n\n"
+        f"• Моделей в кэше: <code>{state.model_floors_count}</code> (коллекций: <code>{collections_count}</code>)\n\n"
         f"🔌 <b>Ресурсы:</b>\n"
         f"• Токенов: <code>{active_tokens}</code>\n"
         f"• Прокси: <code>{active_proxies}</code>"
+    )
+
+
+def format_settings_text(state: ScannerState) -> str:
+    bal_str = f"{state.primary_balance_nano / 1e9:.2f} TON" if state.primary_balance_nano is not None else "не проверен"
+    filter_bal_str = "🟢 ВКЛ" if state.filter_by_balance else "🔴 ВЫКЛ"
+    turnover_str = f"≥ {state.min_turnover_ratio:.1f}x" if state.min_turnover_ratio > 0 else "выключен (0.0)"
+    primary_tok = state.pool.primary_token if state.pool else None
+    primary_str = _mask_token(primary_tok) if primary_tok else "не задан"
+
+    return (
+        f"⚙️ <b>Настройки сканера</b>\n\n"
+        f"1. <b>Фильтр по балансу:</b> {filter_bal_str}\n"
+        f"   <i>(Показывать только подарки, на которые хватает баланса основного аккаунта)</i>\n\n"
+        f"2. <b>Мин. оборот/цена для NFT:</b> <code>{turnover_str}</code>\n"
+        f"   <i>(Отсекает мёртвый груз: оборот/цена ≥ X; кроме чёрного фона и подарков < {state.cheap_price_threshold:.1f} TON)</i>\n\n"
+        f"3. <b>Основной аккаунт:</b> <code>{primary_str}</code>\n"
+        f"   <i>(Текущий баланс: <code>{bal_str}</code>; используется для покупок)</i>\n\n"
+        f"4. <b>Порог выгоды (MIN_TON_DIFF):</b> <code>{state.min_ton_diff:.2f} TON</code>\n"
+        f"   <i>(Подарок покупается, если он дешевле флора минимум на это значение)</i>\n\n"
+        f"5. <b>Порог дешёвых (CHEAP_THRESHOLD):</b> <code>{state.cheap_price_threshold:.2f} TON</code>\n"
+        f"   <i>(Любой подарок с ценой ниже этого порога считается выгодным)</i>\n\n"
+        f"6. <b>Интервал сканирования:</b> <code>{state.scan_interval:.2f} с</code>\n"
+        f"   <i>(Пауза между запросами к витрине)</i>"
     )
 
 
@@ -211,15 +259,17 @@ def format_tokens_text(tokens: list[str], verified_info: Optional[dict] = None) 
         return "🔑 <b>Управление токенами</b>\n\n⚠️ В пуле нет активных токенов!"
 
     lines = [f"🔑 <b>Управление токенами</b> (Всего: <code>{len(tokens)}</code>):\n"]
+    primary_tok = tokens[0] if tokens else None
     for i, tok in enumerate(tokens, 1):
         masked = _mask_token(tok)
+        is_prim = " 👑 [Основной]" if tok == primary_tok else ""
         status = ""
         if verified_info and tok in verified_info:
             ok, msg = verified_info[tok]
             status = f" — {'✅' if ok else '❌'} <i>{msg}</i>"
-        lines.append(f"{i}. <code>{masked}</code>{status}")
+        lines.append(f"{i}. <code>{masked}</code>{is_prim}{status}")
 
-    lines.append("\n💡 <i>Нажмите «Проверить балансы», чтобы проверить валидность токенов и баланс TON.</i>")
+    lines.append("\n💡 <i>Первый токен является 👑 основным (с него проверяется баланс). Нажмите «Сменить основной», чтобы переключить.</i>")
     return "\n".join(lines)
 
 
@@ -430,17 +480,99 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
     @dp.callback_query(F.data == "nav_settings")
     async def cb_nav_settings(cb: CallbackQuery, state: FSMContext):
         await state.clear()
-        text = (
-            f"⚙️ <b>Настройки сканера</b>\n\n"
-            f"1. <b>Порог выгоды (MIN_TON_DIFF):</b> <code>{scanner_state.min_ton_diff:.2f} TON</code>\n"
-            f"   <i>(Подарок покупается, если он дешевле флора минимум на это значение)</i>\n\n"
-            f"2. <b>Порог дешёвых (CHEAP_THRESHOLD):</b> <code>{scanner_state.cheap_price_threshold:.2f} TON</code>\n"
-            f"   <i>(Любой подарок с ценой ниже этого порога считается выгодным)</i>\n\n"
-            f"3. <b>Интервал сканирования:</b> <code>{scanner_state.scan_interval:.2f} с</code>\n"
-            f"   <i>(Пауза между запросами к витрине)</i>"
-        )
-        await cb.message.edit_text(text, reply_markup=settings_keyboard(), parse_mode="HTML")
+        text = format_settings_text(scanner_state)
+        await cb.message.edit_text(text, reply_markup=settings_keyboard(scanner_state), parse_mode="HTML")
         await cb.answer()
+
+    @dp.callback_query(F.data == "toggle_balance_filter")
+    async def cb_toggle_balance_filter(cb: CallbackQuery):
+        scanner_state.filter_by_balance = not scanner_state.filter_by_balance
+        status_text = "включён 🟢" if scanner_state.filter_by_balance else "выключен 🔴"
+        await cb.answer(f"Фильтр по балансу {status_text}")
+        if scanner_state.filter_by_balance and scanner_state.primary_balance_nano is None and scanner_state.pool:
+            prim = scanner_state.pool.primary_token
+            if prim:
+                ok, _, bdata = await verify_token_async(prim)
+                if ok and "hard" in bdata:
+                    scanner_state.primary_balance_nano = int(bdata["hard"])
+        text = format_settings_text(scanner_state)
+        await cb.message.edit_text(text, reply_markup=settings_keyboard(scanner_state), parse_mode="HTML")
+
+    @dp.callback_query(F.data == "set_turnover_ratio")
+    async def cb_set_turnover_ratio(cb: CallbackQuery, state: FSMContext):
+        await state.set_state(BotStates.waiting_for_turnover_ratio)
+        cur = f"{scanner_state.min_turnover_ratio:.1f}x" if scanner_state.min_turnover_ratio > 0 else "выключен (0.0)"
+        await cb.message.edit_text(
+            f"📊 <b>Фильтр по обороту (оборот / цена) для NFT</b>\n\n"
+            f"Текущий порог: <code>{cur}</code>\n\n"
+            f"Отсекает «мёртвый груз» — лоты из непопулярных коллекций с низким оборотом.\n"
+            f"Формула: <code>объём_коллекции / цена_подарка &gt;= X</code>\n"
+            f"<i>💡 Не распространяется на лоты с чёрным фоном и дешевле {scanner_state.cheap_price_threshold:.1f} TON.</i>\n\n"
+            f"Введите минимальный коэффициент (например <code>10.0</code> или <code>0</code> для отключения фильтра):",
+            reply_markup=back_to_menu_keyboard("nav_settings"),
+            parse_mode="HTML",
+        )
+        await cb.answer()
+
+    @dp.message(BotStates.waiting_for_turnover_ratio)
+    async def msg_set_turnover_ratio(msg: Message, state: FSMContext):
+        try:
+            val = float(msg.text.replace(",", ".").strip())
+            if val < 0:
+                raise ValueError
+            scanner_state.min_turnover_ratio = val
+            txt = f"<code>{val:.1f}x</code>" if val > 0 else "выключен (0.0)"
+            await msg.answer(f"✅ Фильтр оборота установлен: {txt}", reply_markup=back_to_menu_keyboard("nav_settings"), parse_mode="HTML")
+            await state.clear()
+        except ValueError:
+            await msg.answer("❌ Пожалуйста, введите неотрицательное число (например 10.0 или 0):")
+
+    @dp.callback_query(F.data == "nav_select_primary")
+    async def cb_nav_select_primary(cb: CallbackQuery):
+        tokens = scanner_state.pool.get_tokens() if scanner_state.pool else []
+        if not tokens:
+            await cb.answer("В пуле нет токенов", show_alert=True)
+            return
+
+        kb_rows = []
+        for i, tok in enumerate(tokens):
+            is_prim = (i == 0)
+            prefix = "👑 " if is_prim else ""
+            label = f"{prefix}{i+1}. {_mask_token(tok)}"
+            kb_rows.append([InlineKeyboardButton(text=label, callback_data=f"set_primary_{i}")])
+        kb_rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="nav_settings")])
+        kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+
+        text = (
+            "👑 <b>Выбор основного аккаунта</b>\n\n"
+            "С основного аккаунта:\n"
+            "• Проверяется баланс TON для фильтрации\n"
+            "• Будут совершаться покупки\n\n"
+            "Выберите аккаунт из списка ниже:"
+        )
+        await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        await cb.answer()
+
+    @dp.callback_query(F.data.startswith("set_primary_"))
+    async def cb_set_primary_token(cb: CallbackQuery):
+        idx_str = cb.data.replace("set_primary_", "")
+        try:
+            idx = int(idx_str)
+            tokens = scanner_state.pool.get_tokens() if scanner_state.pool else []
+            if 0 <= idx < len(tokens):
+                target_tok = tokens[idx]
+                if scanner_state.pool:
+                    scanner_state.pool.set_primary_token(target_tok)
+                ok, _, bdata = await verify_token_async(target_tok)
+                if ok and "hard" in bdata:
+                    scanner_state.primary_balance_nano = int(bdata["hard"])
+                await cb.answer(f"👑 Аккаунт {_mask_token(target_tok)} назначен основным!")
+        except Exception as e:
+            log.error("Ошибка смены основного токена: %s", e)
+            await cb.answer("Ошибка смены токена", show_alert=True)
+
+        text = format_settings_text(scanner_state)
+        await cb.message.edit_text(text, reply_markup=settings_keyboard(scanner_state), parse_mode="HTML")
 
     @dp.callback_query(F.data == "set_min_diff")
     async def cb_set_min_diff(cb: CallbackQuery, state: FSMContext):
@@ -600,12 +732,21 @@ async def send_deal_notification(
         f"🎨 <b>Фон:</b> {backdrop}\n"
     )
 
+    if deal.get("turnover_ratio") is not None:
+        tr = deal["turnover_ratio"]
+        vol_ton = deal.get("collection_volume", 0) / 1e9
+        text += f"📊 <b>Оборот/Цена:</b> <code>{tr:.1f}x</code> (объём: <code>{vol_ton:,.0f} TON</code>)\n"
+
     kb = None
     if gift_id:
-        url = f"https://cdn.tgmrkt.io/gift/{gift_id}"
+        tg_app_url = f"https://t.me/mrkt?startapp=gift_{gift_id}"
+        web_url = f"https://cdn.tgmrkt.io/gift/{gift_id}"
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="🛒 Открыть на маркете", url=url)]
+                [
+                    InlineKeyboardButton(text="📱 Открыть в Telegram", url=tg_app_url),
+                    InlineKeyboardButton(text="🌐 Браузер", url=web_url),
+                ]
             ]
         )
 
