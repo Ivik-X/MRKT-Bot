@@ -510,7 +510,7 @@ async def fetch_all_model_floors_async(pool: AccountPool, session: AsyncSession)
                     if c_name and m_name and fp is not None:
                         key = f"{c_name}:{m_name}"
                         model_floors[key] = int(fp)
-            await asyncio.sleep(0.6)  # Пауза между батчами для предотвращения 429 по IP
+            await asyncio.sleep(1.2)  # Пауза между батчами для предотвращения 429 по IP
         except Exception as e:
             log.warning("Ошибка при загрузке флоров моделей для батча %s: %s", batch, e)
 
