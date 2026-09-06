@@ -226,17 +226,91 @@ curl -X POST 'https://api.tgmrkt.io/api/v1/gifts/models' \
 
 ### 3.4. Авторизация через Telegram WebApp (`POST /auth`)
 
-Инициализация сессии через валидацию данных Telegram WebApp.
+Инициализация и обновление сессионного токена пользователя через валидацию данных Telegram WebApp (`initData`).
 
 - **URL:** `https://api.tgmrkt.io/api/v1/auth`
 - **Метод:** `POST`
-- **Тело запроса:**
+
+#### Тело запроса:
 ```json
 {
-  "initData": "query_id=...&user=...&auth_date=...&hash=..."
+  "data": "query_id=AAHpJVJhAAAAAOklUmHD17gy&user=%7B%22id%22%3A1632773609%2C%22first_name%22%3A%22efim%22%2C%22last_name%22%3A%22%22%2C%22username%22%3A%22ethmbo%22%2C%22language_code%22%3A%22ru%22%2C%22is_premium%22%3Atrue%2C%22allows_write_to_pm%22%3Atrue%2C%22photo_url%22%3A%22https%3A%5C%2F%5C%2Ft.me%5C%2Fi%5C%2Fuserpic%5C%2F320%5C%2FdZGURB4WbBnkF1HqSr9j4-csRsOp9D8Xu_LrzC7IE0s.svg%22%7D&auth_date=1788703871&signature=V2nSm90wxAR07QAyfRjOSQf0tjJSobnyKEPRvD408PTXQiqYxGeAAsYtzN7pe3FvgVXnxBAZZNsgFctciCbkDA&hash=8a75e1956041b10fae0da7060de999985bdf61d6c4ace09dd01f9b09e9a73bce",
+  "photo": "https://t.me/i/userpic/320/dZGURB4WbBnkF1HqSr9j4-csRsOp9D8Xu_LrzC7IE0s.svg",
+  "appId": null
 }
 ```
-- **Ответ:** Токен доступа (UUID), используемый в последующих запросах как `Authorization` и `access_token`.
+
+#### Структура строки `data` (Telegram Mini App initData):
+- `query_id` — уникальный идентификатор сессии веб-приложения Telegram.
+- `user` — URL-encoded JSON с данными профиля Telegram (`id`, `first_name`, `username`, `language_code` и др.).
+- `auth_date` — Unix timestamp момента генерации данных клиентом Telegram.
+- `hash` — криптографический HMAC-SHA256 хеш, подписанный секретным ключом бота.
+- `signature` — Ed25519/HMAC цифровая подпись Telegram.
+
+#### Пример cURL:
+```bash
+curl -X POST 'https://api.tgmrkt.io/api/v1/auth' \
+  -H 'accept: */*' \
+  -H 'content-type: application/json' \
+  -H 'origin: https://cdn.tgmrkt.io' \
+  -H 'referer: https://cdn.tgmrkt.io/' \
+  --data-raw '{"data":"query_id=...&user=...&auth_date=...&hash=...","photo":"https://t.me/...","appId":null}'
+```
+
+#### Пример ответа:
+```json
+{
+  "token": "d3650243-715f-4fd5-a21c-1b6cb54d4c6d",
+  "isFirstTime": false,
+  "giftId": null,
+  "profile": null
+}
+```
+Полученный `token` (UUID) подставляется в `Authorization` и cookie `access_token`.
+
+---
+
+#### 💡 Способы автоматизации получения токенов:
+
+1. **Автоматический рефреш при 401 (Полуавтоматический):**
+   Пока строка `data` (initData) не устарела по `auth_date`, скрипт может при получении ошибки 401 автоматически отправлять запрос к `POST /auth`, забирать новый UUID `token` и сохранять его в `tokens.txt` без участия человека.
+
+2. **Полная автоматизация 24/7 через Telegram MTProto (Telethon / Pyrogram):**
+   Telegram генерирует валидный `initData` только внутри клиента Telegram при вызове `RequestAppWebView`.
+   Подключив Telegram-клиент через Python-библиотеку `telethon`:
+   ```python
+   from telethon import TelegramClient
+   from telethon.tl.functions.messages import RequestAppWebViewRequest
+   from telethon.tl.types import InputBotAppShortName
+   import urllib.parse
+   import requests
+
+   client = TelegramClient("session_name", api_id, api_hash)
+   await client.start()
+
+   # Запрос запуска WebApp у бота маркета
+   bot = await client.get_input_entity("mrkt_bot")
+   web_view = await client(RequestAppWebViewRequest(
+       peer=bot,
+       app=InputBotAppShortName(bot, "app"),
+       platform="android",
+   ))
+
+   # web_view.url содержит: https://cdn.tgmrkt.io/#tgWebAppData=...
+   parsed = urllib.parse.urlparse(web_view.url)
+   fragment = urllib.parse.parse_qs(parsed.fragment)
+   init_data = fragment.get("tgWebAppData", [""])[0]
+
+   # Получаем токен MRKT
+   r = requests.post(
+       "https://api.tgmrkt.io/api/v1/auth",
+       json={"data": init_data, "photo": "", "appId": None},
+       headers={"Origin": "https://cdn.tgmrkt.io", "Referer": "https://cdn.tgmrkt.io/"}
+   )
+   token = r.json()["token"]
+   # Токен готов к использованию!
+   ```
+   Этот подход работает полностью автономно на сервере без необходимости что-либо копировать вручную.
 
 ---
 

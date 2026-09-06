@@ -8,6 +8,7 @@ xray_proxy.py — парсинг VLESS URL и управление xray проц
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
@@ -16,7 +17,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from typing import Optional
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 
 BASE_SOCKS_PORT = int(os.getenv("XRAY_BASE_PORT", 10800))
@@ -60,7 +61,7 @@ def parse_vless(url: str, local_port: int) -> VlessConfig:
         uuid=p.username or "",
         host=p.hostname or "",
         port=p.port or 443,
-        name=p.fragment or f"{p.hostname}:{p.port}",
+        name=unquote(p.fragment or f"{p.hostname}:{p.port}"),
         network=_q(q, "type", "tcp"),
         security=_q(q, "security", "none"),
         sni=_q(q, "sni"),
@@ -279,3 +280,77 @@ def load_proxies(path: str = "proxies.txt") -> list[XrayProcess]:
             print(f"  ❌ Прокси [{cfg.name}] не запустился: {e}")
 
     return processes
+
+
+# ─────────────────────────────────────────────
+#  Проверка пинга и фильтрация быстрых прокси
+# ─────────────────────────────────────────────
+
+async def ping_proxy_async(
+    proc: XrayProcess,
+    test_url: str = "https://api.tgmrkt.io/api/v1/gifts/collections",
+    timeout: float = 1.5,
+) -> tuple[bool, float, str]:
+    """
+    Проверяет доступность и пинг одного прокси через cffi AsyncSession.
+    Возвращает (success: bool, latency_ms: float, error_msg: str).
+    """
+    from curl_cffi.requests import AsyncSession
+
+    socks_url = proc.socks_url
+    proxies = {"http": socks_url, "https": socks_url}
+    t0 = time.monotonic()
+    try:
+        async with AsyncSession(impersonate="chrome124", proxies=proxies) as session:
+            resp = await session.get(test_url, timeout=timeout)
+            latency_ms = (time.monotonic() - t0) * 1000.0
+            # Любой статус-код от сервера подтверждает что прокси и сеть работают
+            if resp.status_code in (200, 401, 403, 429):
+                return True, latency_ms, ""
+            return False, latency_ms, f"HTTP {resp.status_code}"
+    except Exception as e:
+        latency_ms = (time.monotonic() - t0) * 1000.0
+        err_name = e.__class__.__name__
+        err_msg = str(e) or err_name
+        if "timeout" in err_msg.lower():
+            err_msg = "Таймаут"
+        return False, latency_ms, err_msg
+
+
+async def filter_fast_proxies_async(
+    processes: list[XrayProcess],
+    max_ping_seconds: float = 1.5,
+    test_url: str = "https://api.tgmrkt.io/api/v1/gifts/collections",
+) -> list[XrayProcess]:
+    """
+    Параллельно пингует все запущенные прокси.
+    Отсеивает те, у которых пинг > max_ping_seconds или ошибка соединения.
+    Останавливает процессы отклонённых прокси.
+    """
+    if not processes:
+        return []
+
+    print(f"  🔍 Проверка пинга {len(processes)} прокси (порог: {max_ping_seconds:.1f}с)...")
+
+    tasks = [ping_proxy_async(p, test_url=test_url, timeout=max_ping_seconds) for p in processes]
+    results = await asyncio.gather(*tasks)
+
+    fast_proxies: list[XrayProcess] = []
+    max_ping_ms = max_ping_seconds * 1000.0
+
+    for proc, (ok, latency_ms, err) in zip(processes, results):
+        if ok and latency_ms <= max_ping_ms:
+            print(f"  ⚡ Прокси [{proc.cfg.name}] пинг: {latency_ms:.0f} мс (OK)")
+            fast_proxies.append(proc)
+        else:
+            reason = f"пинг {latency_ms:.0f} мс (> {max_ping_ms:.0f} мс)" if ok else f"{err} ({latency_ms:.0f} мс)"
+            print(f"  ❌ Прокси [{proc.cfg.name}] отклонён: {reason}")
+            proc.stop()
+
+    if not fast_proxies:
+        print("  ⚠️  Ни один прокси не прошёл проверку скорости! Работаем напрямую (direct).")
+    else:
+        print(f"  🎯 Отобрано быстрых прокси: {len(fast_proxies)} из {len(processes)}")
+
+    return fast_proxies
+

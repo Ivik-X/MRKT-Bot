@@ -28,7 +28,7 @@ from curl_cffi import requests as cffi_requests
 from curl_cffi.requests import AsyncSession
 from dotenv import load_dotenv
 
-from account_pool import AccountPool, Slot, build_pool
+from account_pool import AccountPool, Slot, build_pool, build_pool_async
 
 load_dotenv()
 
@@ -623,7 +623,7 @@ async def main() -> None:
     log.info("Запуск MRKT Scanner (Async) | порог выгоды: %.2f TON | интервал: %.2fs", MIN_TON_DIFF, SCAN_INTERVAL)
 
     try:
-        pool = build_pool()
+        pool = await build_pool_async(max_ping_seconds=REQUEST_TIMEOUT)
     except RuntimeError as e:
         log.critical("Ошибка инициализации пула: %s", e)
         print(f"\n❌  {e}")

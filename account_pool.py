@@ -18,7 +18,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-from xray_proxy import XrayProcess, load_proxies
+from xray_proxy import XrayProcess, load_proxies, filter_fast_proxies_async
 
 
 # Минимальный интервал между запросами через один слот (секунды)
@@ -201,17 +201,15 @@ def load_tokens(path: str = "tokens.txt") -> list[str]:
     return tokens
 
 
-def build_pool(
+async def build_pool_async(
     tokens_file: str = "tokens.txt",
     proxies_file: str = "proxies.txt",
+    max_ping_seconds: float = 1.5,
 ) -> AccountPool:
     """
-    Строит AccountPool из tokens.txt и proxies.txt.
-
-    Логика:
-      - Если прокси нет: каждый токен → direct слот
-      - Если прокси есть: токены + прокси зипуются по кругу
-        Пример: 3 токена, 2 прокси → [t1@p1, t2@p2, t3@p1]
+    Асинхронно строит AccountPool из tokens.txt и proxies.txt.
+    Запускает прокси, параллельно замеряет пинг каждого к MRKT API
+    и отсеивает слишком медленные (> max_ping_seconds) или неработающие.
     """
     tokens = load_tokens(tokens_file)
     if not tokens:
@@ -221,8 +219,15 @@ def build_pool(
 
     print(f"  🔑 Токенов: {len(tokens)}")
 
-    proxies = load_proxies(proxies_file)
-    print(f"  🌐 Прокси:  {len(proxies)}")
+    raw_proxies = load_proxies(proxies_file)
+    print(f"  🌐 Прокси запущено: {len(raw_proxies)}")
+
+    if raw_proxies:
+        proxies = await filter_fast_proxies_async(
+            raw_proxies, max_ping_seconds=max_ping_seconds
+        )
+    else:
+        proxies = []
 
     slots: list[Slot] = []
     if proxies:
@@ -234,3 +239,21 @@ def build_pool(
             slots.append(Slot(token=token))
 
     return AccountPool(slots)
+
+
+def build_pool(
+    tokens_file: str = "tokens.txt",
+    proxies_file: str = "proxies.txt",
+    max_ping_seconds: float = 1.5,
+) -> AccountPool:
+    """
+    Синхронная обёртка для build_pool_async.
+    """
+    return asyncio.run(
+        build_pool_async(
+            tokens_file=tokens_file,
+            proxies_file=proxies_file,
+            max_ping_seconds=max_ping_seconds,
+        )
+    )
+
