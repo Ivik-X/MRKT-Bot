@@ -147,6 +147,50 @@ class AccountPool:
         """Штрафуем слот за 429."""
         slot.penalize(seconds)
 
+    def get_tokens(self) -> list[str]:
+        """Возвращает список уникальных токенов в пуле."""
+        with self._lock:
+            seen = set()
+            tokens = []
+            for s in self._slots:
+                if s.token not in seen:
+                    seen.add(s.token)
+                    tokens.append(s.token)
+            return tokens
+
+    def get_proxies(self) -> list[XrayProcess]:
+        """Возвращает список уникальных активных прокси."""
+        with self._lock:
+            seen = set()
+            proxies = []
+            for s in self._slots:
+                if s.proxy and id(s.proxy) not in seen:
+                    seen.add(id(s.proxy))
+                    proxies.append(s.proxy)
+            return proxies
+
+    def reload_tokens(self, new_tokens: list[str]) -> None:
+        """
+        Горячая перезагрузка списка токенов на лету.
+        Пересобирает слоты с сохранением текущих активных прокси.
+        """
+        if not new_tokens:
+            raise ValueError("Список токенов не может быть пустым")
+
+        with self._lock:
+            active_proxies = self.get_proxies()
+            new_slots: list[Slot] = []
+
+            if active_proxies:
+                proxy_cycle = itertools.cycle(active_proxies)
+                for tok in new_tokens:
+                    new_slots.append(Slot(token=tok, proxy=next(proxy_cycle)))
+            else:
+                for tok in new_tokens:
+                    new_slots.append(Slot(token=tok))
+
+            self._slots = new_slots
+
     def stop_all_proxies(self) -> None:
         """Останавливает все xray процессы."""
         seen: set = set()
@@ -256,4 +300,62 @@ def build_pool(
             max_ping_seconds=max_ping_seconds,
         )
     )
+
+
+def save_tokens(tokens: list[str], path: str = "tokens.txt") -> None:
+    """Сохраняет токены в файл tokens.txt."""
+    with open(path, "w", encoding="utf-8") as f:
+        for t in tokens:
+            t = t.strip()
+            if t:
+                f.write(f"{t}\n")
+
+
+async def verify_token_async(
+    token: str,
+    proxy: Optional[XrayProcess] = None,
+    timeout: float = 4.0,
+) -> tuple[bool, str, dict]:
+    """
+    Проверяет валидность токена через GET /balance к MRKT API.
+    Возвращает (is_valid: bool, status_msg: str, balance_data: dict).
+    """
+    from curl_cffi.requests import AsyncSession
+
+    headers = {
+        "Authorization": token,
+        "Cookie": f"access_token={token}",
+        "Origin": "https://cdn.tgmrkt.io",
+        "Referer": "https://cdn.tgmrkt.io/",
+        "Accept": "application/json, text/plain, */*",
+    }
+    proxies = None
+    if proxy and proxy.alive():
+        url = proxy.socks_url
+        proxies = {"http": url, "https": url}
+
+    try:
+        async with AsyncSession(impersonate="chrome124", proxies=proxies) as session:
+            resp = await session.get(
+                "https://api.tgmrkt.io/api/v1/balance",
+                headers=headers,
+                timeout=timeout,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                hard_nano = data.get("hard", 0)
+                ton_bal = hard_nano / 1e9
+                return True, f"{ton_bal:.2f} TON", data
+            elif resp.status_code == 401:
+                return False, "401 Unauthorized (токен протух)", {}
+            elif resp.status_code == 429:
+                return False, "429 Too Many Requests", {}
+            else:
+                return False, f"HTTP {resp.status_code}", {}
+    except Exception as e:
+        err_msg = str(e) or e.__class__.__name__
+        if "timeout" in err_msg.lower():
+            err_msg = "Таймаут соединения"
+        return False, err_msg, {}
+
 

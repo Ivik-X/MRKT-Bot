@@ -50,6 +50,12 @@ LOG_DIR              = Path(os.getenv("LOG_DIR", "logs"))
 
 BLACK_BACKDROPS = {"Black"}
 
+TG_BOT_TOKEN         = os.getenv("TG_BOT_TOKEN", "").strip()
+TG_ADMIN_ID_RAW      = os.getenv("TG_ADMIN_ID", "").strip()
+TG_ADMIN_IDS         = {int(x.strip()) for x in TG_ADMIN_ID_RAW.split(",") if x.strip().isdigit()}
+
+from tg_bot import ScannerState, run_telegram_bot, send_deal_notification
+
 
 # ─────────────────────────────────────────────
 #  Логирование
@@ -473,12 +479,18 @@ async def fetch_all_model_floors_async(pool: AccountPool, session: AsyncSession)
 #  Проверка сделок
 # ─────────────────────────────────────────────
 
-def check_gift(gift: dict, black_floor: int | None, model_floors: dict[str, int]) -> list[dict]:
+def check_gift(
+    gift: dict,
+    black_floor: int | None,
+    model_floors: dict[str, int],
+    min_ton_diff: float = MIN_TON_DIFF,
+    cheap_threshold: float = CHEAP_PRICE_THRESHOLD,
+) -> list[dict]:
     """
     Подарок считается ликвидным (покупаем) в трёх случаях:
-    1. У него черный фон и он стоит на MIN_TON_DIFF меньше флора черного фона.
-    2. Он стоит меньше CHEAP_PRICE_THRESHOLD (абсолютный дешевый порог).
-    3. Он стоит на MIN_TON_DIFF дешевле флора этой конкретной модели.
+    1. У него черный фон и он стоит на min_ton_diff меньше флора черного фона.
+    2. Он стоит меньше cheap_threshold (абсолютный дешевый порог).
+    3. Он стоит на min_ton_diff дешевле флора этой конкретной модели.
     """
     deals: list[dict] = []
     price = gift.get("salePrice")
@@ -494,7 +506,7 @@ def check_gift(gift: dict, black_floor: int | None, model_floors: dict[str, int]
     # ── 1. Флор чёрного фона ───────────────────────────────────────────────
     if backdrop_name in BLACK_BACKDROPS and black_floor:
         diff_ton = tons(black_floor - price)
-        if diff_ton >= MIN_TON_DIFF:
+        if diff_ton >= min_ton_diff:
             pct = (black_floor - price) / black_floor * 100
             deals.append({
                 "type": "BLACK",
@@ -510,8 +522,8 @@ def check_gift(gift: dict, black_floor: int | None, model_floors: dict[str, int]
                 collection_name, model_name, gift.get("number"), price_ton, tons(black_floor), diff_ton, pct,
             )
 
-    # ── 2. Абсолютный дешевый порог (< CHEAP_PRICE_THRESHOLD TON) ───────────
-    if price_ton < CHEAP_PRICE_THRESHOLD:
+    # ── 2. Абсолютный дешевый порог (< cheap_threshold TON) ────────────────
+    if price_ton < cheap_threshold:
         model_floor_val = model_floors.get(model_key, price)
         diff_ton = tons(model_floor_val - price) if model_floor_val > price else 0.0
         pct = (model_floor_val - price) / model_floor_val * 100 if model_floor_val > 0 else 0.0
@@ -522,18 +534,18 @@ def check_gift(gift: dict, black_floor: int | None, model_floors: dict[str, int]
             "floor": model_floor_val,
             "pct": pct,
             "diff_ton": diff_ton,
-            "floor_src": f"дешевле {CHEAP_PRICE_THRESHOLD:.2f} TON",
+            "floor_src": f"дешевле {cheap_threshold:.2f} TON",
         })
         log.debug(
             "CHEAP deal: %s %s #%s | %.4f TON < %.2f TON порог",
-            collection_name, model_name, gift.get("number"), price_ton, CHEAP_PRICE_THRESHOLD,
+            collection_name, model_name, gift.get("number"), price_ton, cheap_threshold,
         )
 
     # ── 3. Флор конкретной модели ──────────────────────────────────────────
     model_floor = model_floors.get(model_key)
     if model_floor:
         diff_ton = tons(model_floor - price)
-        if diff_ton >= MIN_TON_DIFF:
+        if diff_ton >= min_ton_diff:
             pct = (model_floor - price) / model_floor * 100
             deals.append({
                 "type": "MODEL",
@@ -645,6 +657,27 @@ async def main() -> None:
         except (NotImplementedError, RuntimeError):
             pass
 
+    scanner_state = ScannerState(
+        pool=pool,
+        is_paused=False,
+        min_ton_diff=MIN_TON_DIFF,
+        cheap_price_threshold=CHEAP_PRICE_THRESHOLD,
+        scan_interval=SCAN_INTERVAL,
+        scans_count=0,
+        deals_count=0,
+        start_time=time.monotonic(),
+        black_floor_nano=None,
+        model_floors_count=0,
+    )
+
+    bot_task = None
+    if TG_BOT_TOKEN and TG_ADMIN_IDS:
+        log.info("Запуск Telegram бота управления (админы: %s)...", TG_ADMIN_IDS)
+        print(f"  🤖 Telegram бот запущен для админов: {TG_ADMIN_IDS}")
+        bot_task = asyncio.create_task(run_telegram_bot(TG_BOT_TOKEN, TG_ADMIN_IDS, scanner_state))
+    else:
+        print("  ℹ️  Telegram бот отключён (не задан TG_BOT_TOKEN или TG_ADMIN_ID в .env)")
+
     seen_ids: set = set()
     black_floor: int | None = None
     model_floors: dict[str, int] = {}
@@ -657,7 +690,17 @@ async def main() -> None:
     try:
         async with AsyncSession() as session:
             while not _shutdown.is_set():
+                if scanner_state.is_paused:
+                    await asyncio.sleep(0.5)
+                    continue
+
+                # Принудительное обновление флоров из Telegram бота
+                if scanner_state.force_refresh_models:
+                    scanner_state.force_refresh_models = False
+                    last_model_refresh = 0.0
+
                 scan_count += 1
+                scanner_state.scans_count = scan_count
                 ts = now_str()
 
                 # ── Флор моделей (каждые 12 часов) ──────────────────────────────
@@ -669,6 +712,7 @@ async def main() -> None:
                         if mf:
                             model_floors = mf
                             last_model_refresh = time.monotonic()
+                            scanner_state.model_floors_count = len(model_floors)
                             print(f"загружено {len(model_floors)} моделей")
                         else:
                             print("не удалось обновить (используем кэш)")
@@ -683,6 +727,7 @@ async def main() -> None:
                         bf = await fetch_black_floor_async(pool, session)
                         if bf:
                             black_floor = bf
+                            scanner_state.black_floor_nano = black_floor
                             log.info("Флор чёрного фона: %s", tons_fmt(black_floor))
                             print(f"[{ts}] 🖤 Флор чёрного фона: {tons_fmt(black_floor)}")
                         else:
@@ -709,15 +754,26 @@ async def main() -> None:
                     if not first_run and new_gifts:
                         scan_deals: list[dict] = []
                         for gift in new_gifts:
-                            scan_deals.extend(check_gift(gift, black_floor, model_floors))
+                            scan_deals.extend(
+                                check_gift(
+                                    gift,
+                                    black_floor,
+                                    model_floors,
+                                    min_ton_diff=scanner_state.min_ton_diff,
+                                    cheap_threshold=scanner_state.cheap_price_threshold,
+                                )
+                            )
 
                         if scan_deals:
                             scan_deals_count = len(scan_deals)
                             total_deals += scan_deals_count
+                            scanner_state.deals_count = total_deals
                             print(f"\n[{ts}]  ✅ {len(scan_deals)} предложений! (сессия: {total_deals})\n")
                             log.info("!!! Найдено %d сделок (сессия: %d)", len(scan_deals), total_deals)
                             for deal in scan_deals:
                                 print_and_log_deal(deal)
+                                if TG_BOT_TOKEN and TG_ADMIN_IDS:
+                                    asyncio.create_task(send_deal_notification(TG_BOT_TOKEN, TG_ADMIN_IDS, deal))
 
                     stats_tracker.record_scan(new_gifts, scan_deals_count)
 
@@ -732,9 +788,9 @@ async def main() -> None:
                     print(f"\n[{ts}] ❌ {e}")
                     log.error("Просроченный токен (скан #%d) [%d/3 попыток]", scan_count, consecutive_401_errors)
                     if consecutive_401_errors >= 3:
-                        log.critical("❌ Все токены в пуле просрочены (HTTP 401). Завершение работы сканера во избежание нагрузки.")
-                        print(f"\n🛑 ОСТАНОВКА: Все токены просрочены (HTTP 401). Сканер автоматически завершил работу во избежание бессмысленных запросов.")
-                        break
+                        log.critical("❌ Все токены в пуле просрочены (HTTP 401). Ожидание обновления через Telegram бота.")
+                        print(f"\n🛑 Все токены просрочены (HTTP 401). Ожидание обновления токенов через Telegram бота...")
+                        scanner_state.is_paused = True
                 except Exception as e:
                     print(f"\n[{ts}] ❌ {e}")
                     log.error("Ошибка в скане #%d: %s", scan_count, e, exc_info=True)
@@ -742,11 +798,12 @@ async def main() -> None:
 
                 first_run = False
 
-                # Ждём следующего скана (с поддержкой shutdown)
+                # Ждём следующего скана (с динамическим интервалом из Telegram бота)
+                current_interval = scanner_state.scan_interval
                 try:
                     await asyncio.wait_for(
                         asyncio.shield(asyncio.ensure_future(_shutdown.wait())),
-                        timeout=SCAN_INTERVAL,
+                        timeout=current_interval,
                     )
                     break  # shutdown получен
                 except asyncio.TimeoutError:
@@ -758,6 +815,8 @@ async def main() -> None:
     finally:
         log.info("Остановка: сканов: %d, сделок: %d", scan_count, total_deals)
         print(f"\n👋 Остановлено. Сканов: {scan_count}, сделок: {total_deals}")
+        if bot_task:
+            bot_task.cancel()
         pool.stop_all_proxies()
 
 
