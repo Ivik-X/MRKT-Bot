@@ -234,7 +234,7 @@ def load_proxies(path: str = "proxies.txt") -> list[XrayProcess]:
     Запускает xray процесс для каждого прокси.
     Возвращает список XrayProcess.
     """
-    if not os.path.exists(path):
+    if not os.path.isfile(path):
         return []
 
     lines = []

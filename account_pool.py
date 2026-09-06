@@ -176,7 +176,7 @@ def load_tokens(path: str = "tokens.txt") -> list[str]:
     """
     tokens: list[str] = []
 
-    if os.path.exists(path):
+    if os.path.isfile(path):
         with open(path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
