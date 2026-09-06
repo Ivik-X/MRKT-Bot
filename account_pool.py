@@ -110,13 +110,19 @@ class AccountPool:
     Пропускает disabled (тормозящие) слоты.
     """
 
-    def __init__(self, slots: list[Slot], reserve_proxies: Optional[list[XrayProcess]] = None):
+    def __init__(
+        self,
+        slots: list[Slot],
+        reserve_proxies: Optional[list[XrayProcess]] = None,
+        use_direct: bool = False,
+    ):
         if not slots:
             raise ValueError("AccountPool: список слотов пуст")
         self._slots = slots
         self._reserve_proxies = list(reserve_proxies or [])
         self._lock = threading.RLock()
         self._async_lock = asyncio.Lock()
+        self.use_direct = use_direct
 
     def replace_slot_proxy(self, slot: Slot) -> Optional[XrayProcess]:
         """Заменяет проблемный прокси в слоте на следующий быстрый из резерва."""
@@ -221,7 +227,7 @@ class AccountPool:
     def reload_tokens(self, new_tokens: list[str]) -> None:
         """
         Горячая перезагрузка списка токенов на лету.
-        Пересобирает слоты с распределением по ВСЕМ активным прокси.
+        Пересобирает слоты с распределением по ВСЕМ активным прокси с учётом use_direct.
         """
         if not new_tokens:
             raise ValueError("Список токенов не может быть пустым")
@@ -230,13 +236,20 @@ class AccountPool:
             active_proxies = self.get_proxies()
             new_slots: list[Slot] = []
 
-            if active_proxies:
+            if not active_proxies:
+                for tok in new_tokens:
+                    new_slots.append(Slot(token=tok))
+            elif self.use_direct:
+                for i, tok in enumerate(new_tokens):
+                    if i == 0:
+                        new_slots.append(Slot(token=tok, proxy=None))
+                    else:
+                        prx = active_proxies[(i - 1) % len(active_proxies)]
+                        new_slots.append(Slot(token=tok, proxy=prx))
+            else:
                 for i, tok in enumerate(new_tokens):
                     prx = active_proxies[i % len(active_proxies)]
                     new_slots.append(Slot(token=tok, proxy=prx))
-            else:
-                for tok in new_tokens:
-                    new_slots.append(Slot(token=tok))
 
             self._slots = new_slots
 
@@ -298,6 +311,44 @@ def load_tokens(path: str = "tokens.txt") -> list[str]:
     return tokens
 
 
+def load_use_direct_setting(path: str = "proxies.txt") -> bool:
+    """
+    Проверяет настройку использования прямого IP сервера (без VPN).
+    Смотрит в proxies.txt на строчку:
+      USE_DIRECT=true / false
+      direct=true / false
+    Поддерживает как открытые строки, так и комментарии: # USE_DIRECT=true.
+    Если в файле не указано, проверяет переменную окружения USE_DIRECT (по умолчанию false).
+    """
+    file_to_read = None
+    if os.path.isfile(path):
+        file_to_read = path
+    elif os.path.isdir(path):
+        for candidate in sorted(os.listdir(path)):
+            cand_path = os.path.join(path, candidate)
+            if os.path.isfile(cand_path):
+                file_to_read = cand_path
+                break
+
+    if file_to_read:
+        try:
+            with open(file_to_read, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    # Поддерживаем USE_DIRECT=true, direct=true, # USE_DIRECT=true
+                    cleaned = line.lstrip("#").strip()
+                    if "=" in cleaned:
+                        k, v = cleaned.split("=", 1)
+                        k = k.strip().upper()
+                        v = v.strip().lower()
+                        if k in ("USE_DIRECT", "DIRECT", "USE_LOCAL_IP"):
+                            return v in ("1", "true", "yes")
+        except Exception:
+            pass
+
+    return os.getenv("USE_DIRECT", "false").lower() in ("1", "true", "yes")
+
+
 async def build_pool_async(
     tokens_file: str = "tokens.txt",
     proxies_file: str = "proxies.txt",
@@ -307,6 +358,7 @@ async def build_pool_async(
     Асинхронно строит AccountPool из tokens.txt и proxies.txt.
     Запускает прокси, параллельно замеряет пинг каждого к MRKT API
     и отсеивает слишком медленные (> max_ping_seconds) или неработающие.
+    Поддерживает настройку USE_DIRECT (true/false) в начале proxies.txt.
     """
     tokens = load_tokens(tokens_file)
     if not tokens:
@@ -315,6 +367,10 @@ async def build_pool_async(
         )
 
     print(f"  🔑 Токенов: {len(tokens)}")
+
+    use_direct = load_use_direct_setting(proxies_file)
+    direct_status = "ВКЛ 🟢 (1 слот без VPN на прямом IP)" if use_direct else "ВЫКЛ 🔴 (все слоты строго через VPN)"
+    print(f"  ⚙️ Прямой IP (USE_DIRECT): {direct_status}")
 
     raw_proxies = load_proxies(proxies_file)
     print(f"  🌐 Прокси запущено: {len(raw_proxies)}")
@@ -326,25 +382,30 @@ async def build_pool_async(
     else:
         proxies = []
 
-    # Отбираем самые быстрые прокси под количество токенов (1 токен = 1 самый быстрый ВПН)
+    # Отбираем самые быстрые прокси под количество токенов
     selected_proxies: list[XrayProcess] = []
     reserve_proxies: list[XrayProcess] = []
+    num_proxies_needed = max(0, len(tokens) - 1) if use_direct else len(tokens)
+
     if proxies:
-        num_needed = len(tokens)
-        selected_proxies = proxies[:num_needed]
+        selected_proxies = proxies[:num_proxies_needed]
         # До 10 лучших оставшихся держим в горячем резерве для авто-замены при сбоях
-        reserve_proxies = proxies[num_needed:num_needed + 10]
-        for extra in proxies[num_needed + 10:]:
+        reserve_proxies = proxies[num_proxies_needed:num_proxies_needed + 10]
+        for extra in proxies[num_proxies_needed + 10:]:
             print(f"  💤 Прокси [{extra.cfg.name}] остановлен (избыточный резерв)")
             extra.stop()
 
-        print(f"  🎯 Отобрано {len(selected_proxies)} самых быстрых прокси для {len(tokens)} токенов (в горячем резерве: {len(reserve_proxies)}):")
-        for idx, (tok, prx) in enumerate(zip(tokens, selected_proxies), 1):
-            tok_mask = f"{tok[:8]}…{tok[-4:]}" if len(tok) > 12 else tok
-            print(f"     #{idx}: {tok_mask} ⇄ [{prx.cfg.name}] ({prx.ping_ms:.0f} мс)")
-
     slots: list[Slot] = []
-    if selected_proxies:
+    if use_direct:
+        # 1-й токен (основной) идёт напрямую без VPN
+        slots.append(Slot(token=tokens[0], proxy=None))
+        for i, token in enumerate(tokens[1:]):
+            if selected_proxies:
+                prx = selected_proxies[i % len(selected_proxies)]
+                slots.append(Slot(token=token, proxy=prx))
+            else:
+                slots.append(Slot(token=token))
+    elif selected_proxies:
         for i, token in enumerate(tokens):
             prx = selected_proxies[i % len(selected_proxies)]
             slots.append(Slot(token=token, proxy=prx))
@@ -352,7 +413,18 @@ async def build_pool_async(
         for token in tokens:
             slots.append(Slot(token=token))
 
-    return AccountPool(slots, reserve_proxies=reserve_proxies)
+    print(f"  🎯 Распределение {len(slots)} слотов:")
+    for idx, slot in enumerate(slots, 1):
+        tok_mask = f"{slot.token[:8]}…{slot.token[-4:]}" if len(slot.token) > 12 else slot.token
+        if slot.proxy:
+            print(f"     #{idx}: {tok_mask} ⇄ [{slot.proxy.cfg.name}] ({slot.proxy.ping_ms:.0f} мс)")
+        else:
+            print(f"     #{idx}: {tok_mask} ⇄ [direct] (текущий прямой IP сервера, 0 мс)")
+
+    if reserve_proxies:
+        print(f"  🛡️ В горячем резерве: {len(reserve_proxies)} прокси для быстрой авто-замены при сбоях")
+
+    return AccountPool(slots, reserve_proxies=reserve_proxies, use_direct=use_direct)
 
 
 def build_pool(
