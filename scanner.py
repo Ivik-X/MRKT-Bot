@@ -44,6 +44,7 @@ BLACK_FLOOR_REFRESH  = int(os.getenv("BLACK_FLOOR_REFRESH", 40))
 MODEL_FLOOR_REFRESH_HOURS = float(os.getenv("MODEL_FLOOR_REFRESH_HOURS", 12.0))
 MODEL_FLOOR_REFRESH_SECS = MODEL_FLOOR_REFRESH_HOURS * 3600.0
 REQUEST_TIMEOUT      = float(os.getenv("REQUEST_TIMEOUT", 1.5))       # Таймаут: >1.5с отключает медленный прокси
+MAX_PING_SECONDS     = float(os.getenv("MAX_PING_SECONDS", 3.0))      # Допустимый пинг прокси при первичном тесте
 MAX_RETRIES          = int(os.getenv("MAX_RETRIES", 3))
 PENALTY_429          = float(os.getenv("PENALTY_429", 60.0))
 LOG_DIR              = Path(os.getenv("LOG_DIR", "logs"))
@@ -467,7 +468,7 @@ async def fetch_all_model_floors_async(pool: AccountPool, session: AsyncSession)
                     if c_name and m_name and fp is not None:
                         key = f"{c_name}:{m_name}"
                         model_floors[key] = int(fp)
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.6)  # Пауза между батчами для предотвращения 429 по IP
         except Exception as e:
             log.warning("Ошибка при загрузке флоров моделей для батча %s: %s", batch, e)
 
@@ -635,7 +636,7 @@ async def main() -> None:
     log.info("Запуск MRKT Scanner (Async) | порог выгоды: %.2f TON | интервал: %.2fs", MIN_TON_DIFF, SCAN_INTERVAL)
 
     try:
-        pool = await build_pool_async(max_ping_seconds=REQUEST_TIMEOUT)
+        pool = await build_pool_async(max_ping_seconds=MAX_PING_SECONDS)
     except RuntimeError as e:
         log.critical("Ошибка инициализации пула: %s", e)
         print(f"\n❌  {e}")

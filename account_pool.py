@@ -248,7 +248,7 @@ def load_tokens(path: str = "tokens.txt") -> list[str]:
 async def build_pool_async(
     tokens_file: str = "tokens.txt",
     proxies_file: str = "proxies.txt",
-    max_ping_seconds: float = 1.5,
+    max_ping_seconds: float = float(os.getenv("MAX_PING_SECONDS", 3.0)),
 ) -> AccountPool:
     """
     Асинхронно строит AccountPool из tokens.txt и proxies.txt.
@@ -288,7 +288,7 @@ async def build_pool_async(
 def build_pool(
     tokens_file: str = "tokens.txt",
     proxies_file: str = "proxies.txt",
-    max_ping_seconds: float = 1.5,
+    max_ping_seconds: float = float(os.getenv("MAX_PING_SECONDS", 3.0)),
 ) -> AccountPool:
     """
     Синхронная обёртка для build_pool_async.

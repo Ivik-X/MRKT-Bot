@@ -289,7 +289,7 @@ def load_proxies(path: str = "proxies.txt") -> list[XrayProcess]:
 async def ping_proxy_async(
     proc: XrayProcess,
     test_url: str = "https://api.tgmrkt.io/api/v1/gifts/collections",
-    timeout: float = 1.5,
+    timeout: float = 4.0,
 ) -> tuple[bool, float, str]:
     """
     Проверяет доступность и пинг одного прокси через cffi AsyncSession.
@@ -319,7 +319,7 @@ async def ping_proxy_async(
 
 async def filter_fast_proxies_async(
     processes: list[XrayProcess],
-    max_ping_seconds: float = 1.5,
+    max_ping_seconds: float = 3.0,
     test_url: str = "https://api.tgmrkt.io/api/v1/gifts/collections",
 ) -> list[XrayProcess]:
     """
@@ -332,7 +332,8 @@ async def filter_fast_proxies_async(
 
     print(f"  🔍 Проверка пинга {len(processes)} прокси (порог: {max_ping_seconds:.1f}с)...")
 
-    tasks = [ping_proxy_async(p, test_url=test_url, timeout=max_ping_seconds) for p in processes]
+    timeout_val = max(4.0, max_ping_seconds + 1.0)
+    tasks = [ping_proxy_async(p, test_url=test_url, timeout=timeout_val) for p in processes]
     results = await asyncio.gather(*tasks)
 
     fast_proxies: list[XrayProcess] = []
