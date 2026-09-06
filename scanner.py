@@ -146,9 +146,25 @@ def tons_fmt(n: int | float) -> str:
 def now_str() -> str:
     return datetime.now().strftime("%H:%M:%S")
 
+def make_telegram_nft_url(collection_name: str, number: Any) -> str:
+    """
+    Генерирует официальную ссылку Telegram NFT вида:
+    https://t.me/nft/CandyCane-79154
+    """
+    if not collection_name or number is None:
+        return "https://t.me/nft"
+    import re
+    cleaned = str(collection_name).replace("'", "")
+    words = re.findall(r"[A-Za-z0-9]+", cleaned)
+    slug = "".join(w.capitalize() for w in words)
+    if not slug:
+        return "https://t.me/nft"
+    return f"https://t.me/nft/{slug}-{number}"
+
 def gift_url(gift: dict) -> str:
-    gid = gift.get("giftId") or gift.get("id", "")
-    return f"https://t.me/mrkt?startapp=gift_{gid}" if gid else "https://t.me/mrkt"
+    col = gift.get("collectionName", "")
+    num = gift.get("number") if gift.get("number") is not None else gift.get("num")
+    return make_telegram_nft_url(col, num)
 
 SEPARATOR = "─" * 60
 
@@ -970,7 +986,15 @@ async def main() -> None:
                             for deal in scan_deals:
                                 print_and_log_deal(deal)
                                 if TG_BOT_TOKEN and TG_ADMIN_IDS:
-                                    asyncio.create_task(send_deal_notification(TG_BOT_TOKEN, TG_ADMIN_IDS, deal))
+                                    deal_type = deal.get("type", "MODEL")
+                                    if scanner_state.notify_categories.get(deal_type, True):
+                                        asyncio.create_task(send_deal_notification(TG_BOT_TOKEN, TG_ADMIN_IDS, deal))
+                                    else:
+                                        scanner_state.vault.append(deal)
+                                        log.info(
+                                            "Сделка [%s] #%s сохранена в Хранилище (уведомления выключены) | Всего в хранилище: %d",
+                                            deal_type, deal.get("gift", {}).get("number"), len(scanner_state.vault),
+                                        )
 
                     stats_tracker.record_scan(new_gifts, scan_deals_count)
 

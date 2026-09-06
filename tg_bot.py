@@ -60,6 +60,13 @@ class ScannerState:
     filter_by_balance: bool = False
     min_turnover_ratio: float = 0.0
     collection_volumes: dict[str, int] = field(default_factory=dict)
+    notify_categories: dict[str, bool] = field(default_factory=lambda: {
+        "BLACK": os.getenv("NOTIFY_BLACK", "true").lower() in ("1", "true", "yes"),
+        "CHEAP": os.getenv("NOTIFY_CHEAP", "true").lower() in ("1", "true", "yes"),
+        "MODEL": os.getenv("NOTIFY_MODEL", "true").lower() in ("1", "true", "yes"),
+        "LOW_ID": os.getenv("NOTIFY_LOW_ID", "true").lower() in ("1", "true", "yes"),
+    })
+    vault: list[dict] = field(default_factory=list)
 
     def uptime_str(self) -> str:
         elapsed = int(time.monotonic() - self.start_time)
@@ -96,6 +103,21 @@ def _mask_token(token: str) -> str:
     return token
 
 
+def make_telegram_nft_url(collection_name: str, number: Any) -> str:
+    """
+    Генерирует официальную ссылку Telegram NFT вида:
+    https://t.me/nft/CandyCane-79154
+    """
+    if not collection_name or number is None:
+        return "https://t.me/nft"
+    cleaned = str(collection_name).replace("'", "")
+    words = re.findall(r"[A-Za-z0-9]+", cleaned)
+    slug = "".join(w.capitalize() for w in words)
+    if not slug:
+        return "https://t.me/nft"
+    return f"https://t.me/nft/{slug}-{number}"
+
+
 def _extract_uuid_tokens(text: str) -> list[str]:
     """Извлекает валидные UUID токены из любого текста."""
     pattern = r"[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}"
@@ -119,9 +141,15 @@ def main_keyboard(state: ScannerState) -> InlineKeyboardMarkup:
         if state.is_paused
         else InlineKeyboardButton(text="⏸ Пауза", callback_data="scanner_pause")
     )
+    vault_count = len(state.vault) if state.vault else 0
+    vault_badge = f" ({vault_count})" if vault_count > 0 else ""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [status_btn, InlineKeyboardButton(text="🔄 Обновить статус", callback_data="nav_main")],
+            [
+                InlineKeyboardButton(text=f"📦 Хранилище{vault_badge}", callback_data="nav_vault"),
+                InlineKeyboardButton(text="🔔 Категории", callback_data="nav_categories"),
+            ],
             [
                 InlineKeyboardButton(text="🔑 Токены", callback_data="nav_tokens"),
                 InlineKeyboardButton(text="⚙️ Настройки", callback_data="nav_settings"),
@@ -181,6 +209,40 @@ def proxies_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def categories_keyboard(state: ScannerState) -> InlineKeyboardMarkup:
+    cat_names = {
+        "BLACK": "🖤 Чёрный фон",
+        "CHEAP": "💸 Сверхдешёвые",
+        "MODEL": "🎯 Ниже флора",
+        "LOW_ID": "🏷️ Редкий ID (<100)",
+    }
+    rows = []
+    for cat_key, cat_label in cat_names.items():
+        is_on = state.notify_categories.get(cat_key, True)
+        status = "🟢 ВКЛ" if is_on else "🔴 ВЫКЛ (в хранилище)"
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{cat_label}: {status}",
+                callback_data=f"toggle_cat_{cat_key}",
+            )
+        ])
+    vault_count = len(state.vault) if state.vault else 0
+    rows.append([InlineKeyboardButton(text=f"📦 Перейти в Хранилище ({vault_count})", callback_data="nav_vault")])
+    rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="nav_main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def vault_keyboard(state: ScannerState) -> InlineKeyboardMarkup:
+    vault_len = len(state.vault) if state.vault else 0
+    rows = []
+    if vault_len > 0:
+        rows.append([InlineKeyboardButton(text=f"📤 Отправить все ({vault_len}) в чат", callback_data="vault_send_all")])
+        rows.append([InlineKeyboardButton(text="🗑 Очистить хранилище", callback_data="vault_clear")])
+    rows.append([InlineKeyboardButton(text="🔔 Настройка категорий", callback_data="nav_categories")])
+    rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="nav_main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def back_to_menu_keyboard(target: str = "nav_main") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -206,12 +268,14 @@ def format_main_text(state: ScannerState) -> str:
     filter_bal_str = "🟢 ВКЛ" if state.filter_by_balance else "🔴 ВЫКЛ"
     turnover_str = f"≥ {state.min_turnover_ratio:.1f}x" if state.min_turnover_ratio > 0 else "выключен"
     collections_count = len(state.collection_volumes) if state.collection_volumes else 0
+    vault_count = len(state.vault) if state.vault else 0
 
     return (
         f"🤖 <b>MRKT Scanner Manager</b>\n\n"
         f"Статус: {status_icon}\n"
         f"⏱ Аптайм: <code>{state.uptime_str()}</code>\n"
-        f"📊 Сканов: <code>{state.scans_count:,}</code> | 🎯 Сделок: <code>{state.deals_count}</code>\n\n"
+        f"📊 Сканов: <code>{state.scans_count:,}</code> | 🎯 Сделок: <code>{state.deals_count}</code>\n"
+        f"📦 В хранилище: <b>{vault_count}</b> сделок\n\n"
         f"⚙️ <b>Параметры:</b>\n"
         f"• Порог выгоды: <code>{state.min_ton_diff:.2f} TON</code>\n"
         f"• Дешёвые подарки: &lt; <code>{state.cheap_price_threshold:.2f} TON</code>\n"
@@ -227,6 +291,43 @@ def format_main_text(state: ScannerState) -> str:
         f"🔌 <b>Ресурсы:</b>\n"
         f"• Токенов: <code>{active_tokens}</code>\n"
         f"• Прокси: <code>{active_proxies}</code>"
+    )
+
+
+def format_categories_text(state: ScannerState) -> str:
+    vault_len = len(state.vault) if state.vault else 0
+    return (
+        f"🔔 <b>Уведомления по категориям</b>\n\n"
+        f"Нажмите на категорию, чтобы включить или выключить моментальные алерты в чат:\n\n"
+        f"• <b>ВКЛ 🟢</b> — алерты сразу приходят в этот чат.\n"
+        f"• <b>ВЫКЛ 🔴</b> — алерты не спамят в чат, а бережно сохраняются в 📦 <b>Хранилище</b> (сейчас там: <b>{vault_len}</b> шт.). "
+        f"Вы можете выгрузить их все одной кнопкой в любой удобный момент.\n"
+    )
+
+
+def format_vault_text(state: ScannerState) -> str:
+    vault = state.vault or []
+    count = len(vault)
+    if count == 0:
+        return (
+            "📦 <b>Хранилище сделок</b>\n\n"
+            "Хранилище сейчас <b>пусто</b>.\n\n"
+            "<i>Сюда автоматически сохраняются сделки тех категорий, для которых выключены моментальные уведомления.</i>"
+        )
+
+    by_cat = {"BLACK": 0, "CHEAP": 0, "MODEL": 0, "LOW_ID": 0}
+    for d in vault:
+        t = d.get("type", "MODEL")
+        by_cat[t] = by_cat.get(t, 0) + 1
+
+    return (
+        f"📦 <b>Хранилище сделок</b>\n\n"
+        f"Всего накоплено сделок: <b>{count}</b> шт.\n"
+        f"• 🖤 Чёрный фон: <b>{by_cat.get('BLACK', 0)}</b>\n"
+        f"• 💸 Сверхдешёвые: <b>{by_cat.get('CHEAP', 0)}</b>\n"
+        f"• 🎯 Ниже флора модели: <b>{by_cat.get('MODEL', 0)}</b>\n"
+        f"• 🏷️ Редкие номера (&lt;100): <b>{by_cat.get('LOW_ID', 0)}</b>\n\n"
+        f"Нажмите <b>«📤 Отправить все в чат»</b>, чтобы выгрузить все накопленные подарки сообщениями."
     )
 
 
@@ -324,6 +425,66 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
     async def cb_refresh_floors(cb: CallbackQuery):
         scanner_state.force_refresh_models = True
         await cb.answer("🔄 Запущено обновление флоров моделей...")
+
+    # ── Раздел: Уведомления по категориям ────────────────────────────────
+    @dp.callback_query(F.data == "nav_categories")
+    async def cb_nav_categories(cb: CallbackQuery, state: FSMContext):
+        await state.clear()
+        text = format_categories_text(scanner_state)
+        await cb.message.edit_text(text, reply_markup=categories_keyboard(scanner_state), parse_mode="HTML")
+        await cb.answer()
+
+    @dp.callback_query(F.data.startswith("toggle_cat_"))
+    async def cb_toggle_cat(cb: CallbackQuery):
+        cat = cb.data.replace("toggle_cat_", "")
+        current = scanner_state.notify_categories.get(cat, True)
+        scanner_state.notify_categories[cat] = not current
+        status = "ВКЛ 🟢" if not current else "ВЫКЛ 🔴"
+        await cb.answer(f"{cat}: {status}")
+        text = format_categories_text(scanner_state)
+        await cb.message.edit_text(text, reply_markup=categories_keyboard(scanner_state), parse_mode="HTML")
+
+    # ── Раздел: Хранилище (Vault) ─────────────────────────────────────────
+    @dp.callback_query(F.data == "nav_vault")
+    async def cb_nav_vault(cb: CallbackQuery, state: FSMContext):
+        await state.clear()
+        text = format_vault_text(scanner_state)
+        await cb.message.edit_text(text, reply_markup=vault_keyboard(scanner_state), parse_mode="HTML")
+        await cb.answer()
+
+    @dp.callback_query(F.data == "vault_send_all")
+    async def cb_vault_send_all(cb: CallbackQuery):
+        vault_deals = list(scanner_state.vault)
+        if not vault_deals:
+            await cb.answer("Хранилище пусто!", show_alert=True)
+            return
+
+        scanner_state.vault.clear()
+        await cb.answer(f"Отправка {len(vault_deals)} сделок...")
+        await cb.message.edit_text(
+            f"📤 <i>Отправка {len(vault_deals)} сделок из Хранилища в чат...</i>",
+            parse_mode="HTML",
+        )
+
+        for d in vault_deals:
+            await send_deal_notification(bot_token, admin_ids, d, bot=bot)
+            await asyncio.sleep(0.08)
+
+        text = format_vault_text(scanner_state)
+        await cb.message.edit_text(text, reply_markup=vault_keyboard(scanner_state), parse_mode="HTML")
+        await cb.message.answer(
+            f"✅ Все <b>{len(vault_deals)}</b> сделок из Хранилища успешно отправлены!",
+            reply_markup=back_to_menu_keyboard("nav_vault"),
+            parse_mode="HTML",
+        )
+
+    @dp.callback_query(F.data == "vault_clear")
+    async def cb_vault_clear(cb: CallbackQuery):
+        count = len(scanner_state.vault)
+        scanner_state.vault.clear()
+        await cb.answer(f"Хранилище очищено ({count} удалено)", show_alert=True)
+        text = format_vault_text(scanner_state)
+        await cb.message.edit_text(text, reply_markup=vault_keyboard(scanner_state), parse_mode="HTML")
 
     # ── Раздел: Токены ───────────────────────────────────────────────────
     @dp.callback_query(F.data == "nav_tokens")
@@ -696,6 +857,7 @@ async def send_deal_notification(
     bot_token: str,
     admin_ids: set[int],
     deal: dict,
+    bot: Optional[Bot] = None,
 ) -> None:
     """Отправляет богато оформленное уведомление о выгодной сделке в Telegram."""
     if not bot_token or not admin_ids:
@@ -722,7 +884,6 @@ async def send_deal_notification(
     mod_name = gift.get("modelName", "")
     num = gift.get("number") or gift.get("num") or "?"
     backdrop = gift.get("backdropName", "—")
-    gift_id = gift.get("giftId") or gift.get("id") or ""
 
     text = (
         f"{header}\n\n"
@@ -738,26 +899,24 @@ async def send_deal_notification(
         vol_ton = deal.get("collection_volume", 0) / 1e9
         text += f"📊 <b>Оборот/Цена:</b> <code>{tr:.1f}x</code> (объём: <code>{vol_ton:,.0f} TON</code>)\n"
 
-    kb = None
-    if gift_id:
-        tg_app_url = f"https://t.me/mrkt?startapp=gift_{gift_id}"
-        web_url = f"https://cdn.tgmrkt.io/gift/{gift_id}"
-        text += (
-            f"\n🔗 <b>Ссылки на подарок:</b>\n"
-            f"• 📱 <a href=\"{tg_app_url}\">Открыть в Telegram (Mini App)</a>\n"
-            f"• 🌐 <a href=\"{web_url}\">Открыть в браузере</a>\n"
-            f"• 📋 <code>{tg_app_url}</code>\n"
-        )
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="📱 Открыть в Telegram", url=tg_app_url),
-                    InlineKeyboardButton(text="🌐 Браузер", url=web_url),
-                ]
+    nft_url = make_telegram_nft_url(col_name, num)
+    text += (
+        f"\n🔗 <b>Ссылка на NFT:</b>\n"
+        f"• 🎁 <a href=\"{nft_url}\">{nft_url}</a>\n"
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🎁 Открыть NFT в Telegram", url=nft_url),
             ]
-        )
+        ]
+    )
 
-    bot = Bot(token=bot_token)
+    should_close = False
+    if bot is None:
+        bot = Bot(token=bot_token)
+        should_close = True
+
     try:
         for admin_id in admin_ids:
             try:
@@ -770,4 +929,5 @@ async def send_deal_notification(
             except Exception as e:
                 log.warning("Не удалось отправить алерт в TG %s: %s", admin_id, e)
     finally:
-        await bot.session.close()
+        if should_close:
+            await bot.session.close()
