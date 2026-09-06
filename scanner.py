@@ -40,7 +40,9 @@ MARKET_API_URL       = "https://api.tgmrkt.io/api/v1"
 SCAN_INTERVAL        = float(os.getenv("SCAN_INTERVAL", 0.5))
 MIN_TON_DIFF         = float(os.getenv("MIN_TON_DIFF", 2.5))
 CHEAP_PRICE_THRESHOLD = float(os.getenv("CHEAP_PRICE_THRESHOLD", 3.0))  # абсолютный порог: < N TON → всегда сделка
-BLACK_FLOOR_REFRESH  = int(os.getenv("BLACK_FLOOR_REFRESH", 10))
+BLACK_FLOOR_REFRESH  = int(os.getenv("BLACK_FLOOR_REFRESH", 40))
+MODEL_FLOOR_REFRESH_HOURS = float(os.getenv("MODEL_FLOOR_REFRESH_HOURS", 12.0))
+MODEL_FLOOR_REFRESH_SECS = MODEL_FLOOR_REFRESH_HOURS * 3600.0
 REQUEST_TIMEOUT      = float(os.getenv("REQUEST_TIMEOUT", 1.5))       # Таймаут: >1.5с отключает медленный прокси
 MAX_RETRIES          = int(os.getenv("MAX_RETRIES", 3))
 PENALTY_429          = float(os.getenv("PENALTY_429", 60.0))
@@ -234,9 +236,15 @@ class AuthTokenExpiredError(Exception):
 #  API с retry и логированием
 # ─────────────────────────────────────────────
 
-async def api_post_async(endpoint: str, json_data: dict, pool: AccountPool, session: AsyncSession) -> dict:
+async def api_request_async(
+    method: str,
+    endpoint: str,
+    pool: AccountPool,
+    session: AsyncSession,
+    json_data: dict | None = None,
+) -> Any:
     """
-    Асинхронный POST запрос через AsyncSession с обработкой 429 и отключением медленных прокси (>1.5с).
+    Асинхронный HTTP запрос (GET/POST) через AsyncSession с обработкой 429 и отключением медленных прокси (>1.5с).
     """
     last_exc: Exception | None = None
 
@@ -245,18 +253,26 @@ async def api_post_async(endpoint: str, json_data: dict, pool: AccountPool, sess
         t0 = time.monotonic()
 
         log.debug(
-            "API POST %s | слот: %s | попытка %d/%d",
-            endpoint, slot.label, attempt + 1, MAX_RETRIES,
+            "API %s %s | слот: %s | попытка %d/%d",
+            method.upper(), endpoint, slot.label, attempt + 1, MAX_RETRIES,
         )
 
         try:
-            r = await session.post(
-                f"{MARKET_API_URL}{endpoint}",
-                headers=slot.headers,
-                json=json_data,
-                proxies=slot.proxies,
-                timeout=REQUEST_TIMEOUT,
-            )
+            if method.upper() == "GET":
+                r = await session.get(
+                    f"{MARKET_API_URL}{endpoint}",
+                    headers=slot.headers,
+                    proxies=slot.proxies,
+                    timeout=REQUEST_TIMEOUT,
+                )
+            else:
+                r = await session.post(
+                    f"{MARKET_API_URL}{endpoint}",
+                    headers=slot.headers,
+                    json=json_data or {},
+                    proxies=slot.proxies,
+                    timeout=REQUEST_TIMEOUT,
+                )
             elapsed = time.monotonic() - t0
 
             if elapsed > REQUEST_TIMEOUT:
@@ -305,15 +321,23 @@ async def api_post_async(endpoint: str, json_data: dict, pool: AccountPool, sess
                 stats_tracker.record_error("HTTP 429", str(e), slot.label, endpoint)
             else:
                 log.warning(
-                    "Ошибка запроса %s | слот: %s | elapsed: %.2fс | %s",
-                    endpoint, slot.label, elapsed, e,
+                    "Ошибка запроса %s %s | слот: %s | elapsed: %.2fс | %s",
+                    method.upper(), endpoint, slot.label, elapsed, e,
                 )
                 stats_tracker.record_error(err_name, str(e), slot.label, endpoint)
             last_exc = e
             if attempt < MAX_RETRIES - 1:
                 await asyncio.sleep(0.3)
 
-    raise last_exc or RuntimeError("Все попытки исчерпаны")
+    raise last_exc or RuntimeError(f"Все попытки исчерпаны: {method} {endpoint}")
+
+
+async def api_post_async(endpoint: str, json_data: dict, pool: AccountPool, session: AsyncSession) -> dict:
+    return await api_request_async("POST", endpoint, pool, session, json_data)
+
+
+async def api_get_async(endpoint: str, pool: AccountPool, session: AsyncSession) -> Any:
+    return await api_request_async("GET", endpoint, pool, session)
 
 
 # ─────────────────────────────────────────────
@@ -399,67 +423,76 @@ async def fetch_black_floor_async(pool: AccountPool, session: AsyncSession) -> i
     return floor
 
 
+async def fetch_all_model_floors_async(pool: AccountPool, session: AsyncSession) -> dict[str, int]:
+    """
+    1. GET /gifts/collections -> список всех доступных коллекций.
+    2. Батчами (по <=10 коллекций): POST /gifts/models {"collections": [...]}.
+    3. Возвращает карту {"CollectionName:ModelName": floorPriceNanoTons}.
+    """
+    model_floors: dict[str, int] = {}
+    log.info("Загрузка списка коллекций для обновления флора моделей...")
+    try:
+        collections_data = await api_get_async("/gifts/collections", pool, session)
+    except Exception as e:
+        log.error("Не удалось получить список коллекций: %s", e)
+        return model_floors
 
+    if not isinstance(collections_data, list):
+        log.error("Некорректный формат ответа /gifts/collections: %s", type(collections_data))
+        return model_floors
+
+    collection_names = [
+        c.get("name")
+        for c in collections_data
+        if isinstance(c, dict) and c.get("name")
+    ]
+    log.info("Получено коллекций: %d. Запрашиваем флор моделей пачками по 10...", len(collection_names))
+
+    # Лимит API: за раз можно указать не более 10 коллекций
+    for i in range(0, len(collection_names), 10):
+        batch = collection_names[i:i + 10]
+        try:
+            models_data = await api_post_async("/gifts/models", {"collections": batch}, pool, session)
+            if isinstance(models_data, list):
+                for item in models_data:
+                    c_name = item.get("collectionName")
+                    m_name = item.get("modelName")
+                    fp = item.get("floorPriceNanoTons")
+                    if c_name and m_name and fp is not None:
+                        key = f"{c_name}:{m_name}"
+                        model_floors[key] = int(fp)
+            await asyncio.sleep(0.2)
+        except Exception as e:
+            log.warning("Ошибка при загрузке флоров моделей для батча %s: %s", batch, e)
+
+    log.info("Флоры моделей обновлены: загружено %d моделей", len(model_floors))
+    return model_floors
 
 
 # ─────────────────────────────────────────────
 #  Проверка сделок
 # ─────────────────────────────────────────────
 
-def check_gift(gift: dict, black_floor: int | None) -> list[dict]:
+def check_gift(gift: dict, black_floor: int | None, model_floors: dict[str, int]) -> list[dict]:
+    """
+    Подарок считается ликвидным (покупаем) в трёх случаях:
+    1. У него черный фон и он стоит на MIN_TON_DIFF меньше флора черного фона.
+    2. Он стоит меньше CHEAP_PRICE_THRESHOLD (абсолютный дешевый порог).
+    3. Он стоит на MIN_TON_DIFF дешевле флора этой конкретной модели.
+    """
     deals: list[dict] = []
     price = gift.get("salePrice")
     if not price:
         return deals
     price = int(price)
     price_ton = tons(price)
+    collection_name = gift.get("collectionName")
+    model_name = gift.get("modelName")
+    backdrop_name = gift.get("backdropName")
+    model_key = f"{collection_name}:{model_name}"
 
-    # ── 1. Абсолютный порог цены (< CHEAP_PRICE_THRESHOLD TON → всегда сделка) ──
-    if price_ton < CHEAP_PRICE_THRESHOLD:
-        coll_floor = gift.get("floorPriceNanoTONsByCollection")
-        floor_val = int(coll_floor) if coll_floor else price
-        diff_ton = tons(floor_val - price)
-        pct = (floor_val - price) / floor_val * 100 if floor_val > 0 else 0.0
-        deals.append({
-            "type": "CHEAP",
-            "gift": gift,
-            "price": price,
-            "floor": floor_val,
-            "pct": pct,
-            "diff_ton": diff_ton,
-            "floor_src": "absolute_threshold",
-        })
-        log.debug(
-            "CHEAP deal: %s %s #%s | %.4f TON < %.2f TON порог",
-            gift.get("collectionName"), gift.get("modelName"),
-            gift.get("number"), price_ton, CHEAP_PRICE_THRESHOLD,
-        )
-        return deals  # уже нашли сделку — дальше проверять не нужно
-
-    # ── 2. Флор коллекции (floorPriceNanoTONsByCollection) ────────────────
-    coll_floor = gift.get("floorPriceNanoTONsByCollection")
-    if coll_floor:
-        coll_floor = int(coll_floor)
-        diff_ton = tons(coll_floor - price)
-        if diff_ton >= MIN_TON_DIFF:
-            pct = (coll_floor - price) / coll_floor * 100
-            deals.append({
-                "type": "COLLECTION",
-                "gift": gift,
-                "price": price,
-                "floor": coll_floor,
-                "pct": pct,
-                "diff_ton": diff_ton,
-                "floor_src": "collection_floor",
-            })
-            log.debug(
-                "COLLECTION deal: %s %s #%s | %.2f TON < флор коллекции %.2f TON (выгода %.2f TON, %.1f%% скидка)",
-                gift.get("collectionName"), gift.get("modelName"),
-                gift.get("number"), price_ton, tons(coll_floor), diff_ton, pct,
-            )
-
-    # ── 3. Флор чёрного фона ───────────────────────────────────────────────
-    if gift.get("backdropName") in BLACK_BACKDROPS and black_floor:
+    # ── 1. Флор чёрного фона ───────────────────────────────────────────────
+    if backdrop_name in BLACK_BACKDROPS and black_floor:
         diff_ton = tons(black_floor - price)
         if diff_ton >= MIN_TON_DIFF:
             pct = (black_floor - price) / black_floor * 100
@@ -470,12 +503,50 @@ def check_gift(gift: dict, black_floor: int | None) -> list[dict]:
                 "floor": black_floor,
                 "pct": pct,
                 "diff_ton": diff_ton,
-                "floor_src": "black_market",
+                "floor_src": "черный фон",
             })
             log.debug(
-                "BLACK deal: %s %s #%s | %.2f TON < флор %.2f TON (выгода %.2f TON, %.1f%% скидка)",
-                gift.get("collectionName"), gift.get("modelName"),
-                gift.get("number"), price_ton, tons(black_floor), diff_ton, pct,
+                "BLACK deal: %s %s #%s | %.2f TON < флор черного %.2f TON (выгода %.2f TON, %.1f%% скидка)",
+                collection_name, model_name, gift.get("number"), price_ton, tons(black_floor), diff_ton, pct,
+            )
+
+    # ── 2. Абсолютный дешевый порог (< CHEAP_PRICE_THRESHOLD TON) ───────────
+    if price_ton < CHEAP_PRICE_THRESHOLD:
+        model_floor_val = model_floors.get(model_key, price)
+        diff_ton = tons(model_floor_val - price) if model_floor_val > price else 0.0
+        pct = (model_floor_val - price) / model_floor_val * 100 if model_floor_val > 0 else 0.0
+        deals.append({
+            "type": "CHEAP",
+            "gift": gift,
+            "price": price,
+            "floor": model_floor_val,
+            "pct": pct,
+            "diff_ton": diff_ton,
+            "floor_src": f"дешевле {CHEAP_PRICE_THRESHOLD:.2f} TON",
+        })
+        log.debug(
+            "CHEAP deal: %s %s #%s | %.4f TON < %.2f TON порог",
+            collection_name, model_name, gift.get("number"), price_ton, CHEAP_PRICE_THRESHOLD,
+        )
+
+    # ── 3. Флор конкретной модели ──────────────────────────────────────────
+    model_floor = model_floors.get(model_key)
+    if model_floor:
+        diff_ton = tons(model_floor - price)
+        if diff_ton >= MIN_TON_DIFF:
+            pct = (model_floor - price) / model_floor * 100
+            deals.append({
+                "type": "MODEL",
+                "gift": gift,
+                "price": price,
+                "floor": model_floor,
+                "pct": pct,
+                "diff_ton": diff_ton,
+                "floor_src": f"модель {model_name}",
+            })
+            log.debug(
+                "MODEL deal: %s %s #%s | %.2f TON < флор модели %.2f TON (выгода %.2f TON, %.1f%% скидка)",
+                collection_name, model_name, gift.get("number"), price_ton, tons(model_floor), diff_ton, pct,
             )
 
     return deals
@@ -487,7 +558,7 @@ def check_gift(gift: dict, black_floor: int | None) -> list[dict]:
 
 def print_and_log_deal(deal: dict) -> None:
     gift = deal["gift"]
-    _tags = {"BLACK": "🖤  ЧЁРНЫЙ ФОН", "CHEAP": "💸  ДЁШЕВО", "COLLECTION": "🔥  НИЖЕ ФЛОРА КОЛЛЕКЦИИ"}
+    _tags = {"BLACK": "🖤  ЧЁРНЫЙ ФОН", "CHEAP": f"💸  ДЁШЕВО (<{CHEAP_PRICE_THRESHOLD:.1f} TON)", "MODEL": "🎯  НИЖЕ ФЛОРА МОДЕЛИ"}
     tag = _tags.get(deal["type"], "🔥  ВЫГОДНАЯ СДЕЛКА")
     diff_ton = deal.get("diff_ton", tons(deal["floor"] - deal["price"]))
 
@@ -539,6 +610,7 @@ async def main() -> None:
         f"  🚀  MRKT Gift Scanner (Async)  (старт: {startup_ts})",
         f"  Порог выгоды:  {MIN_TON_DIFF:.2f} TON  |  дёшево < {CHEAP_PRICE_THRESHOLD:.2f} TON",
         f"  Интервал:      {SCAN_INTERVAL:.2f} сек  |  таймаут прокси: {REQUEST_TIMEOUT:.1f} сек",
+        f"  Флор моделей:  обновление каждые {MODEL_FLOOR_REFRESH_HOURS:.1f} ч",
         f"  Штраф 429:     {PENALTY_429:.0f} сек",
         f"  Чёрные фоны:   {', '.join(BLACK_BACKDROPS)}",
         f"  Логи:          {LOG_DIR.resolve()}",
@@ -575,6 +647,8 @@ async def main() -> None:
 
     seen_ids: set = set()
     black_floor: int | None = None
+    model_floors: dict[str, int] = {}
+    last_model_refresh: float = 0.0
     scan_count = 0
     total_deals = 0
     consecutive_401_errors = 0
@@ -585,6 +659,22 @@ async def main() -> None:
             while not _shutdown.is_set():
                 scan_count += 1
                 ts = now_str()
+
+                # ── Флор моделей (каждые 12 часов) ──────────────────────────────
+                if not model_floors or (time.monotonic() - last_model_refresh >= MODEL_FLOOR_REFRESH_SECS):
+                    log.info("Обновляем базу флоров моделей...")
+                    print(f"[{ts}] 🔄 Обновление флоров моделей (раз в {MODEL_FLOOR_REFRESH_HOURS:.0f}ч)...", end=" ", flush=True)
+                    try:
+                        mf = await fetch_all_model_floors_async(pool, session)
+                        if mf:
+                            model_floors = mf
+                            last_model_refresh = time.monotonic()
+                            print(f"загружено {len(model_floors)} моделей")
+                        else:
+                            print("не удалось обновить (используем кэш)")
+                    except Exception as e:
+                        log.error("Не удалось обновить флор моделей: %s", e)
+                        print(f"ошибка: {e}")
 
                 # ── Флор чёрного фона ────────────────────────────────────────────
                 if black_floor is None or scan_count % BLACK_FLOOR_REFRESH == 0:
@@ -619,7 +709,7 @@ async def main() -> None:
                     if not first_run and new_gifts:
                         scan_deals: list[dict] = []
                         for gift in new_gifts:
-                            scan_deals.extend(check_gift(gift, black_floor))
+                            scan_deals.extend(check_gift(gift, black_floor, model_floors))
 
                         if scan_deals:
                             scan_deals_count = len(scan_deals)
