@@ -50,13 +50,13 @@ MIN_TURNOVER_RATIO    = float(os.getenv("MIN_TURNOVER_RATIO", "0.0"))
 LOW_ID_MAX_FLOOR_RATIO = float(os.getenv("LOW_ID_MAX_FLOOR_RATIO", "0.20"))
 FILTER_BY_BALANCE     = os.getenv("FILTER_BY_BALANCE", "false").lower() in ("1", "true", "yes")
 PRIMARY_TOKEN         = os.getenv("PRIMARY_TOKEN", "").strip()
-FLOOR_REFRESH         = int(os.getenv("FLOOR_REFRESH", 40))
+FLOOR_REFRESH         = int(os.getenv("FLOOR_REFRESH", 300))
 FLOOR_HISTORY_LEN     = int(os.getenv("FLOOR_HISTORY_LEN", 5))
 FLOOR_ANOMALY_PCT     = float(os.getenv("FLOOR_ANOMALY_PCT", 50.0))
 REQUEST_TIMEOUT       = max(2.5, float(os.getenv("REQUEST_TIMEOUT", 3.0)))
 MAX_PING_SECONDS      = float(os.getenv("MAX_PING_SECONDS", 3.0))
 MAX_RETRIES           = int(os.getenv("MAX_RETRIES", 3))
-PENALTY_429           = float(os.getenv("PENALTY_429", 60.0))
+PENALTY_429           = float(os.getenv("PENALTY_429", 15.0))
 LOG_DIR               = Path(os.getenv("LOG_DIR", "logs"))
 
 RATE_ADAPT_WINDOW     = int(os.getenv("RATE_ADAPT_WINDOW", 30))
@@ -416,6 +416,7 @@ async def api_request_async(
                 pool.penalize(slot, retry_after)
                 stats_tracker.record_error("HTTP 429", f"penalty {retry_after}s", slot.label, endpoint)
                 last_exc = Exception(f"HTTP 429 (слот: {slot.label})")
+                await asyncio.sleep(0.5)
                 continue
 
             r.raise_for_status()
@@ -1069,17 +1070,9 @@ async def main() -> None:
                         print(f"{len(collection_floors)} коллекций | 🖤 {tons_fmt(black_floor) if black_floor else 'N/A'}")
                         log.info("Флоры: %d коллекций | чёрный: %s", len(collection_floors), tons_fmt(black_floor) if black_floor else "N/A")
 
-                        # Перепроверка аномалий
                         anomalous = floor_tracker.pop_anomalous()
                         if anomalous:
-                            log.info("Аномалии флора (%d коллекций) — перепроверка...", len(anomalous))
-                            bf2, cf2, _ = await fetch_floors_async(pool, session, floor_tracker)
-                            if cf2:
-                                collection_floors = cf2
-                                scanner_state.collection_floors_count = len(collection_floors)
-                            if bf2:
-                                black_floor = bf2
-                                scanner_state.black_floor_nano = black_floor
+                            log.info("Зафиксированы колебания флора (%d коллекций): %s", len(anomalous), ", ".join(list(anomalous)[:5]))
 
                     except Exception as e:
                         log.error("Не удалось обновить флоры: %s", e)

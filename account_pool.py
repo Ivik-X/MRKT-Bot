@@ -24,7 +24,7 @@ from xray_proxy import XrayProcess, load_proxies, filter_fast_proxies_async
 # Минимальный интервал между запросами через один слот (секунды)
 SLOT_COOLDOWN = float(os.getenv("SLOT_COOLDOWN", 0.5))
 # Кулдаун при 429 (секунды)
-PENALTY_SECONDS = float(os.getenv("PENALTY_SECONDS", 60.0))
+PENALTY_SECONDS = float(os.getenv("PENALTY_SECONDS", 15.0))
 
 
 # ─────────────────────────────────────────────
