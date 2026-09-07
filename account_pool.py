@@ -203,6 +203,22 @@ class AccountPool:
                     proxies.append(s.proxy)
             return proxies
 
+    def avg_ping_ms(self) -> float | None:
+        """
+        Возвращает средний пинг (мс) по всем слотам, у которых есть данные о задержке.
+        Используется для расчёта стартового интервала сканирования.
+        """
+        pings = []
+        with self._lock:
+            for s in self._slots:
+                # Slot хранит avg_latency_ms если был измерен пинг
+                lat = getattr(s, "avg_latency_ms", None) or getattr(s, "ping_ms", None)
+                if lat and lat > 0:
+                    pings.append(lat)
+        if not pings:
+            return None
+        return sum(pings) / len(pings)
+
     @property
     def slots(self) -> list[Slot]:
         """Возвращает копию списка слотов пула."""

@@ -7,6 +7,7 @@ tg_bot.py — Управление MRKT-сканером через Telegram-б�
   - Изменение порогов выгоды и интервала сканирования на лету.
   - Статистика, пауза/запуск сканера, просмотр пинга прокси.
   - Отправка мгновенных алертов о найденных подарках.
+  - Просмотр логов по временному диапазону.
 """
 
 from __future__ import annotations
@@ -17,7 +18,9 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Optional
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command, CommandStart
@@ -53,20 +56,25 @@ class ScannerState:
     deals_count: int = 0
     start_time: float = field(default_factory=time.monotonic)
     black_floor_nano: Optional[int] = None
-    model_floors_count: int = 0
-    force_refresh_models: bool = False
+    collection_floors_count: int = 0           # Заменяет model_floors_count
+    force_refresh_floors: bool = False          # Заменяет force_refresh_models
     last_deal: Optional[dict] = None
     primary_balance_nano: Optional[int] = None
     filter_by_balance: bool = False
     min_turnover_ratio: float = 0.0
     collection_volumes: dict[str, int] = field(default_factory=dict)
     notify_categories: dict[str, bool] = field(default_factory=lambda: {
-        "BLACK": os.getenv("NOTIFY_BLACK", "true").lower() in ("1", "true", "yes"),
-        "CHEAP": os.getenv("NOTIFY_CHEAP", "true").lower() in ("1", "true", "yes"),
-        "MODEL": os.getenv("NOTIFY_MODEL", "true").lower() in ("1", "true", "yes"),
+        "BLACK":  os.getenv("NOTIFY_BLACK",  "true").lower() in ("1", "true", "yes"),
+        "CHEAP":  os.getenv("NOTIFY_CHEAP",  "true").lower() in ("1", "true", "yes"),
+        "NFT":    os.getenv("NOTIFY_NFT",    "true").lower() in ("1", "true", "yes"),
         "LOW_ID": os.getenv("NOTIFY_LOW_ID", "true").lower() in ("1", "true", "yes"),
     })
     vault: list[dict] = field(default_factory=list)
+    # Хранилище отправленных алертов для пометки выкупленных
+    # {gift_id: {"sent_at": float, "messages": {admin_id: msg_id}, "text": str, "nft_url": str, "older_ids": set}}
+    sent_alerts: dict[str, dict[str, Any]] = field(default_factory=dict)
+    sold_queue: list[str] = field(default_factory=list)  # gift_id выкупленных лотов
+    rate_adaptor: Optional[Any] = None  # RateAdaptor из scanner.py
 
     def uptime_str(self) -> str:
         elapsed = int(time.monotonic() - self.start_time)
@@ -89,6 +97,7 @@ class BotStates(StatesGroup):
     waiting_for_cheap_threshold = State()
     waiting_for_scan_interval = State()
     waiting_for_turnover_ratio = State()
+    waiting_for_log_time = State()
 
 
 # ─────────────────────────────────────────────
@@ -158,6 +167,9 @@ def main_keyboard(state: ScannerState) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="🌐 Прокси и Пинг", callback_data="nav_proxies"),
                 InlineKeyboardButton(text="🔄 Обновить флоры", callback_data="refresh_floors"),
             ],
+            [
+                InlineKeyboardButton(text="📋 Просмотр логов", callback_data="nav_logs"),
+            ],
         ]
     )
 
@@ -211,9 +223,9 @@ def proxies_keyboard() -> InlineKeyboardMarkup:
 
 def categories_keyboard(state: ScannerState) -> InlineKeyboardMarkup:
     cat_names = {
-        "BLACK": "🖤 Чёрный фон",
-        "CHEAP": "💸 Сверхдешёвые",
-        "MODEL": "🎯 Ниже флора",
+        "BLACK":  "🖤 Чёрный фон",
+        "CHEAP":  "💸 Сверхдешёвые",
+        "NFT":    "🎯 Ниже флора коллекции",
         "LOW_ID": "🏷️ Редкий ID (<100)",
     }
     rows = []
@@ -267,8 +279,15 @@ def format_main_text(state: ScannerState) -> str:
     bal_str = f"{state.primary_balance_nano / 1e9:.2f} TON" if state.primary_balance_nano is not None else "не проверен"
     filter_bal_str = "🟢 ВКЛ" if state.filter_by_balance else "🔴 ВЫКЛ"
     turnover_str = f"≥ {state.min_turnover_ratio:.1f}x" if state.min_turnover_ratio > 0 else "выключен"
-    collections_count = len(state.collection_volumes) if state.collection_volumes else 0
+    floors_count = state.collection_floors_count if hasattr(state, "collection_floors_count") else 0
     vault_count = len(state.vault) if state.vault else 0
+
+    # Авто-интервал
+    adaptor = getattr(state, "rate_adaptor", None)
+    if adaptor is not None and adaptor.is_auto:
+        interval_str = f"{state.scan_interval:.2f} с <i>(авто)</i>"
+    else:
+        interval_str = f"{state.scan_interval:.2f} с <i>(ручной)</i>"
 
     return (
         f"🤖 <b>MRKT Scanner Manager</b>\n\n"
@@ -279,15 +298,15 @@ def format_main_text(state: ScannerState) -> str:
         f"⚙️ <b>Параметры:</b>\n"
         f"• Порог выгоды: <code>{state.min_ton_diff:.2f} TON</code>\n"
         f"• Дешёвые подарки: &lt; <code>{state.cheap_price_threshold:.2f} TON</code>\n"
-        f"• Мин. оборот/цена (NFT): <code>{turnover_str}</code>\n"
+        f"• Мин. оборот/цена: <code>{turnover_str}</code>\n"
         f"• Фильтр по балансу: <b>{filter_bal_str}</b>\n"
-        f"• Интервал сканов: <code>{state.scan_interval:.2f} с</code>\n\n"
+        f"• ⚡ Интервал: {interval_str}\n\n"
         f"👑 <b>Основной аккаунт:</b>\n"
         f"• Токен: <code>{primary_str}</code>\n"
         f"• Баланс TON: <code>{bal_str}</code>\n\n"
         f"📦 <b>Рыночные данные:</b>\n"
         f"• Флор чёрного фона: <code>{bf_str}</code>\n"
-        f"• Моделей в кэше: <code>{state.model_floors_count}</code> (коллекций: <code>{collections_count}</code>)\n\n"
+        f"• Коллекций в кэше: <code>{floors_count}</code>\n\n"
         f"🔌 <b>Ресурсы:</b>\n"
         f"• Токенов: <code>{active_tokens}</code>\n"
         f"• Прокси: <code>{active_proxies}</code>"
@@ -315,9 +334,9 @@ def format_vault_text(state: ScannerState) -> str:
             "<i>Сюда автоматически сохраняются сделки тех категорий, для которых выключены моментальные уведомления.</i>"
         )
 
-    by_cat = {"BLACK": 0, "CHEAP": 0, "MODEL": 0, "LOW_ID": 0}
+    by_cat: dict[str, int] = {}
     for d in vault:
-        t = d.get("type", "MODEL")
+        t = d.get("type", "NFT")
         by_cat[t] = by_cat.get(t, 0) + 1
 
     return (
@@ -325,7 +344,7 @@ def format_vault_text(state: ScannerState) -> str:
         f"Всего накоплено сделок: <b>{count}</b> шт.\n"
         f"• 🖤 Чёрный фон: <b>{by_cat.get('BLACK', 0)}</b>\n"
         f"• 💸 Сверхдешёвые: <b>{by_cat.get('CHEAP', 0)}</b>\n"
-        f"• 🎯 Ниже флора модели: <b>{by_cat.get('MODEL', 0)}</b>\n"
+        f"• 🎯 Ниже флора коллекции: <b>{by_cat.get('NFT', 0)}</b>\n"
         f"• 🏷️ Редкие номера (&lt;100): <b>{by_cat.get('LOW_ID', 0)}</b>\n\n"
         f"Нажмите <b>«📤 Отправить все в чат»</b>, чтобы выгрузить все накопленные подарки сообщениями."
     )
@@ -337,6 +356,9 @@ def format_settings_text(state: ScannerState) -> str:
     turnover_str = f"≥ {state.min_turnover_ratio:.1f}x" if state.min_turnover_ratio > 0 else "выключен (0.0)"
     primary_tok = state.pool.primary_token if state.pool else None
     primary_str = _mask_token(primary_tok) if primary_tok else "не задан"
+    adaptor = getattr(state, "rate_adaptor", None)
+    auto_mode = adaptor.is_auto if adaptor is not None else True
+    interval_mode = "авто" if auto_mode else "ручной"
 
     return (
         f"⚙️ <b>Настройки сканера</b>\n\n"
@@ -350,8 +372,8 @@ def format_settings_text(state: ScannerState) -> str:
         f"   <i>(Подарок покупается, если он дешевле флора минимум на это значение)</i>\n\n"
         f"5. <b>Порог дешёвых (CHEAP_THRESHOLD):</b> <code>{state.cheap_price_threshold:.2f} TON</code>\n"
         f"   <i>(Любой подарок с ценой ниже этого порога считается выгодным)</i>\n\n"
-        f"6. <b>Интервал сканирования:</b> <code>{state.scan_interval:.2f} с</code>\n"
-        f"   <i>(Пауза между запросами к витрине)</i>"
+        f"6. <b>⚡ Интервал сканирования ({interval_mode}):</b> <code>{state.scan_interval:.2f} с</code>\n"
+        f"   <i>(Пауза между запросами; при установке вручную авто-адаптация отключается)</i>"
     )
 
 
@@ -423,8 +445,8 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
 
     @dp.callback_query(F.data == "refresh_floors")
     async def cb_refresh_floors(cb: CallbackQuery):
-        scanner_state.force_refresh_models = True
-        await cb.answer("🔄 Запущено обновление флоров моделей...")
+        scanner_state.force_refresh_floors = True
+        await cb.answer("🔄 Запущено обновление флоров коллекций...")
 
     # ── Раздел: Уведомления по категориям ────────────────────────────────
     @dp.callback_query(F.data == "nav_categories")
@@ -784,9 +806,13 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
     @dp.callback_query(F.data == "set_interval")
     async def cb_set_interval(cb: CallbackQuery, state: FSMContext):
         await state.set_state(BotStates.waiting_for_scan_interval)
+        adaptor = getattr(scanner_state, "rate_adaptor", None)
+        mode_str = "авто" if (adaptor and adaptor.is_auto) else "ручной"
         await cb.message.edit_text(
-            f"✏️ Текущий интервал сканирования: <code>{scanner_state.scan_interval:.2f} с</code>\n\n"
-            f"Введите новый интервал в секундах (например <code>0.5</code>):",
+            f"✏️ Текущий интервал: <code>{scanner_state.scan_interval:.2f} с</code> ({mode_str})\n\n"
+            f"Введите новый интервал в секундах (например <code>0.5</code>).\n"
+            f"<i>После ручной установки авто-адаптация отключается.</i>\n"
+            f"Введите <code>auto</code> для возврата в авто-режим:",
             reply_markup=back_to_menu_keyboard("nav_settings"),
             parse_mode="HTML",
         )
@@ -794,15 +820,72 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
 
     @dp.message(BotStates.waiting_for_scan_interval)
     async def msg_set_interval(msg: Message, state: FSMContext):
+        raw = (msg.text or "").strip().lower()
+        adaptor = getattr(scanner_state, "rate_adaptor", None)
+        if raw == "auto":
+            if adaptor:
+                adaptor.set_auto()
+                scanner_state.scan_interval = adaptor.interval
+            await msg.answer(f"✅ Авто-режим интервала включён (текущий: <code>{scanner_state.scan_interval:.2f} с</code>)", reply_markup=back_to_menu_keyboard("nav_settings"), parse_mode="HTML")
+            await state.clear()
+            return
         try:
-            val = float(msg.text.replace(",", ".").strip())
+            val = float(raw.replace(",", "."))
             if val < 0.1:
                 raise ValueError
             scanner_state.scan_interval = val
-            await msg.answer(f"✅ Интервал сканирования изменён на <code>{val:.2f} с</code>", reply_markup=back_to_menu_keyboard("nav_settings"), parse_mode="HTML")
+            if adaptor:
+                adaptor.set_manual(val)
+            await msg.answer(f"✅ Интервал изменён на <code>{val:.2f} с</code> (ручной режим)", reply_markup=back_to_menu_keyboard("nav_settings"), parse_mode="HTML")
             await state.clear()
         except ValueError:
-            await msg.answer("❌ Пожалуйста, введите положительное число не менее 0.1 (например 0.5):")
+            await msg.answer("❌ Введите положительное число >= 0.1 или <code>auto</code>:", parse_mode="HTML")
+
+    # ── Раздел: Просмотр логов ────────────────────────────────────────────
+    @dp.callback_query(F.data == "nav_logs")
+    async def cb_nav_logs(cb: CallbackQuery, state: FSMContext):
+        await state.set_state(BotStates.waiting_for_log_time)
+        text = (
+            "📋 <b>Просмотр логов</b>\n\n"
+            "Отправьте временную метку для поиска строк в диапазоне ±10 секунд.\n\n"
+            "Форматы:\n"
+            "• <code>20:15:33</code> — время в формате ЧЧ:ММ:СС\n"
+            "• <code>20:15</code> — время ЧЧ:ММ (секунды = 0)\n"
+            "• <code>now</code> — последние 60 секунд логов\n"
+        )
+        await cb.message.edit_text(text, reply_markup=back_to_menu_keyboard("nav_main"), parse_mode="HTML")
+        await cb.answer()
+
+    @dp.message(BotStates.waiting_for_log_time)
+    async def msg_log_time(msg: Message, state: FSMContext):
+        raw = (msg.text or "").strip()
+        log_dir = Path(os.getenv("LOG_DIR", "logs"))
+        lines = read_log_window(raw, log_dir)
+        await state.clear()
+        if not lines:
+            await msg.answer(
+                f"📋 По запросу <code>{raw}</code> ничего не найдено в логах.\n"
+                "<i>Убедитесь, что время указано в формате ЧЧ:ММ:СС или ЧЧ:ММ.</i>",
+                parse_mode="HTML",
+                reply_markup=back_to_menu_keyboard("nav_main"),
+            )
+            return
+
+        full_text = f"📋 <b>Логи ±10с от {raw}:</b>\n\n" + "\n".join(lines)
+        # Разбиваем на части если слишком длинно
+        MAX_LEN = 4000
+        chunks = [full_text[i:i+MAX_LEN] for i in range(0, len(full_text), MAX_LEN)]
+        for i, chunk in enumerate(chunks):
+            if i == len(chunks) - 1:
+                await msg.answer(
+                    f"<code>{chunk}</code>",
+                    parse_mode="HTML",
+                    reply_markup=back_to_menu_keyboard("nav_main"),
+                )
+            else:
+                await msg.answer(f"<code>{chunk}</code>", parse_mode="HTML")
+            if len(chunks) > 1:
+                await asyncio.sleep(0.1)
 
     # ── Раздел: Прокси и Пинг ────────────────────────────────────────────
     @dp.callback_query(F.data == "nav_proxies")
@@ -850,6 +933,68 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
 
 
 # ─────────────────────────────────────────────
+#  Чтение логов по временному диапазону
+# ─────────────────────────────────────────────
+
+def read_log_window(timestamp_str: str, log_dir: Path, window_sec: int = 10) -> list[str]:
+    """
+    Читает строки из scanner.log в окне [ts - window_sec, ts + window_sec].
+    timestamp_str: 'ЧЧ:ММ:СС', 'ЧЧ:ММ', или 'now'.
+    """
+    now = datetime.now()
+    raw = timestamp_str.strip().lower()
+
+    if raw == "now":
+        target_dt = now
+        window_sec = 30
+    else:
+        try:
+            parts = raw.split(":")
+            h = int(parts[0])
+            m = int(parts[1]) if len(parts) > 1 else 0
+            s = int(parts[2]) if len(parts) > 2 else 0
+            target_dt = now.replace(hour=h, minute=m, second=s, microsecond=0)
+        except (ValueError, IndexError):
+            return []
+
+    start_dt = target_dt - timedelta(seconds=window_sec)
+    end_dt   = target_dt + timedelta(seconds=window_sec)
+
+    # Ищем текущий лог-файл и вчерашний (на случай перехода через полночь)
+    date_str_today = now.strftime("%Y-%m-%d")
+    date_str_prev  = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    candidates = [
+        log_dir / "scanner.log",
+        log_dir / f"scanner.log.{date_str_today}",
+        log_dir / f"scanner.log.{date_str_prev}",
+    ]
+
+    matched: list[str] = []
+    # Формат строки: 2026-09-07 20:15:33 [INFO    ] ...
+    _ts_re = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
+
+    for log_path in candidates:
+        if not log_path.exists():
+            continue
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    m = _ts_re.match(line)
+                    if not m:
+                        continue
+                    try:
+                        line_dt = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+                    except ValueError:
+                        continue
+                    if start_dt <= line_dt <= end_dt:
+                        matched.append(line.rstrip())
+        except OSError:
+            pass
+
+    return matched
+
+
+# ─────────────────────────────────────────────
 #  Отправка Deal Alerts в Telegram
 # ─────────────────────────────────────────────
 
@@ -858,6 +1003,8 @@ async def send_deal_notification(
     admin_ids: set[int],
     deal: dict,
     bot: Optional[Bot] = None,
+    scanner_state: Optional["ScannerState"] = None,
+    older_ids: Optional[set[str]] = None,
 ) -> None:
     """Отправляет богато оформленное уведомление о выгодной сделке в Telegram."""
     if not bot_token or not admin_ids:
@@ -873,9 +1020,9 @@ async def send_deal_notification(
     floor_ton = floor / 1e9
 
     tags = {
-        "BLACK": "🖤 <b>ВЫГОДНЫЙ ЧЁРНЫЙ ФОН</b>",
-        "CHEAP": "💸 <b>СВЕРХДЕШЁВЫЙ ПОДАРОК</b>",
-        "MODEL": "🎯 <b>НИЖЕ ФЛОРА МОДЕЛИ</b>",
+        "BLACK":  "🖤 <b>ВЫГОДНЫЙ ЧЁРНЫЙ ФОН</b>",
+        "CHEAP":  "💸 <b>СВЕРХДЕШЁВЫЙ ПОДАРОК</b>",
+        "NFT":    "🎯 <b>НИЖЕ ФЛОРА КОЛЛЕКЦИИ</b>",
         "LOW_ID": "🏷️ <b>РЕДКИЙ НОМЕР (#1 — #99)</b>",
     }
     header = tags.get(deal_type, "🔥 <b>ВЫГОДНАЯ СДЕЛКА!</b>")
@@ -884,6 +1031,7 @@ async def send_deal_notification(
     mod_name = gift.get("modelName", "")
     num = gift.get("number") or gift.get("num") or "?"
     backdrop = gift.get("backdropName", "—")
+    gift_id = gift.get("id", "")
 
     text = (
         f"{header}\n\n"
@@ -906,9 +1054,7 @@ async def send_deal_notification(
     )
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(text="🎁 Открыть NFT в Telegram", url=nft_url),
-            ]
+            [InlineKeyboardButton(text="🎁 Открыть NFT в Telegram", url=nft_url)]
         ]
     )
 
@@ -920,12 +1066,23 @@ async def send_deal_notification(
     try:
         for admin_id in admin_ids:
             try:
-                await bot.send_message(
+                sent_msg = await bot.send_message(
                     chat_id=admin_id,
                     text=text,
                     reply_markup=kb,
                     parse_mode="HTML",
                 )
+                # Сохраняем данные алерта для последующей пометки выкупленных
+                if scanner_state is not None and gift_id:
+                    if gift_id not in scanner_state.sent_alerts:
+                        scanner_state.sent_alerts[gift_id] = {
+                            "sent_at": time.time(),
+                            "messages": {},
+                            "text": text,
+                            "nft_url": nft_url,
+                            "older_ids": set(older_ids) if older_ids else set(),
+                        }
+                    scanner_state.sent_alerts[gift_id]["messages"][admin_id] = sent_msg.message_id
             except Exception as e:
                 log.warning("Не удалось отправить алерт в TG %s: %s", admin_id, e)
     finally:

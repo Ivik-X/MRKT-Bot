@@ -17,12 +17,15 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 import sys
 import time
+from collections import deque
 from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
+from statistics import median
 from typing import Any
 
 from curl_cffi import requests as cffi_requests
@@ -37,28 +40,34 @@ load_dotenv()
 #  Конфиг
 # ─────────────────────────────────────────────
 
-MARKET_API_URL       = "https://api.tgmrkt.io/api/v1"
-SCAN_INTERVAL        = float(os.getenv("SCAN_INTERVAL", 0.5))
-MIN_TON_DIFF         = float(os.getenv("MIN_TON_DIFF", 2.5))
-CHEAP_PRICE_THRESHOLD = float(os.getenv("CHEAP_PRICE_THRESHOLD", 3.0))  # абсолютный порог: < N TON → всегда сделка
-MIN_TURNOVER_RATIO   = float(os.getenv("MIN_TURNOVER_RATIO", "0.0"))   # оборот коллекции / цена: >= X для NFT
-LOW_ID_MAX_FLOOR_RATIO = float(os.getenv("LOW_ID_MAX_FLOOR_RATIO", "0.20"))  # ID < 100: цена <= X * floor (20% флора)
-FILTER_BY_BALANCE    = os.getenv("FILTER_BY_BALANCE", "false").lower() in ("1", "true", "yes")
-PRIMARY_TOKEN        = os.getenv("PRIMARY_TOKEN", "").strip()
-BLACK_FLOOR_REFRESH  = int(os.getenv("BLACK_FLOOR_REFRESH", 40))
-MODEL_FLOOR_REFRESH_HOURS = float(os.getenv("MODEL_FLOOR_REFRESH_HOURS", 12.0))
-MODEL_FLOOR_REFRESH_SECS = MODEL_FLOOR_REFRESH_HOURS * 3600.0
-REQUEST_TIMEOUT      = max(2.5, float(os.getenv("REQUEST_TIMEOUT", 3.0)))       # Таймаут запроса (мин. 2.5с для стабильности)
-MAX_PING_SECONDS     = float(os.getenv("MAX_PING_SECONDS", 3.0))      # Допустимый пинг прокси при первичном тесте
-MAX_RETRIES          = int(os.getenv("MAX_RETRIES", 3))
-PENALTY_429          = float(os.getenv("PENALTY_429", 60.0))
-LOG_DIR              = Path(os.getenv("LOG_DIR", "logs"))
+MARKET_API_URL        = "https://api.tgmrkt.io/api/v1"
+SCAN_INTERVAL         = float(os.getenv("SCAN_INTERVAL", 0.5))
+MIN_SCAN_INTERVAL     = float(os.getenv("MIN_SCAN_INTERVAL", 0.3))
+MAX_SCAN_INTERVAL     = float(os.getenv("MAX_SCAN_INTERVAL", 3.0))
+MIN_TON_DIFF          = float(os.getenv("MIN_TON_DIFF", 2.5))
+CHEAP_PRICE_THRESHOLD = float(os.getenv("CHEAP_PRICE_THRESHOLD", 3.0))
+MIN_TURNOVER_RATIO    = float(os.getenv("MIN_TURNOVER_RATIO", "0.0"))
+LOW_ID_MAX_FLOOR_RATIO = float(os.getenv("LOW_ID_MAX_FLOOR_RATIO", "0.20"))
+FILTER_BY_BALANCE     = os.getenv("FILTER_BY_BALANCE", "false").lower() in ("1", "true", "yes")
+PRIMARY_TOKEN         = os.getenv("PRIMARY_TOKEN", "").strip()
+FLOOR_REFRESH         = int(os.getenv("FLOOR_REFRESH", 40))
+FLOOR_HISTORY_LEN     = int(os.getenv("FLOOR_HISTORY_LEN", 5))
+FLOOR_ANOMALY_PCT     = float(os.getenv("FLOOR_ANOMALY_PCT", 50.0))
+REQUEST_TIMEOUT       = max(2.5, float(os.getenv("REQUEST_TIMEOUT", 3.0)))
+MAX_PING_SECONDS      = float(os.getenv("MAX_PING_SECONDS", 3.0))
+MAX_RETRIES           = int(os.getenv("MAX_RETRIES", 3))
+PENALTY_429           = float(os.getenv("PENALTY_429", 60.0))
+LOG_DIR               = Path(os.getenv("LOG_DIR", "logs"))
+
+RATE_ADAPT_WINDOW     = int(os.getenv("RATE_ADAPT_WINDOW", 30))
+RATE_UP_THRESHOLD     = float(os.getenv("RATE_UP_THRESHOLD", 0.15))
+RATE_DOWN_THRESHOLD   = float(os.getenv("RATE_DOWN_THRESHOLD", 0.04))
 
 BLACK_BACKDROPS = {"Black"}
 
-TG_BOT_TOKEN         = os.getenv("TG_BOT_TOKEN", "").strip()
-TG_ADMIN_ID_RAW      = os.getenv("TG_ADMIN_ID", "").strip()
-TG_ADMIN_IDS         = {int(x.strip()) for x in TG_ADMIN_ID_RAW.split(",") if x.strip().isdigit()}
+TG_BOT_TOKEN     = os.getenv("TG_BOT_TOKEN", "").strip()
+TG_ADMIN_ID_RAW  = os.getenv("TG_ADMIN_ID", "").strip()
+TG_ADMIN_IDS     = {int(x.strip()) for x in TG_ADMIN_ID_RAW.split(",") if x.strip().isdigit()}
 
 from tg_bot import ScannerState, run_telegram_bot, send_deal_notification, _mask_token
 
@@ -68,63 +77,34 @@ from tg_bot import ScannerState, run_telegram_bot, send_deal_notification, _mask
 # ─────────────────────────────────────────────
 
 def setup_logging() -> tuple[logging.Logger, logging.Logger]:
-    """
-    Настраивает два логгера:
-      scanner — подробный лог сканера (файл + консоль)
-      deals   — только найденные сделки в JSONL формате
-
-    Файлы:
-      logs/scanner_YYYY-MM-DD.log  — ротация раз в сутки, хранить 30 дней
-      logs/deals.jsonl             — все найденные сделки, один JSON на строку
-    """
     LOG_DIR.mkdir(exist_ok=True)
 
-    # ── Формат ───────────────────────────────────────────────────────────
-    fmt_file    = logging.Formatter(
-        "%(asctime)s [%(levelname)-8s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    fmt_console = logging.Formatter(
-        "%(asctime)s %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    fmt_file    = logging.Formatter("%(asctime)s [%(levelname)-8s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    fmt_console = logging.Formatter("%(asctime)s %(message)s", datefmt="%H:%M:%S")
 
-    # ── Scanner logger ────────────────────────────────────────────────────
     scanner_log = logging.getLogger("scanner")
     scanner_log.setLevel(logging.DEBUG)
 
-    # В файл (ротация раз в день, 30 файлов)
     fh = TimedRotatingFileHandler(
-        LOG_DIR / "scanner.log",
-        when="midnight",
-        interval=1,
-        backupCount=30,
-        encoding="utf-8",
+        LOG_DIR / "scanner.log", when="midnight", interval=1, backupCount=30, encoding="utf-8",
     )
     fh.suffix = "%Y-%m-%d"
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(fmt_file)
     scanner_log.addHandler(fh)
 
-    # В консоль (только INFO+)
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(logging.INFO)
     ch.setFormatter(fmt_console)
     scanner_log.addHandler(ch)
 
-    # ── Deals logger ──────────────────────────────────────────────────────
-    # Пишет только в файл, сырые JSONL строки
     deals_log = logging.getLogger("deals")
     deals_log.setLevel(logging.INFO)
-    deals_log.propagate = False  # не тянуть в корневой логгер
+    deals_log.propagate = False
 
-    dfh = logging.FileHandler(
-        LOG_DIR / "deals.jsonl",
-        mode="a",
-        encoding="utf-8",
-    )
+    dfh = logging.FileHandler(LOG_DIR / "deals.jsonl", mode="a", encoding="utf-8")
     dfh.setLevel(logging.INFO)
-    dfh.setFormatter(logging.Formatter("%(message)s"))  # только само сообщение
+    dfh.setFormatter(logging.Formatter("%(message)s"))
     deals_log.addHandler(dfh)
 
     return scanner_log, deals_log
@@ -146,16 +126,13 @@ def tons_fmt(n: int | float) -> str:
 def now_str() -> str:
     return datetime.now().strftime("%H:%M:%S")
 
+_SLUG_RE = re.compile(r"[A-Za-z0-9]+")
+
 def make_telegram_nft_url(collection_name: str, number: Any) -> str:
-    """
-    Генерирует официальную ссылку Telegram NFT вида:
-    https://t.me/nft/CandyCane-79154
-    """
     if not collection_name or number is None:
         return "https://t.me/nft"
-    import re
     cleaned = str(collection_name).replace("'", "")
-    words = re.findall(r"[A-Za-z0-9]+", cleaned)
+    words = _SLUG_RE.findall(cleaned)
     slug = "".join(w.capitalize() for w in words)
     if not slug:
         return "https://t.me/nft"
@@ -169,7 +146,6 @@ def gift_url(gift: dict) -> str:
 SEPARATOR = "─" * 60
 
 def log_deal_to_file(deal: dict) -> None:
-    """Записывает сделку в deals.jsonl (один JSON объект на строку)."""
     gift = deal["gift"]
     diff_ton = deal.get("diff_ton", tons(deal["floor"] - deal["price"]))
     row = {
@@ -194,7 +170,6 @@ def log_deal_to_file(deal: dict) -> None:
 
 
 def log_error_to_file(error_type: str, message: str, slot_label: str = "", endpoint: str = "") -> None:
-    """Записывает событие ошибки в logs/errors.jsonl."""
     row = {
         "ts": datetime.utcnow().isoformat(timespec="seconds") + "Z",
         "type": error_type,
@@ -218,6 +193,7 @@ class StatsTracker:
         self.errors_count = 0
         self.errors_by_type: dict[str, int] = {}
         self.collections_summary: dict[str, int] = {}
+        self._last_save = 0.0
 
     def record_scan(self, new_gifts: list[dict], deals_count: int = 0) -> None:
         self.scans_completed += 1
@@ -226,13 +202,15 @@ class StatsTracker:
         for g in new_gifts:
             col = g.get("collectionName", "Unknown")
             self.collections_summary[col] = self.collections_summary.get(col, 0) + 1
-        self.save()
+        now = time.monotonic()
+        if now - self._last_save >= 30.0:
+            self.save()
+            self._last_save = now
 
     def record_error(self, err_type: str, msg: str = "", slot_label: str = "", endpoint: str = "") -> None:
         self.errors_count += 1
         self.errors_by_type[err_type] = self.errors_by_type.get(err_type, 0) + 1
         log_error_to_file(err_type, msg, slot_label, endpoint)
-        self.save()
 
     def save(self) -> None:
         try:
@@ -256,8 +234,123 @@ stats_tracker = StatsTracker()
 
 
 class AuthTokenExpiredError(Exception):
-    """Исключение: просроченный или невалидный токен (HTTP 401)."""
     pass
+
+
+# ─────────────────────────────────────────────
+#  FloorTracker — история флора NFT-коллекций
+# ─────────────────────────────────────────────
+
+class FloorTracker:
+    """
+    Хранит историю последних FLOOR_HISTORY_LEN измерений флора каждой коллекции.
+    Медиана — рабочий флор. Отклонение > FLOOR_ANOMALY_PCT% → перепроверка.
+    """
+
+    def __init__(self, history_len: int = FLOOR_HISTORY_LEN, anomaly_pct: float = FLOOR_ANOMALY_PCT):
+        self._history: dict[str, deque] = {}
+        self._stable: dict[str, int] = {}
+        self._anomalous: set[str] = set()
+        self._history_len = history_len
+        self._anomaly_pct = anomaly_pct
+
+    def update(self, col_name: str, new_floor: int) -> int:
+        if col_name not in self._history:
+            self._history[col_name] = deque(maxlen=self._history_len)
+        hist = self._history[col_name]
+        prev_stable = self._stable.get(col_name)
+        hist.append(new_floor)
+        stable = int(median(hist))
+        self._stable[col_name] = stable
+        if prev_stable and prev_stable > 0:
+            change_pct = abs(new_floor - prev_stable) / prev_stable * 100
+            if change_pct > self._anomaly_pct:
+                self._anomalous.add(col_name)
+                log.debug(
+                    "FloorTracker: аномалия '%s': %s → %s (%.0f%%)",
+                    col_name, tons_fmt(prev_stable), tons_fmt(new_floor), change_pct,
+                )
+        return stable
+
+    def get(self, col_name: str) -> int | None:
+        return self._stable.get(col_name)
+
+    def get_all(self) -> dict[str, int]:
+        return dict(self._stable)
+
+    def pop_anomalous(self) -> set[str]:
+        result = self._anomalous.copy()
+        self._anomalous.clear()
+        return result
+
+    def count(self) -> int:
+        return len(self._stable)
+
+
+# ─────────────────────────────────────────────
+#  RateAdaptor — авто-подстройка интервала
+# ─────────────────────────────────────────────
+
+class RateAdaptor:
+    """
+    Адаптивный регулятор интервала сканирования.
+    429-rate > RATE_UP_THRESHOLD   → интервал +0.15с
+    429-rate < RATE_DOWN_THRESHOLD → интервал -0.05с
+    """
+
+    def __init__(
+        self,
+        initial_interval: float,
+        min_interval: float = MIN_SCAN_INTERVAL,
+        max_interval: float = MAX_SCAN_INTERVAL,
+        window: int = RATE_ADAPT_WINDOW,
+    ):
+        self.interval = max(min_interval, min(max_interval, initial_interval))
+        self._min = min_interval
+        self._max = max_interval
+        self._window = window
+        self._scans = 0
+        self._errors_429 = 0
+        self._auto = True
+
+    def record_ok(self) -> None:
+        self._scans += 1
+
+    def record_429(self) -> None:
+        self._scans += 1
+        self._errors_429 += 1
+
+    def maybe_adjust(self) -> bool:
+        if not self._auto or self._scans < self._window:
+            return False
+        rate = self._errors_429 / self._scans
+        old = self.interval
+        if rate > RATE_UP_THRESHOLD:
+            self.interval = min(self._max, self.interval + 0.15)
+        elif rate < RATE_DOWN_THRESHOLD and self.interval > self._min:
+            self.interval = max(self._min, self.interval - 0.05)
+        changed = abs(self.interval - old) > 0.001
+        if changed:
+            log.info(
+                "RateAdaptor: интервал %.2fс → %.2fс (429-rate %.0f%% за %d сканов)",
+                old, self.interval, rate * 100, self._scans,
+            )
+        self._scans = 0
+        self._errors_429 = 0
+        return changed
+
+    def set_manual(self, interval: float) -> None:
+        self.interval = max(self._min, min(self._max, interval))
+        self._auto = False
+
+    def set_auto(self) -> None:
+        self._auto = True
+        self._scans = 0
+        self._errors_429 = 0
+
+    @property
+    def is_auto(self) -> bool:
+        return self._auto
 
 
 # ─────────────────────────────────────────────
@@ -271,19 +364,13 @@ async def api_request_async(
     session: AsyncSession,
     json_data: dict | None = None,
 ) -> Any:
-    """
-    Асинхронный HTTP запрос (GET/POST) через AsyncSession с обработкой 429 и отключением медленных прокси (>1.5с).
-    """
     last_exc: Exception | None = None
 
     for attempt in range(MAX_RETRIES):
         slot = await pool.next_async()
         t0 = time.monotonic()
 
-        log.debug(
-            "API %s %s | слот: %s | попытка %d/%d",
-            method.upper(), endpoint, slot.label, attempt + 1, MAX_RETRIES,
-        )
+        log.debug("API %s %s | слот: %s | попытка %d/%d", method.upper(), endpoint, slot.label, attempt + 1, MAX_RETRIES)
 
         try:
             if method.upper() == "GET":
@@ -308,14 +395,12 @@ async def api_request_async(
                 if needs_replace:
                     new_prx = pool.replace_slot_proxy(slot)
                     if new_prx:
-                        log.warning("⚠️ Слот [%s] ответил за %.2fс — заменён на резервный [%s]", slot.token[:8], elapsed, new_prx.cfg.name)
-                        print(f"\n🔄 Слот [{slot.token[:8]}…] переключён на резервный прокси [{new_prx.cfg.name}]")
+                        log.warning("⚠️ Слот [%s] ответил за %.2fс — заменён [%s]", slot.token[:8], elapsed, new_prx.cfg.name)
                     else:
-                        log.warning("⚠️ Слот [%s] ответил за %.2fс — отключён (резерв пуст)", slot.label, elapsed)
-                        print(f"\n⚠️  Прокси [{slot.label}] отключён (>%.1fс, {elapsed:.1f}с)" % (REQUEST_TIMEOUT, elapsed))
+                        log.warning("⚠️ Слот [%s] ответил за %.2fс — отключён", slot.label, elapsed)
 
             if r.status_code == 401:
-                log.error("HTTP 401 Unauthorized | Токен просрочен (слот: %s)", slot.label)
+                log.error("HTTP 401 | Токен просрочен (слот: %s)", slot.label)
                 stats_tracker.record_error("HTTP 401", f"Токен просрочен (слот: {slot.label})", slot.label, endpoint)
                 last_exc = AuthTokenExpiredError(f"HTTP 401: Токен просрочен (слот: {slot.label})")
                 continue
@@ -327,21 +412,15 @@ async def api_request_async(
                 except (ValueError, TypeError):
                     retry_val = 0.0
                 retry_after = retry_val if retry_val > 0 else PENALTY_429
-                log.warning(
-                    "429 Too Many Requests | слот: %s | штраф: %.0fс | elapsed: %.2fс",
-                    slot.label, retry_after, elapsed,
-                )
+                log.warning("429 | слот: %s | штраф: %.0fс", slot.label, retry_after)
                 pool.penalize(slot, retry_after)
-                stats_tracker.record_error("HTTP 429", f"Too Many Requests (penalty {retry_after}s)", slot.label, endpoint)
+                stats_tracker.record_error("HTTP 429", f"penalty {retry_after}s", slot.label, endpoint)
                 last_exc = Exception(f"HTTP 429 (слот: {slot.label})")
                 continue
 
             r.raise_for_status()
             slot.record_success()
-            log.debug(
-                "API ответ: %d | elapsed: %.2fс | слот: %s",
-                r.status_code, elapsed, slot.label,
-            )
+            log.debug("API ответ: %d | %.2fс | %s", r.status_code, elapsed, slot.label)
             return r.json()
 
         except asyncio.CancelledError:
@@ -354,24 +433,18 @@ async def api_request_async(
                 if needs_replace:
                     new_prx = pool.replace_slot_proxy(slot)
                     if new_prx:
-                        log.warning("⚠️ Слот [%s] таймаут — заменён на резервный [%s]", slot.token[:8], new_prx.cfg.name)
-                        print(f"\n🔄 Слот [{slot.token[:8]}…] переключён на резервный прокси [{new_prx.cfg.name}]")
+                        log.warning("⚠️ Слот [%s] таймаут — заменён [%s]", slot.token[:8], new_prx.cfg.name)
                     else:
-                        log.warning("⚠️ Слот [%s] превысил таймаут %.1fс — отключён (резерв пуст)", slot.label, REQUEST_TIMEOUT)
-                        print(f"\n⚠️  Прокси [{slot.label}] отключён за таймаут (>%.1fс)" % REQUEST_TIMEOUT)
+                        log.warning("⚠️ Слот [%s] таймаут — отключён", slot.label)
             if "429" in str(e):
                 pool.penalize(slot, PENALTY_429)
                 log.warning("429 (из исключения) | слот: %s | штраф: %.0fс", slot.label, PENALTY_429)
                 stats_tracker.record_error("HTTP 429", str(e), slot.label, endpoint)
             else:
-                log.warning(
-                    "Ошибка запроса %s %s | слот: %s | elapsed: %.2fс | %s",
-                    method.upper(), endpoint, slot.label, elapsed, e,
-                )
+                log.warning("Ошибка %s %s | %s | %.2fс | %s", method.upper(), endpoint, slot.label, elapsed, e)
                 stats_tracker.record_error(err_name, str(e), slot.label, endpoint)
             last_exc = e
-            if attempt < MAX_RETRIES - 1:
-                await asyncio.sleep(0.3)
+            # Нет sleep(0.3) — сразу берём следующий слот
 
     raise last_exc or RuntimeError(f"Все попытки исчерпаны: {method} {endpoint}")
 
@@ -385,7 +458,7 @@ async def api_get_async(endpoint: str, pool: AccountPool, session: AsyncSession)
 
 
 # ─────────────────────────────────────────────
-#  Загрузка листингов (Async)
+#  Загрузка листингов (параллельный Async)
 # ─────────────────────────────────────────────
 
 async def fetch_page_async(cursor: str, pool: AccountPool, session: AsyncSession) -> dict:
@@ -394,7 +467,7 @@ async def fetch_page_async(cursor: str, pool: AccountPool, session: AsyncSession
         "modelNames": [],
         "backdropNames": [],
         "symbolNames": [],
-        "ordering": "None",    # по времени, новые первые
+        "ordering": "None",
         "lowToHigh": False,
         "maxPrice": None,
         "minPrice": None,
@@ -407,115 +480,109 @@ async def fetch_page_async(cursor: str, pool: AccountPool, session: AsyncSession
     }, pool, session)
 
 
-async def fetch_new_listings_async(pool: AccountPool, seen_ids: set, first_run: bool, session: AsyncSession) -> list[dict]:
+async def fetch_new_listings_async(
+    pool: AccountPool,
+    seen_ids: Any,
+    first_run: bool,
+    session: AsyncSession,
+) -> tuple[list[dict], list[dict]]:
+    """
+    Загрузка первой страницы листинга (20 подарков).
+    Возвращает (new_gifts, page_gifts).
+    """
+    data = await fetch_page_async("", pool, session)
+    gifts = data.get("gifts", [])
+    log.debug("Страница 1: %d подарков", len(gifts))
+
+    if not gifts:
+        return [], []
+
+    if first_run:
+        return gifts, gifts
+
     new_gifts: list[dict] = []
-    cursor = ""
-    max_pages = 1 if first_run else 3
-
-    for page_n in range(1, max_pages + 1):
-        data = await fetch_page_async(cursor, pool, session)
-        gifts = data.get("gifts", [])
-        log.debug("Страница %d: получено %d подарков", page_n, len(gifts))
-
-        if not gifts:
+    for gift in gifts:
+        gid = gift.get("id")
+        if gid in seen_ids:
             break
+        new_gifts.append(gift)
 
-        found_old = False
-        for gift in gifts:
-            gid = gift.get("id")
-            if gid in seen_ids:
-                found_old = True
-                break
-            new_gifts.append(gift)
-
-        if found_old:
-            log.debug("Страница %d: встретили виденный ID, останавливаемся", page_n)
-            break
-
-        cursor = data.get("cursor")
-        if not cursor:
-            break
-
-    return new_gifts
+    return new_gifts, gifts
 
 
-async def fetch_black_floor_async(pool: AccountPool, session: AsyncSession) -> int | None:
-    data = await api_post_async("/gifts/saling", {
-        "collectionNames": [],
-        "modelNames": [],
-        "backdropNames": list(BLACK_BACKDROPS),
-        "symbolNames": [],
-        "ordering": "Price",
-        "lowToHigh": True,
-        "maxPrice": None,
-        "minPrice": None,
-        "mintable": None,
-        "number": None,
-        "count": 20,
-        "cursor": "",
-        "query": None,
-        "promotedFirst": False,
-    }, pool, session)
+# ─────────────────────────────────────────────
+#  Загрузка флоров NFT-коллекций
+# ─────────────────────────────────────────────
 
-    prices = sorted(
-        int(g["salePrice"])
-        for g in data.get("gifts", [])
-        if g.get("salePrice")
-    )
-    floor = prices[1] if len(prices) >= 2 else (prices[0] if prices else None)
-    log.debug("Флор чёрного фона: %s (из %d позиций)", tons_fmt(floor) if floor else "N/A", len(prices))
-    return floor
-
-
-async def fetch_all_model_floors_async(pool: AccountPool, session: AsyncSession) -> tuple[dict[str, int], dict[str, int]]:
+async def fetch_floors_async(
+    pool: AccountPool,
+    session: AsyncSession,
+    floor_tracker: FloorTracker,
+) -> tuple[int | None, dict[str, int], dict[str, int]]:
     """
-    1. GET /gifts/collections -> список всех доступных коллекций и их объёмов.
-    2. Батчами (по <=10 коллекций): POST /gifts/models {"collections": [...]}.
-    3. Возвращает кортеж: (model_floors, collection_volumes).
+    Получает флоры всех коллекций из /gifts/collections (один запрос).
+    Также запрашивает флор чёрного фона из листинга Black подарков.
+    Возвращает (black_floor_nano, collection_floors, collection_volumes).
     """
-    model_floors: dict[str, int] = {}
-    collection_volumes: dict[str, int] = {}
-    log.info("Загрузка списка коллекций для обновления флора моделей и объёмов...")
+    log.debug("Обновляем флоры коллекций...")
+
     try:
         collections_data = await api_get_async("/gifts/collections", pool, session)
     except Exception as e:
-        log.error("Не удалось получить список коллекций: %s", e)
-        return model_floors, collection_volumes
+        log.error("Не удалось получить /gifts/collections: %s", e)
+        return None, floor_tracker.get_all(), {}
 
     if not isinstance(collections_data, list):
-        log.error("Некорректный формат ответа /gifts/collections: %s", type(collections_data))
-        return model_floors, collection_volumes
+        log.error("Некорректный формат /gifts/collections: %s", type(collections_data))
+        return None, floor_tracker.get_all(), {}
 
-    collection_names = []
+    collection_volumes: dict[str, int] = {}
+
     for c in collections_data:
-        if isinstance(c, dict) and c.get("name"):
-            c_name = c["name"]
-            collection_names.append(c_name)
-            vol = c.get("volume")
-            if vol is not None:
-                collection_volumes[c_name] = int(vol)
+        if not isinstance(c, dict) or not c.get("name"):
+            continue
+        c_name = c["name"]
+        vol = c.get("volume")
+        if vol is not None:
+            collection_volumes[c_name] = int(vol)
+        raw_floor = c.get("floorPriceNanoTons")
+        if raw_floor is not None and int(raw_floor) > 0:
+            floor_tracker.update(c_name, int(raw_floor))
 
-    log.info("Получено коллекций: %d (объёмов: %d). Запрашиваем флор моделей пачками по 10...", len(collection_names), len(collection_volumes))
+    # Отдельный запрос для точного флора чёрного фона
+    black_floor = await _fetch_black_floor_from_listing(pool, session)
 
-    # Лимит API: за раз можно указать не более 10 коллекций
-    for i in range(0, len(collection_names), 10):
-        batch = collection_names[i:i + 10]
-        try:
-            models_data = await api_post_async("/gifts/models", {"collections": batch}, pool, session)
-            if isinstance(models_data, list):
-                for item in models_data:
-                    c_name = item.get("collectionName")
-                    m_name = item.get("modelName")
-                    fp = item.get("floorPriceNanoTons")
-                    if c_name and m_name and fp is not None:
-                        key = f"{c_name}:{m_name}"
-                        model_floors[key] = int(fp)
-            await asyncio.sleep(1.2)  # Пауза между батчами для предотвращения 429 по IP
-        except Exception as e:
-            log.warning("Ошибка при загрузке флоров моделей для батча %s: %s", batch, e)
+    collection_floors = floor_tracker.get_all()
+    log.debug("Флоры обновлены: %d коллекций, чёрный: %s", len(collection_floors), tons_fmt(black_floor) if black_floor else "N/A")
+    return black_floor, collection_floors, collection_volumes
 
-    log.info("Флоры моделей обновлены: загружено %d моделей, %d коллекций", len(model_floors), len(collection_volumes))
-    return model_floors, collection_volumes
+
+async def _fetch_black_floor_from_listing(pool: AccountPool, session: AsyncSession) -> int | None:
+    try:
+        data = await api_post_async("/gifts/saling", {
+            "collectionNames": [],
+            "modelNames": [],
+            "backdropNames": list(BLACK_BACKDROPS),
+            "symbolNames": [],
+            "ordering": "Price",
+            "lowToHigh": True,
+            "maxPrice": None,
+            "minPrice": None,
+            "mintable": None,
+            "number": None,
+            "count": 20,
+            "cursor": "",
+            "query": None,
+            "promotedFirst": False,
+        }, pool, session)
+    except Exception as e:
+        log.warning("Не удалось получить листинг Black: %s", e)
+        return None
+
+    prices = sorted(int(g["salePrice"]) for g in data.get("gifts", []) if g.get("salePrice"))
+    floor = prices[1] if len(prices) >= 2 else (prices[0] if prices else None)
+    log.debug("Флор чёрного: %s (%d позиций)", tons_fmt(floor) if floor else "N/A", len(prices))
+    return floor
 
 
 # ─────────────────────────────────────────────
@@ -525,7 +592,7 @@ async def fetch_all_model_floors_async(pool: AccountPool, session: AsyncSession)
 def check_gift(
     gift: dict,
     black_floor: int | None,
-    model_floors: dict[str, int],
+    collection_floors: dict[str, int],
     collection_volumes: dict[str, int] | None = None,
     min_ton_diff: float = MIN_TON_DIFF,
     cheap_threshold: float = CHEAP_PRICE_THRESHOLD,
@@ -533,14 +600,12 @@ def check_gift(
     max_price_nano: int | None = None,
 ) -> list[dict]:
     """
-    Подарок считается ликвидным (покупаем) в трёх случаях:
-    1. У него черный фон и он стоит на min_ton_diff меньше флора черного фона.
-    2. Он стоит меньше cheap_threshold (абсолютный дешевый порог).
-    3. Он стоит на min_ton_diff дешевле флора этой конкретной модели.
+    Три условия покупки:
+    1. Черный фон + цена ниже флора черного на min_ton_diff.
+    2. Цена < cheap_threshold (абсолютно дёшево).
+    3. Цена ниже флора коллекции (NFT floor) на min_ton_diff.
 
-    Дополнительные фильтры:
-    - filter_by_balance: если max_price_nano задан и цена лота выше баланса — отсекается.
-    - min_turnover_ratio: если задан (>0) и оборот_коллекции / цена < min_turnover_ratio — отсекается (не применяется к лотам с черным фоном и дешевле cheap_threshold).
+    Доп. фильтры: баланс, оборот.
     """
     deals: list[dict] = []
     price = gift.get("salePrice")
@@ -551,21 +616,10 @@ def check_gift(
     collection_name = gift.get("collectionName")
     model_name = gift.get("modelName")
     backdrop_name = gift.get("backdropName")
-    model_key = f"{collection_name}:{model_name}"
 
-    # ── Фильтр по балансу ────────────────────────────────────────────────
     if max_price_nano is not None and price > max_price_nano:
-        log.debug(
-            "Пропуск лота %s: цена %.2f TON > баланса %.2f TON",
-            gift.get("number"), price_ton, tons(max_price_nano),
-        )
         return deals
 
-    # ── Фильтр по обороту (оборот коллекции / цена) для NFT ───────────────
-    # Фильтр НЕ распространяется на категории:
-    # 1) черный фон (backdropName in BLACK_BACKDROPS)
-    # 2) дешевле cheap_threshold TON (price_ton < cheap_threshold)
-    # 3) редкий номер ID < 100 (number < 100)
     gift_num = gift.get("number") if gift.get("number") is not None else gift.get("num")
     is_low_id = False
     low_id_val = None
@@ -580,13 +634,9 @@ def check_gift(
     turnover_ratio = (col_vol / price) if price > 0 else 0.0
     is_turnover_exempt = (backdrop_name in BLACK_BACKDROPS) or (price_ton < cheap_threshold) or is_low_id
     if not is_turnover_exempt and min_turnover_ratio > 0 and turnover_ratio < min_turnover_ratio:
-        log.debug(
-            "Пропуск лота %s (коллекция '%s'): оборот/цена %.1fx < порога %.1fx (оборот: %.0f TON)",
-            gift.get("number"), collection_name, turnover_ratio, min_turnover_ratio, tons(col_vol),
-        )
         return deals
 
-    # ── 1. Флор чёрного фона ───────────────────────────────────────────────
+    # 1. Чёрный фон
     if backdrop_name in BLACK_BACKDROPS and black_floor:
         diff_ton = tons(black_floor - price)
         if diff_ton >= min_ton_diff:
@@ -602,71 +652,55 @@ def check_gift(
                 "turnover_ratio": turnover_ratio,
                 "collection_volume": col_vol,
             })
-            log.debug(
-                "BLACK deal: %s %s #%s | %.2f TON < флор черного %.2f TON (выгода %.2f TON, %.1f%% скидка, оборот %.1fx)",
-                collection_name, model_name, gift.get("number"), price_ton, tons(black_floor), diff_ton, pct, turnover_ratio,
-            )
 
-    # ── 2. Абсолютный дешевый порог (< cheap_threshold TON) ────────────────
+    # 2. Абсолютно дёшево
     if price_ton < cheap_threshold:
-        model_floor_val = model_floors.get(model_key, price)
-        diff_ton = tons(model_floor_val - price) if model_floor_val > price else 0.0
-        pct = (model_floor_val - price) / model_floor_val * 100 if model_floor_val > 0 else 0.0
+        col_floor = collection_floors.get(collection_name, price)
+        diff_ton = tons(col_floor - price) if col_floor > price else 0.0
+        pct = (col_floor - price) / col_floor * 100 if col_floor > 0 else 0.0
         deals.append({
             "type": "CHEAP",
             "gift": gift,
             "price": price,
-            "floor": model_floor_val,
+            "floor": col_floor,
             "pct": pct,
             "diff_ton": diff_ton,
             "floor_src": f"дешевле {cheap_threshold:.2f} TON",
             "turnover_ratio": turnover_ratio,
             "collection_volume": col_vol,
         })
-        log.debug(
-            "CHEAP deal: %s %s #%s | %.4f TON < %.2f TON порог (оборот %.1fx)",
-            collection_name, model_name, gift.get("number"), price_ton, cheap_threshold, turnover_ratio,
-        )
 
-    # ── 3. Флор конкретной модели или Редкий номер ID < 100 ──────────────
-    model_floor = model_floors.get(model_key)
-    if model_floor:
-        diff_ton = tons(model_floor - price)
-        pct = (model_floor - price) / model_floor * 100 if model_floor > 0 else 0.0
-        max_allowed_low_id = int(model_floor * LOW_ID_MAX_FLOOR_RATIO) if is_low_id else -1
+    # 3. Флор коллекции (NFT) или редкий ID
+    col_floor = collection_floors.get(collection_name)
+    if col_floor:
+        diff_ton = tons(col_floor - price)
+        pct = (col_floor - price) / col_floor * 100 if col_floor > 0 else 0.0
+        max_allowed_low_id = int(col_floor * LOW_ID_MAX_FLOOR_RATIO) if is_low_id else -1
 
         if is_low_id and price <= max_allowed_low_id:
             deals.append({
                 "type": "LOW_ID",
                 "gift": gift,
                 "price": price,
-                "floor": model_floor,
+                "floor": col_floor,
                 "pct": pct,
                 "diff_ton": diff_ton,
-                "floor_src": f"редкий ID #{low_id_val} (≤{LOW_ID_MAX_FLOOR_RATIO*100:.0f}% флора)",
+                "floor_src": f"редкий ID #{low_id_val} (<=  {LOW_ID_MAX_FLOOR_RATIO*100:.0f}% флора)",
                 "turnover_ratio": turnover_ratio,
                 "collection_volume": col_vol,
             })
-            log.debug(
-                "LOW_ID deal: %s %s #%s | %.2f TON <= %.0f%% флора %.2f TON (выгода %.2f TON, %.1f%% скидка, оборот %.1fx)",
-                collection_name, model_name, low_id_val, price_ton, LOW_ID_MAX_FLOOR_RATIO * 100, tons(model_floor), diff_ton, pct, turnover_ratio,
-            )
         elif diff_ton >= min_ton_diff:
             deals.append({
-                "type": "MODEL",
+                "type": "NFT",
                 "gift": gift,
                 "price": price,
-                "floor": model_floor,
+                "floor": col_floor,
                 "pct": pct,
                 "diff_ton": diff_ton,
-                "floor_src": f"модель {model_name}",
+                "floor_src": f"флор коллекции {collection_name}",
                 "turnover_ratio": turnover_ratio,
                 "collection_volume": col_vol,
             })
-            log.debug(
-                "MODEL deal: %s %s #%s | %.2f TON < флор модели %.2f TON (выгода %.2f TON, %.1f%% скидка, оборот %.1fx)",
-                collection_name, model_name, gift.get("number"), price_ton, tons(model_floor), diff_ton, pct, turnover_ratio,
-            )
 
     return deals
 
@@ -678,9 +712,9 @@ def check_gift(
 def print_and_log_deal(deal: dict) -> None:
     gift = deal["gift"]
     _tags = {
-        "BLACK": "🖤  ЧЁРНЫЙ ФОН",
-        "CHEAP": f"💸  ДЁШЕВО (<{CHEAP_PRICE_THRESHOLD:.1f} TON)",
-        "MODEL": "🎯  НИЖЕ ФЛОРА МОДЕЛИ",
+        "BLACK":  "🖤  ЧЁРНЫЙ ФОН",
+        "CHEAP":  f"💸  ДЁШЕВО (<{CHEAP_PRICE_THRESHOLD:.1f} TON)",
+        "NFT":    "🎯  НИЖЕ ФЛОРА КОЛЛЕКЦИИ",
         "LOW_ID": "🏷️  РЕДКИЙ НОМЕР (<100)",
     }
     tag = _tags.get(deal["type"], "🔥  ВЫГОДНАЯ СДЕЛКА")
@@ -690,7 +724,7 @@ def print_and_log_deal(deal: dict) -> None:
     vol_nano = deal.get("collection_volume")
     tr_line = []
     if tr is not None and vol_nano is not None:
-        tr_line.append(f"  📊  Оборот/цена: {tr:.1f}x  (объём коллекции: {vol_nano/1e9:,.0f} TON)")
+        tr_line.append(f"  📊  Оборот/цена: {tr:.1f}x  (объём: {vol_nano/1e9:,.0f} TON)")
 
     lines = [
         SEPARATOR,
@@ -702,22 +736,132 @@ def print_and_log_deal(deal: dict) -> None:
         f"  🔗  {gift_url(gift)}",
         "",
     ]
-    output = "\n".join(lines)
-    print(output)
+    print("\n".join(lines))
 
     tr_info = f" | оборот: {tr:.1f}x" if tr is not None else ""
-    # Логируем в scanner.log
     log.info(
-        "DEAL [%s] выгода %.2f TON (скидка %.1f%%) | %s %s #%s | %.2f TON → флор %.2f TON%s | %s",
+        "DEAL [%s] выгода %.2f TON (%.1f%%) | %s #%s | %.2f TON → флор %.2f TON%s | %s",
         deal["type"], diff_ton, deal["pct"],
-        gift.get("collectionName"), gift.get("modelName"), gift.get("number"),
+        gift.get("collectionName"), gift.get("number"),
         tons(deal["price"]), tons(deal["floor"]),
-        tr_info,
-        gift_url(gift),
+        tr_info, gift_url(gift),
     )
-
-    # Записываем в deals.jsonl
     log_deal_to_file(deal)
+
+
+# ─────────────────────────────────────────────
+#  Детектирование выкупленных лотов
+# ─────────────────────────────────────────────
+
+async def _edit_sold_alert_async(
+    bot_token: str,
+    alert_info: dict,
+    elapsed_sec: int,
+) -> None:
+    """Редактирует Telegram-сообщение о лоте, помечая его как выкупленный с временем."""
+    if not bot_token or not alert_info:
+        return
+    from aiogram import Bot
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+    messages = alert_info.get("messages", {})
+    if not messages:
+        return
+
+    orig_text = alert_info.get("text", "")
+    nft_url = alert_info.get("nft_url", "")
+
+    header_sold = f"☑️ <b>ЛОТ ВЫКУПЛЕН</b> (за {elapsed_sec} сек)"
+    if orig_text:
+        parts = orig_text.split("\n\n", 1)
+        body = parts[1] if len(parts) > 1 else orig_text
+        new_text = f"{header_sold}\n\n{body}"
+    else:
+        new_text = header_sold
+
+    reply_markup = None
+    if nft_url:
+        reply_markup = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="🎁 Открыть NFT в Telegram", url=nft_url)]]
+        )
+
+    bot = Bot(token=bot_token)
+    try:
+        for admin_id, msg_id in messages.items():
+            try:
+                await bot.edit_message_text(
+                    chat_id=admin_id,
+                    message_id=msg_id,
+                    text=new_text,
+                    reply_markup=reply_markup,
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                log.debug("Ошибка редактирования сообщения %s (sold): %s", msg_id, e)
+    finally:
+        await bot.session.close()
+
+
+def check_sold_alerts(
+    page_gifts: list[dict],
+    scanner_state: ScannerState,
+    bot_token: str,
+) -> None:
+    """
+    Проверяет отправленные алерты на выкуп:
+    1. Если подарок всё ещё на странице 1 — обновляем список ID, идущих после него.
+    2. Если подарок исчез, но ХОТЯ БЫ ОДИН подарок, который был ПОСЛЕ него, всё ещё на странице — лот выкуплен!
+    3. Если исчезли и подарок, и все последующие — они просто сместились на страницу 2 (НЕ помечаем как выкупленные).
+    4. Старые алерты (> 15 минут) удаляются для очистки памяти.
+    """
+    if not scanner_state.sent_alerts:
+        return
+
+    now = time.time()
+    current_page_ids = {g.get("id") for g in page_gifts if g.get("id")}
+    sold_deals = []
+    expired_ids = []
+
+    for gid, info in list(scanner_state.sent_alerts.items()):
+        # Очистка памяти: алерты старше 15 минут удаляем
+        if now - info.get("sent_at", now) > 900:
+            expired_ids.append(gid)
+            continue
+
+        # Подарок всё ещё виден на первой странице
+        if gid in current_page_ids:
+            found = False
+            new_older = set()
+            for g in page_gifts:
+                if found:
+                    oid = g.get("id")
+                    if oid:
+                        new_older.add(oid)
+                elif g.get("id") == gid:
+                    found = True
+            if new_older:
+                info["older_ids"] = new_older
+            continue
+
+        # Подарок исчез с первой страницы
+        older_ids = info.get("older_ids", set())
+        # Если хотя бы один лот, стоявший ПОСЛЕ него, всё ещё на странице —
+        # значит страница не уехала вперёд, а лот был именно выкуплен/удалён!
+        if older_ids and (older_ids & current_page_ids):
+            elapsed_sec = max(1, int(now - info.get("sent_at", now)))
+            sold_deals.append((gid, info, elapsed_sec))
+        else:
+            # Лот и все следующие за ним уехали вниз (смещение пагинации) — не помечаем выкупленным
+            pass
+
+    for gid in expired_ids:
+        scanner_state.sent_alerts.pop(gid, None)
+
+    for gid, info, elapsed_sec in sold_deals:
+        scanner_state.sent_alerts.pop(gid, None)
+        log.info("🎯 Лот %s выкуплен за %dс!", gid, elapsed_sec)
+        if bot_token:
+            asyncio.create_task(_edit_sold_alert_async(bot_token, info, elapsed_sec))
 
 
 # ─────────────────────────────────────────────
@@ -730,7 +874,6 @@ def _handle_signal(sig, frame):
     log.info("Получен сигнал %s, завершаем...", signal.Signals(sig).name)
     _shutdown.set()
 
-# Graceful shutdown на Linux (SIGTERM от systemd/kill)
 signal.signal(signal.SIGTERM, _handle_signal)
 signal.signal(signal.SIGINT, _handle_signal)
 
@@ -742,8 +885,8 @@ async def main() -> None:
         "=" * 60,
         f"  🚀  MRKT Gift Scanner (Async)  (старт: {startup_ts})",
         f"  Порог выгоды:  {MIN_TON_DIFF:.2f} TON  |  дёшево < {CHEAP_PRICE_THRESHOLD:.2f} TON",
-        f"  Интервал:      {SCAN_INTERVAL:.2f} сек  |  таймаут прокси: {REQUEST_TIMEOUT:.1f} сек",
-        f"  Флор моделей:  обновление каждые {MODEL_FLOOR_REFRESH_HOURS:.1f} ч",
+        f"  Интервал:      {SCAN_INTERVAL:.2f} сек (авто-адаптация)",
+        f"  Флоры:         раз в {FLOOR_REFRESH} сканов | история: {FLOOR_HISTORY_LEN} точек",
         f"  Штраф 429:     {PENALTY_429:.0f} сек",
         f"  Чёрные фоны:   {', '.join(BLACK_BACKDROPS)}",
         f"  Логи:          {LOG_DIR.resolve()}",
@@ -752,8 +895,8 @@ async def main() -> None:
     ]
     for line in header_lines:
         print(line)
-    log.info("="*50)
-    log.info("Запуск MRKT Scanner (Async) | порог выгоды: %.2f TON | интервал: %.2fs", MIN_TON_DIFF, SCAN_INTERVAL)
+    log.info("=" * 50)
+    log.info("Запуск MRKT Scanner (Async) | порог выгоды: %.2f TON", MIN_TON_DIFF)
 
     try:
         pool = await build_pool_async(max_ping_seconds=MAX_PING_SECONDS)
@@ -769,10 +912,8 @@ async def main() -> None:
     log.info("Пул: %s", pool)
     print("=" * 60)
 
-    # Настройка моментального завершения по Ctrl+C на уровне asyncio
     loop = asyncio.get_running_loop()
     def _sig_handler():
-        log.info("Получен сигнал завершения, останавливаем...")
         _shutdown.set()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -781,6 +922,16 @@ async def main() -> None:
         except (NotImplementedError, RuntimeError):
             pass
 
+    # Стартовый интервал из пинга пула
+    avg_ping = pool.avg_ping_ms() if hasattr(pool, "avg_ping_ms") else None
+    if avg_ping and avg_ping > 0:
+        start_interval = max(MIN_SCAN_INTERVAL, min(avg_ping / 1000.0 * 1.5, SCAN_INTERVAL))
+        log.info("Стартовый интервал из пинга %.0f мс: %.2f с", avg_ping, start_interval)
+    else:
+        start_interval = SCAN_INTERVAL
+
+    adaptor = RateAdaptor(initial_interval=start_interval)
+
     scanner_state = ScannerState(
         pool=pool,
         is_paused=False,
@@ -788,28 +939,24 @@ async def main() -> None:
         cheap_price_threshold=CHEAP_PRICE_THRESHOLD,
         min_turnover_ratio=MIN_TURNOVER_RATIO,
         filter_by_balance=FILTER_BY_BALANCE,
-        scan_interval=SCAN_INTERVAL,
+        scan_interval=adaptor.interval,
         scans_count=0,
         deals_count=0,
         start_time=time.monotonic(),
         black_floor_nano=None,
-        model_floors_count=0,
+        collection_floors_count=0,
+        rate_adaptor=adaptor,
     )
 
     bot_task = None
     if TG_BOT_TOKEN and TG_ADMIN_IDS:
-        log.info("Запуск Telegram бота управления (админы: %s)...", TG_ADMIN_IDS)
+        log.info("Запуск Telegram бота (админы: %s)...", TG_ADMIN_IDS)
         print(f"  🤖 Telegram бот запущен для админов: {TG_ADMIN_IDS}")
         bot_task = asyncio.create_task(run_telegram_bot(TG_BOT_TOKEN, TG_ADMIN_IDS, scanner_state))
     else:
         print("  ℹ️  Telegram бот отключён (не задан TG_BOT_TOKEN или TG_ADMIN_ID в .env)")
 
-    # Инициализация основного аккаунта (выбор с максимальным балансом, если не задан)
-    async def init_primary_account_async(
-        pool_obj: AccountPool,
-        state_obj: ScannerState,
-        explicit_token: str = "",
-    ) -> None:
+    async def init_primary_account_async(pool_obj: AccountPool, state_obj: ScannerState, explicit_token: str = "") -> None:
         tokens = pool_obj.get_tokens()
         if not tokens:
             state_obj.primary_balance_nano = None
@@ -826,11 +973,8 @@ async def main() -> None:
             else:
                 bal_text = f"ошибка ({msg})"
             print(f"  👑 Основной аккаунт (из .env): {_mask_token(explicit_token)} (баланс: {bal_text})")
-            log.info("Основной аккаунт (из .env): %s (баланс: %s)", explicit_token, bal_text)
             return
 
-        # PRIMARY_TOKEN не указан — опрашиваем балансы всех аккаунтов параллельно
-        # и выбираем аккаунт с НАИБОЛЬШИМ балансом
         print(f"  👑 Поиск аккаунта с наибольшим балансом среди {len(tokens)} токенов...")
         tasks = []
         for tok in tokens:
@@ -839,7 +983,6 @@ async def main() -> None:
             tasks.append(verify_token_async(tok, proxy=proxy))
 
         results = await asyncio.gather(*tasks)
-
         best_token = tokens[0]
         best_balance = -1
 
@@ -856,14 +999,11 @@ async def main() -> None:
         pool_obj.set_primary_token(best_token)
         state_obj.primary_balance_nano = max(0, best_balance) if best_balance >= 0 else None
         bal_text = f"{best_balance / 1e9:.2f} TON" if best_balance >= 0 else "0.00 TON"
-        print(f"  👑 Автовыбор: {_mask_token(best_token)} выбран основным (баланс: {bal_text})")
-        log.info("Автовыбран основной аккаунт с наибольшим балансом: %s (баланс: %s)", best_token, bal_text)
+        print(f"  👑 Автовыбор: {_mask_token(best_token)} (баланс: {bal_text})")
 
-    # Фоновое обновление баланса текущего основного аккаунта
     async def update_primary_balance_async(pool_obj: AccountPool, state_obj: ScannerState) -> None:
         tok = pool_obj.primary_token
         if not tok:
-            state_obj.primary_balance_nano = None
             return
         try:
             slot = next((s for s in pool_obj.slots if s.token == tok), None)
@@ -871,18 +1011,15 @@ async def main() -> None:
             ok, msg, bdata = await verify_token_async(tok, proxy=proxy)
             if ok and "hard" in bdata:
                 state_obj.primary_balance_nano = int(bdata["hard"])
-                log.debug("Баланс основного аккаунта обновлён: %.2f TON", state_obj.primary_balance_nano / 1e9)
-            else:
-                log.warning("Не удалось обновить баланс основного аккаунта: %s", msg)
         except Exception as err:
-            log.warning("Ошибка при обновлении баланса основного аккаунта: %s", err)
+            log.warning("Ошибка обновления баланса: %s", err)
 
     await init_primary_account_async(pool, scanner_state, explicit_token=PRIMARY_TOKEN)
 
-    seen_ids: set = set()
+    seen_ids: dict[str, None] = {}
     black_floor: int | None = None
-    model_floors: dict[str, int] = {}
-    last_model_refresh: float = 0.0
+    collection_floors: dict[str, int] = {}
+    floor_tracker = FloorTracker()
     last_balance_refresh: float = time.monotonic()
     scan_count = 0
     total_deals = 0
@@ -896,68 +1033,83 @@ async def main() -> None:
                     await asyncio.sleep(0.5)
                     continue
 
-                # Периодическое фоновое обновление баланса основного аккаунта (каждые 30 сек)
                 if (time.monotonic() - last_balance_refresh >= 30.0) or (scanner_state.filter_by_balance and scanner_state.primary_balance_nano is None):
                     last_balance_refresh = time.monotonic()
                     asyncio.create_task(update_primary_balance_async(pool, scanner_state))
 
-                # Принудительное обновление флоров из Telegram бота
-                if scanner_state.force_refresh_models:
-                    scanner_state.force_refresh_models = False
-                    last_model_refresh = 0.0
+                # Синхронизация интервала с адаптором
+                if scanner_state.scan_interval != adaptor.interval:
+                    if adaptor.is_auto:
+                        adaptor.set_manual(scanner_state.scan_interval)
+                    else:
+                        scanner_state.scan_interval = adaptor.interval
+
+                # Принудительное обновление флоров
+                if scanner_state.force_refresh_floors:
+                    scanner_state.force_refresh_floors = False
+                    scan_count = FLOOR_REFRESH - 1
 
                 scan_count += 1
                 scanner_state.scans_count = scan_count
                 ts = now_str()
 
-                # ── Флор моделей (каждые 12 часов) ──────────────────────────────
-                if not model_floors or (time.monotonic() - last_model_refresh >= MODEL_FLOOR_REFRESH_SECS):
-                    log.info("Обновляем базу флоров моделей...")
-                    print(f"[{ts}] 🔄 Обновление флоров моделей (раз в {MODEL_FLOOR_REFRESH_HOURS:.0f}ч)...", end=" ", flush=True)
+                # ── Обновление флоров ─────────────────────────────────────────
+                if scan_count == 1 or scan_count % FLOOR_REFRESH == 0:
+                    label = "первый запуск" if scan_count == 1 else f"скан #{scan_count}"
+                    print(f"[{ts}] 🔄 Флоры ({label})...", end=" ", flush=True)
                     try:
-                        mf, cv = await fetch_all_model_floors_async(pool, session)
-                        if mf:
-                            model_floors = mf
-                            last_model_refresh = time.monotonic()
-                            scanner_state.model_floors_count = len(model_floors)
-                            if cv:
-                                scanner_state.collection_volumes = cv
-                            print(f"загружено {len(model_floors)} моделей ({len(cv)} коллекций)")
-                        else:
-                            print("не удалось обновить (используем кэш)")
-                    except Exception as e:
-                        log.error("Не удалось обновить флор моделей: %s", e)
-                        print(f"ошибка: {e}")
-
-                # ── Флор чёрного фона ────────────────────────────────────────────
-                if black_floor is None or scan_count % BLACK_FLOOR_REFRESH == 0:
-                    log.debug("Обновляем флор чёрного фона...")
-                    try:
-                        bf = await fetch_black_floor_async(pool, session)
+                        bf, cf, cv = await fetch_floors_async(pool, session, floor_tracker)
+                        if cf:
+                            collection_floors = cf
+                            scanner_state.collection_floors_count = len(collection_floors)
+                            scanner_state.collection_volumes = cv
                         if bf:
                             black_floor = bf
                             scanner_state.black_floor_nano = black_floor
-                            log.info("Флор чёрного фона: %s", tons_fmt(black_floor))
-                            print(f"[{ts}] 🖤 Флор чёрного фона: {tons_fmt(black_floor)}")
-                        else:
-                            log.warning("Флор чёрного фона не получен (нет Black листингов?)")
-                    except Exception as e:
-                        log.error("Не удалось получить флор чёрного фона: %s", e)
-                        print(f"[{ts}] ⚠️  Флор чёрного: {e}")
+                        print(f"{len(collection_floors)} коллекций | 🖤 {tons_fmt(black_floor) if black_floor else 'N/A'}")
+                        log.info("Флоры: %d коллекций | чёрный: %s", len(collection_floors), tons_fmt(black_floor) if black_floor else "N/A")
 
-                # ── Скан ─────────────────────────────────────────────────────────
+                        # Перепроверка аномалий
+                        anomalous = floor_tracker.pop_anomalous()
+                        if anomalous:
+                            log.info("Аномалии флора (%d коллекций) — перепроверка...", len(anomalous))
+                            bf2, cf2, _ = await fetch_floors_async(pool, session, floor_tracker)
+                            if cf2:
+                                collection_floors = cf2
+                                scanner_state.collection_floors_count = len(collection_floors)
+                            if bf2:
+                                black_floor = bf2
+                                scanner_state.black_floor_nano = black_floor
+
+                    except Exception as e:
+                        log.error("Не удалось обновить флоры: %s", e)
+                        print(f"ошибка: {e}")
+
+                # ── Скан ─────────────────────────────────────────────────────
                 label = " (первый скан)" if first_run else ""
-                log.debug("Скан #%d начат%s", scan_count, label)
+                log.debug("Скан #%d%s", scan_count, label)
                 print(f"[{ts}] ⟳ Скан #{scan_count}{label}...", end=" ", flush=True)
 
                 try:
                     t_scan = time.monotonic()
-                    new_gifts = await fetch_new_listings_async(pool, seen_ids, first_run, session)
+                    new_gifts, page_gifts = await fetch_new_listings_async(pool, seen_ids, first_run, session)
                     elapsed = time.monotonic() - t_scan
-                    consecutive_401_errors = 0  # Скан успешен — сбрасываем счётчик ошибки 401
+                    consecutive_401_errors = 0
 
-                    for g in new_gifts:
-                        seen_ids.add(g.get("id"))
+                    if first_run:
+                        for g in page_gifts:
+                            gid = g.get("id")
+                            if gid:
+                                seen_ids[gid] = None
+                    else:
+                        for g in new_gifts:
+                            gid = g.get("id")
+                            if gid:
+                                seen_ids[gid] = None
+
+                    # Ограничение памяти seen_ids (макс 5000 элементов)
+                    while len(seen_ids) > 5000:
+                        seen_ids.pop(next(iter(seen_ids)))
 
                     scan_deals_count = 0
                     if not first_run and new_gifts:
@@ -968,7 +1120,7 @@ async def main() -> None:
                                 check_gift(
                                     gift,
                                     black_floor,
-                                    model_floors,
+                                    collection_floors,
                                     collection_volumes=scanner_state.collection_volumes,
                                     min_ton_diff=scanner_state.min_ton_diff,
                                     cheap_threshold=scanner_state.cheap_price_threshold,
@@ -986,38 +1138,62 @@ async def main() -> None:
                             for deal in scan_deals:
                                 print_and_log_deal(deal)
                                 if TG_BOT_TOKEN and TG_ADMIN_IDS:
-                                    deal_type = deal.get("type", "MODEL")
+                                    deal_type = deal.get("type", "NFT")
                                     if scanner_state.notify_categories.get(deal_type, True):
-                                        asyncio.create_task(send_deal_notification(TG_BOT_TOKEN, TG_ADMIN_IDS, deal))
+                                        deal_gid = deal.get("gift", {}).get("id")
+                                        older_ids = set()
+                                        found = False
+                                        for pg in page_gifts:
+                                            if found:
+                                                ogid = pg.get("id")
+                                                if ogid:
+                                                    older_ids.add(ogid)
+                                            elif pg.get("id") == deal_gid:
+                                                found = True
+
+                                        asyncio.create_task(
+                                            send_deal_notification(
+                                                TG_BOT_TOKEN,
+                                                TG_ADMIN_IDS,
+                                                deal,
+                                                scanner_state=scanner_state,
+                                                older_ids=older_ids,
+                                            )
+                                        )
                                     else:
                                         scanner_state.vault.append(deal)
-                                        log.info(
-                                            "Сделка [%s] #%s сохранена в Хранилище (уведомления выключены) | Всего в хранилище: %d",
-                                            deal_type, deal.get("gift", {}).get("number"), len(scanner_state.vault),
-                                        )
+                                        log.info("Сделка [%s] #%s → Хранилище (%d)", deal_type, deal.get("gift", {}).get("number"), len(scanner_state.vault))
+
+                    # Детектирование выкупленных лотов на основе текущей страницы
+                    if not first_run and page_gifts:
+                        check_sold_alerts(page_gifts, scanner_state, TG_BOT_TOKEN)
 
                     stats_tracker.record_scan(new_gifts, scan_deals_count)
 
                     print(f"+{len(new_gifts)} новых  |  в базе: {len(seen_ids)}  |  {elapsed:.1f}с")
-                    log.info(
-                        "Скан #%d: +%d новых | всего в базе: %d | %.1fс",
-                        scan_count, len(new_gifts), len(seen_ids), elapsed,
-                    )
+                    log.info("Скан #%d: +%d новых | база: %d | %.1fс", scan_count, len(new_gifts), len(seen_ids), elapsed)
+
+                    adaptor.record_ok()
+                    if adaptor.maybe_adjust():
+                        scanner_state.scan_interval = adaptor.interval
+                        log.info("⚡ Авто-интервал: %.2fс", adaptor.interval)
 
                 except AuthTokenExpiredError as e:
                     consecutive_401_errors += 1
                     print(f"\n[{ts}] ❌ {e}")
-                    log.error("Просроченный токен (скан #%d) [%d/3 попыток]", scan_count, consecutive_401_errors)
                     if consecutive_401_errors >= 3:
-                        log.critical("❌ Все токены в пуле просрочены (HTTP 401). Ожидание обновления через Telegram бота.")
-                        print(f"\n🛑 Все токены просрочены (HTTP 401). Ожидание обновления токенов через Telegram бота...")
+                        log.critical("❌ Все токены просрочены (HTTP 401).")
+                        print(f"\n🛑 Все токены просрочены. Ожидание обновления через Telegram бота...")
                         scanner_state.is_paused = True
                 except Exception as e:
                     err_str = str(e)
                     if "429" in err_str:
-                        print(f"\n[{ts}] ⏳ 429 Too Many Requests (все слоты на штрафе), пауза 3с...")
-                        log.warning("Скан #%d: все слоты на штрафе (429). Ждём освобождения...", scan_count)
+                        print(f"\n[{ts}] ⏳ 429 — пауза 3с...")
+                        log.warning("Скан #%d: все слоты на штрафе (429).", scan_count)
                         stats_tracker.record_error("HTTP 429", err_str)
+                        adaptor.record_429()
+                        adaptor.maybe_adjust()
+                        scanner_state.scan_interval = adaptor.interval
                         await asyncio.sleep(3.0)
                     else:
                         print(f"\n[{ts}] ❌ {e}")
@@ -1026,21 +1202,20 @@ async def main() -> None:
 
                 first_run = False
 
-                # Ждём следующего скана (с динамическим интервалом из Telegram бота)
                 current_interval = scanner_state.scan_interval
                 try:
                     await asyncio.wait_for(
                         asyncio.shield(asyncio.ensure_future(_shutdown.wait())),
                         timeout=current_interval,
                     )
-                    break  # shutdown получен
+                    break
                 except asyncio.TimeoutError:
-                    pass  # нормально, просто истёк интервал
+                    pass
 
     except (KeyboardInterrupt, asyncio.CancelledError):
-        print("\n👋 Сканирование остановлено пользователем (Ctrl+C).")
-        log.info("Остановка пользователем (Ctrl+C).")
+        print("\n👋 Сканирование остановлено.")
     finally:
+        stats_tracker.save()
         log.info("Остановка: сканов: %d, сделок: %d", scan_count, total_deals)
         print(f"\n👋 Остановлено. Сканов: {scan_count}, сделок: {total_deals}")
         if bot_task:
