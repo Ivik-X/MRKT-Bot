@@ -34,7 +34,14 @@ from aiogram.types import (
     Message,
 )
 
-from account_pool import AccountPool, save_tokens, verify_token_async
+from account_pool import (
+    AccountPool,
+    save_tokens,
+    verify_token_async,
+    buy_gift_async,
+    verify_gift_in_vault_async,
+)
+from settings_manager import save_settings
 from xray_proxy import ping_proxy_async
 
 log = logging.getLogger("mrkt.tg_bot")
@@ -49,6 +56,7 @@ class ScannerState:
     """Общее состояние сканера для управления из Telegram."""
     pool: Optional[AccountPool] = None
     is_paused: bool = False
+    auto_buy: bool = False
     min_ton_diff: float = 2.5
     cheap_price_threshold: float = 3.0
     scan_interval: float = 0.5
@@ -74,7 +82,9 @@ class ScannerState:
     # {gift_id: {"sent_at": float, "messages": {admin_id: msg_id}, "text": str, "nft_url": str, "older_ids": set}}
     sent_alerts: dict[str, dict[str, Any]] = field(default_factory=dict)
     sold_queue: list[str] = field(default_factory=list)  # gift_id выкупленных лотов
+    buying_in_progress: set[str] = field(default_factory=set)  # gift_id покупаемых сейчас
     rate_adaptor: Optional[Any] = None  # RateAdaptor из scanner.py
+
 
     def uptime_str(self) -> str:
         elapsed = int(time.monotonic() - self.start_time)
@@ -199,8 +209,10 @@ def tokens_keyboard() -> InlineKeyboardMarkup:
 
 def settings_keyboard(state: ScannerState) -> InlineKeyboardMarkup:
     bal_toggle_text = "🟢 ВКЛ" if state.filter_by_balance else "🔴 ВЫКЛ"
+    autobuy_toggle_text = "🟢 ВКЛ" if state.auto_buy else "🔴 ВЫКЛ"
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text=f"🤖 Авто-покупка (AutoBuy): {autobuy_toggle_text}", callback_data="toggle_autobuy")],
             [InlineKeyboardButton(text=f"💰 Фильтр по балансу: {bal_toggle_text}", callback_data="toggle_balance_filter")],
             [InlineKeyboardButton(text="📊 Мин. оборот/цена (NFT)", callback_data="set_turnover_ratio")],
             [InlineKeyboardButton(text="👑 Сменить основной аккаунт", callback_data="nav_select_primary")],
@@ -210,6 +222,7 @@ def settings_keyboard(state: ScannerState) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="nav_main")],
         ]
     )
+
 
 
 def proxies_keyboard() -> InlineKeyboardMarkup:
@@ -296,11 +309,13 @@ def format_main_text(state: ScannerState) -> str:
         f"📊 Сканов: <code>{state.scans_count:,}</code> | 🎯 Сделок: <code>{state.deals_count}</code>\n"
         f"📦 В хранилище: <b>{vault_count}</b> сделок\n\n"
         f"⚙️ <b>Параметры:</b>\n"
+        f"• 🤖 AutoBuy: <b>{'🟢 ВКЛ' if state.auto_buy else '🔴 ВЫКЛ'}</b>\n"
         f"• Порог выгоды: <code>{state.min_ton_diff:.2f} TON</code>\n"
         f"• Дешёвые подарки: &lt; <code>{state.cheap_price_threshold:.2f} TON</code>\n"
         f"• Мин. оборот/цена: <code>{turnover_str}</code>\n"
         f"• Фильтр по балансу: <b>{filter_bal_str}</b>\n"
         f"• ⚡ Интервал: {interval_str}\n\n"
+
         f"👑 <b>Основной аккаунт:</b>\n"
         f"• Токен: <code>{primary_str}</code>\n"
         f"• Баланс TON: <code>{bal_str}</code>\n\n"
@@ -351,6 +366,7 @@ def format_vault_text(state: ScannerState) -> str:
 
 
 def format_settings_text(state: ScannerState) -> str:
+    autobuy_str = "🟢 ВКЛ" if state.auto_buy else "🔴 ВЫКЛ"
     bal_str = f"{state.primary_balance_nano / 1e9:.2f} TON" if state.primary_balance_nano is not None else "не проверен"
     filter_bal_str = "🟢 ВКЛ" if state.filter_by_balance else "🔴 ВЫКЛ"
     turnover_str = f"≥ {state.min_turnover_ratio:.1f}x" if state.min_turnover_ratio > 0 else "выключен (0.0)"
@@ -362,6 +378,8 @@ def format_settings_text(state: ScannerState) -> str:
 
     return (
         f"⚙️ <b>Настройки сканера</b>\n\n"
+        f"0. <b>Авто-покупка (AutoBuy):</b> {autobuy_str}\n"
+        f"   <i>(Моментальный выкуп подходящих подарков с основного аккаунта без задержек)</i>\n\n"
         f"1. <b>Фильтр по балансу:</b> {filter_bal_str}\n"
         f"   <i>(Показывать только подарки, на которые хватает баланса основного аккаунта)</i>\n\n"
         f"2. <b>Мин. оборот/цена для NFT:</b> <code>{turnover_str}</code>\n"
@@ -375,6 +393,7 @@ def format_settings_text(state: ScannerState) -> str:
         f"6. <b>⚡ Интервал сканирования ({interval_mode}):</b> <code>{state.scan_interval:.2f} с</code>\n"
         f"   <i>(Пауза между запросами; при установке вручную авто-адаптация отключается)</i>"
     )
+
 
 
 def format_tokens_text(tokens: list[str], verified_info: Optional[dict] = None) -> str:
@@ -461,7 +480,9 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
         cat = cb.data.replace("toggle_cat_", "")
         current = scanner_state.notify_categories.get(cat, True)
         scanner_state.notify_categories[cat] = not current
+        save_settings(scanner_state)
         status = "ВКЛ 🟢" if not current else "ВЫКЛ 🔴"
+
         await cb.answer(f"{cat}: {status}")
         text = format_categories_text(scanner_state)
         await cb.message.edit_text(text, reply_markup=categories_keyboard(scanner_state), parse_mode="HTML")
@@ -667,9 +688,19 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
         await cb.message.edit_text(text, reply_markup=settings_keyboard(scanner_state), parse_mode="HTML")
         await cb.answer()
 
+    @dp.callback_query(F.data == "toggle_autobuy")
+    async def cb_toggle_autobuy(cb: CallbackQuery):
+        scanner_state.auto_buy = not scanner_state.auto_buy
+        save_settings(scanner_state)
+        status_text = "включена 🟢" if scanner_state.auto_buy else "выключена 🔴"
+        await cb.answer(f"Авто-покупка {status_text}")
+        text = format_settings_text(scanner_state)
+        await cb.message.edit_text(text, reply_markup=settings_keyboard(scanner_state), parse_mode="HTML")
+
     @dp.callback_query(F.data == "toggle_balance_filter")
     async def cb_toggle_balance_filter(cb: CallbackQuery):
         scanner_state.filter_by_balance = not scanner_state.filter_by_balance
+        save_settings(scanner_state)
         status_text = "включён 🟢" if scanner_state.filter_by_balance else "выключен 🔴"
         await cb.answer(f"Фильтр по балансу {status_text}")
         if scanner_state.filter_by_balance and scanner_state.primary_balance_nano is None and scanner_state.pool:
@@ -680,6 +711,7 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
                     scanner_state.primary_balance_nano = int(bdata["hard"])
         text = format_settings_text(scanner_state)
         await cb.message.edit_text(text, reply_markup=settings_keyboard(scanner_state), parse_mode="HTML")
+
 
     @dp.callback_query(F.data == "set_turnover_ratio")
     async def cb_set_turnover_ratio(cb: CallbackQuery, state: FSMContext):
@@ -704,6 +736,7 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
             if val < 0:
                 raise ValueError
             scanner_state.min_turnover_ratio = val
+            save_settings(scanner_state)
             txt = f"<code>{val:.1f}x</code>" if val > 0 else "выключен (0.0)"
             await msg.answer(f"✅ Фильтр оборота установлен: {txt}", reply_markup=back_to_menu_keyboard("nav_settings"), parse_mode="HTML")
             await state.clear()
@@ -746,6 +779,7 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
                 target_tok = tokens[idx]
                 if scanner_state.pool:
                     scanner_state.pool.set_primary_token(target_tok)
+                save_settings(scanner_state)
                 ok, _, bdata = await verify_token_async(target_tok)
                 if ok and "hard" in bdata:
                     scanner_state.primary_balance_nano = int(bdata["hard"])
@@ -753,6 +787,7 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
         except Exception as e:
             log.error("Ошибка смены основного токена: %s", e)
             await cb.answer("Ошибка смены токена", show_alert=True)
+
 
         text = format_settings_text(scanner_state)
         await cb.message.edit_text(text, reply_markup=settings_keyboard(scanner_state), parse_mode="HTML")
@@ -775,6 +810,7 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
             if val <= 0:
                 raise ValueError
             scanner_state.min_ton_diff = val
+            save_settings(scanner_state)
             await msg.answer(f"✅ Порог выгоды изменён на <code>{val:.2f} TON</code>", reply_markup=back_to_menu_keyboard("nav_settings"), parse_mode="HTML")
             await state.clear()
         except ValueError:
@@ -798,6 +834,7 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
             if val <= 0:
                 raise ValueError
             scanner_state.cheap_price_threshold = val
+            save_settings(scanner_state)
             await msg.answer(f"✅ Порог дешёвых подарков изменён на <code>{val:.2f} TON</code>", reply_markup=back_to_menu_keyboard("nav_settings"), parse_mode="HTML")
             await state.clear()
         except ValueError:
@@ -826,6 +863,7 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
             if adaptor:
                 adaptor.set_auto()
                 scanner_state.scan_interval = adaptor.interval
+            save_settings(scanner_state)
             await msg.answer(f"✅ Авто-режим интервала включён (текущий: <code>{scanner_state.scan_interval:.2f} с</code>)", reply_markup=back_to_menu_keyboard("nav_settings"), parse_mode="HTML")
             await state.clear()
             return
@@ -836,10 +874,12 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
             scanner_state.scan_interval = val
             if adaptor:
                 adaptor.set_manual(val)
+            save_settings(scanner_state)
             await msg.answer(f"✅ Интервал изменён на <code>{val:.2f} с</code> (ручной режим)", reply_markup=back_to_menu_keyboard("nav_settings"), parse_mode="HTML")
             await state.clear()
         except ValueError:
             await msg.answer("❌ Введите положительное число >= 0.1 или <code>auto</code>:", parse_mode="HTML")
+
 
     # ── Раздел: Просмотр логов ────────────────────────────────────────────
     @dp.callback_query(F.data == "nav_logs")
@@ -924,7 +964,116 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
 
         await cb.message.edit_text("\n".join(lines), reply_markup=proxies_keyboard(), parse_mode="HTML")
 
+    # ── Ручная покупка подарка из уведомления ─────────────────────────────
+    @dp.callback_query(F.data.startswith("buy:"))
+    async def cb_buy_gift(cb: CallbackQuery):
+        raw_parts = cb.data.split(":")
+        if len(raw_parts) < 3:
+            await cb.answer("Неверные данные лота", show_alert=True)
+            return
+
+        gift_id = raw_parts[1]
+        try:
+            price_nano = int(raw_parts[2])
+        except ValueError:
+            await cb.answer("Некорректная цена лота", show_alert=True)
+            return
+
+        if gift_id in scanner_state.buying_in_progress:
+            await cb.answer("⏳ Покупка уже выполняется...", show_alert=True)
+            return
+
+        scanner_state.buying_in_progress.add(gift_id)
+        await cb.answer("⚡ Отправка запроса на покупку...")
+
+        pool = scanner_state.pool
+        prim_slot = pool.get_primary_slot() if pool else None
+        if not prim_slot:
+            scanner_state.buying_in_progress.discard(gift_id)
+            await cb.answer("❌ Нет активного основного аккаунта", show_alert=True)
+            return
+
+        # Оптимистично уменьшаем баланс
+        if scanner_state.primary_balance_nano is not None:
+            scanner_state.primary_balance_nano = max(0, scanner_state.primary_balance_nano - price_nano)
+
+        t_start = time.monotonic()
+        ok, msg, item = await buy_gift_async(
+            gift_id=gift_id,
+            price_nano=price_nano,
+            token=prim_slot.token,
+            proxies=prim_slot.proxies,
+        )
+        elapsed = time.monotonic() - t_start
+
+        # Фоновое обновление точного баланса
+        async def _refresh_bal():
+            try:
+                ok_b, _, bdata = await verify_token_async(prim_slot.token, proxy=prim_slot.proxy)
+                if ok_b and "hard" in bdata:
+                    scanner_state.primary_balance_nano = int(bdata["hard"])
+            except Exception:
+                pass
+
+        asyncio.create_task(_refresh_bal())
+
+        alert_info = scanner_state.sent_alerts.pop(gift_id, None)
+        deal = alert_info.get("deal") if alert_info else {}
+        gift = deal.get("gift", {}) if deal else {}
+        col_name = gift.get("collectionName", "NFT")
+        mod_name = gift.get("modelName", "")
+        num = gift.get("number") or gift.get("num") or "?"
+        price_ton = price_nano / 1e9
+
+        scanner_state.buying_in_progress.discard(gift_id)
+
+        if ok:
+            in_vault = await verify_gift_in_vault_async(gift_id, prim_slot.token, prim_slot.proxies)
+            vault_str = "Подтверждено в Хранилище ✅" if in_vault else "В Хранилище (по чеку покупки) ✅"
+            bal_str = (
+                f"~{scanner_state.primary_balance_nano / 1e9:.2f} TON"
+                if scanner_state.primary_balance_nano is not None
+                else "обновляется"
+            )
+            success_text = (
+                f"🎉 <b>УСПЕШНАЯ ПОКУПКА!</b>\n\n"
+                f"🎁 <b>{col_name} — {mod_name} #{num}</b>\n"
+                f"💰 <b>Куплено за:</b> <code>{price_ton:.2f} TON</code>\n"
+                f"📦 <b>Статус:</b> {vault_str}\n"
+                f"💳 <b>Остаток баланса:</b> <code>{bal_str}</code>\n"
+                f"⏱ <b>Время выкупа:</b> <code>{elapsed:.2f} с</code>\n"
+            )
+            nft_url = make_telegram_nft_url(col_name, num)
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="✅ Выкуплено вами", callback_data="noop")],
+                    [InlineKeyboardButton(text="🎁 Открыть NFT в Telegram", url=nft_url)],
+                ]
+            )
+            try:
+                await cb.message.edit_text(success_text, reply_markup=kb, parse_mode="HTML")
+            except Exception:
+                await cb.message.reply(success_text, reply_markup=kb, parse_mode="HTML")
+        else:
+            await cb.answer(f"❌ Не удалось купить: {msg}", show_alert=True)
+            nft_url = alert_info.get("nft_url", "https://t.me/nft") if alert_info else "https://t.me/nft"
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text=f"❌ Ошибка ({msg[:25]})", callback_data="noop")],
+                    [InlineKeyboardButton(text="🎁 Открыть NFT в Telegram", url=nft_url)],
+                ]
+            )
+            try:
+                await cb.message.edit_reply_markup(reply_markup=kb)
+            except Exception:
+                pass
+
+    @dp.callback_query(F.data == "noop")
+    async def cb_noop(cb: CallbackQuery):
+        await cb.answer()
+
     # ── Запуск Polling ───────────────────────────────────────────────────
+
     log.info("Telegram бот запущен для администраторов: %s", admin_ids)
     try:
         await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
@@ -1005,6 +1154,7 @@ async def send_deal_notification(
     bot: Optional[Bot] = None,
     scanner_state: Optional["ScannerState"] = None,
     older_ids: Optional[set[str]] = None,
+    with_buy_button: bool = True,
 ) -> None:
     """Отправляет богато оформленное уведомление о выгодной сделке в Telegram."""
     if not bot_token or not admin_ids:
@@ -1052,11 +1202,12 @@ async def send_deal_notification(
         f"\n🔗 <b>Ссылка на NFT:</b>\n"
         f"• 🎁 <a href=\"{nft_url}\">{nft_url}</a>\n"
     )
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🎁 Открыть NFT в Telegram", url=nft_url)]
-        ]
-    )
+
+    kb_rows = []
+    if with_buy_button and gift_id:
+        kb_rows.append([InlineKeyboardButton(text=f"💳 Купить за {price_ton:.2f} TON", callback_data=f"buy:{gift_id}:{price}")])
+    kb_rows.append([InlineKeyboardButton(text="🎁 Открыть NFT в Telegram", url=nft_url)])
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
 
     should_close = False
     if bot is None:
@@ -1072,7 +1223,7 @@ async def send_deal_notification(
                     reply_markup=kb,
                     parse_mode="HTML",
                 )
-                # Сохраняем данные алерта для последующей пометки выкупленных
+                # Сохраняем данные алерта для последующей пометки выкупленных и ручной покупки
                 if scanner_state is not None and gift_id:
                     if gift_id not in scanner_state.sent_alerts:
                         scanner_state.sent_alerts[gift_id] = {
@@ -1081,6 +1232,8 @@ async def send_deal_notification(
                             "text": text,
                             "nft_url": nft_url,
                             "older_ids": set(older_ids) if older_ids else set(),
+                            "deal": deal,
+                            "price_nano": price,
                         }
                     scanner_state.sent_alerts[gift_id]["messages"][admin_id] = sent_msg.message_id
             except Exception as e:
@@ -1088,3 +1241,175 @@ async def send_deal_notification(
     finally:
         if should_close:
             await bot.session.close()
+
+
+async def send_autobuy_success_report(
+    bot_token: str,
+    admin_ids: set[int],
+    deal: dict,
+    buy_data: dict,
+    in_vault: bool,
+    buy_elapsed: float,
+    scanner_state: Optional["ScannerState"] = None,
+    bot: Optional[Bot] = None,
+) -> None:
+    """Отправляет отчёт об успешной автоматической покупке подарка."""
+    if not bot_token or not admin_ids:
+        return
+
+    gift = deal.get("gift", {})
+    col_name = gift.get("collectionName", "Unknown")
+    mod_name = gift.get("modelName", "")
+    num = gift.get("number") or gift.get("num") or "?"
+    price = deal.get("price", 0)
+    floor = deal.get("floor", 0)
+    diff_ton = deal.get("diff_ton", 0.0)
+    price_ton = price / 1e9
+    floor_ton = floor / 1e9
+    backdrop = gift.get("backdropName", "—")
+
+    vault_str = "Подтверждено в Хранилище ✅" if in_vault else "В Хранилище (по чеку покупки) ✅"
+    bal_str = (
+        f"{scanner_state.primary_balance_nano / 1e9:.2f} TON"
+        if scanner_state and scanner_state.primary_balance_nano is not None
+        else "обновляется"
+    )
+
+    text = (
+        f"🤖⚡ <b>УСПЕШНАЯ АВТО-ПОКУПКА!</b>\n\n"
+        f"🎁 <b>{col_name} — {mod_name} #{num}</b>\n"
+        f"💰 <b>Куплено за:</b> <code>{price_ton:.2f} TON</code>\n"
+        f"🎯 <b>Флор:</b> <code>{floor_ton:.2f} TON</code>\n"
+        f"💵 <b>Выгода:</b> <code>{diff_ton:.2f} TON</code>\n"
+        f"🎨 <b>Фон:</b> {backdrop}\n"
+        f"📦 <b>Хранилище:</b> {vault_str}\n"
+        f"💳 <b>Остаток баланса:</b> ~<code>{bal_str}</code>\n"
+        f"⚡ <b>Скорость выкупа:</b> <code>{buy_elapsed:.2f} с</code>\n"
+    )
+    nft_url = make_telegram_nft_url(col_name, num)
+    text += f"\n🔗 <a href=\"{nft_url}\">{nft_url}</a>"
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🎁 Открыть NFT в Telegram", url=nft_url)]
+        ]
+    )
+
+    should_close = False
+    if bot is None:
+        bot = Bot(token=bot_token)
+        should_close = True
+
+    try:
+        for admin_id in admin_ids:
+            try:
+                await bot.send_message(
+                    chat_id=admin_id,
+                    text=text,
+                    reply_markup=kb,
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                log.warning("Не удалось отправить отчет об автопокупке в TG %s: %s", admin_id, e)
+    finally:
+        if should_close:
+            await bot.session.close()
+
+
+async def send_autobuy_failed_report(
+    bot_token: str,
+    admin_ids: set[int],
+    deal: dict,
+    reason: str,
+    buy_elapsed: float,
+    scanner_state: Optional["ScannerState"] = None,
+    bot: Optional[Bot] = None,
+) -> None:
+    """Отправляет отчёт о сбое при авто-покупке."""
+    if not bot_token or not admin_ids:
+        return
+
+    gift = deal.get("gift", {})
+    col_name = gift.get("collectionName", "Unknown")
+    mod_name = gift.get("modelName", "")
+    num = gift.get("number") or gift.get("num") or "?"
+    price_ton = deal.get("price", 0) / 1e9
+    floor_ton = deal.get("floor", 0) / 1e9
+
+    text = (
+        f"❌ <b>СБОЙ АВТО-ПОКУПКИ</b>\n\n"
+        f"🎁 <b>{col_name} — {mod_name} #{num}</b>\n"
+        f"💰 <b>Цена:</b> <code>{price_ton:.2f} TON</code> | 🎯 <b>Флор:</b> <code>{floor_ton:.2f} TON</code>\n"
+        f"⚠️ <b>Причина:</b> <code>{reason}</code>\n"
+        f"⏱ <b>Время отклика:</b> <code>{buy_elapsed:.2f} с</code>\n"
+    )
+    nft_url = make_telegram_nft_url(col_name, num)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🎁 Открыть NFT в Telegram", url=nft_url)]
+        ]
+    )
+
+    should_close = False
+    if bot is None:
+        bot = Bot(token=bot_token)
+        should_close = True
+
+    try:
+        for admin_id in admin_ids:
+            try:
+                await bot.send_message(
+                    chat_id=admin_id,
+                    text=text,
+                    reply_markup=kb,
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                log.warning("Не удалось отправить отчет о сбое автопокупки в TG %s: %s", admin_id, e)
+    finally:
+        if should_close:
+            await bot.session.close()
+
+
+async def send_autobuy_skipped_notification(
+    bot_token: str,
+    admin_ids: set[int],
+    deal: dict,
+    reason: str,
+    bot: Optional[Bot] = None,
+) -> None:
+    """Уведомляет о пропуске автопокупки (например, недостаточно баланса)."""
+    if not bot_token or not admin_ids:
+        return
+
+    gift = deal.get("gift", {})
+    col_name = gift.get("collectionName", "Unknown")
+    mod_name = gift.get("modelName", "")
+    num = gift.get("number") or gift.get("num") or "?"
+    price_ton = deal.get("price", 0) / 1e9
+
+    text = (
+        f"⚠️ <b>АВТО-ПОКУПКА ПРОПУЩЕНА</b>\n\n"
+        f"🎁 <b>{col_name} — {mod_name} #{num}</b>\n"
+        f"💰 <b>Цена лота:</b> <code>{price_ton:.2f} TON</code>\n"
+        f"ℹ️ <b>Причина:</b> {reason}\n"
+    )
+
+    should_close = False
+    if bot is None:
+        bot = Bot(token=bot_token)
+        should_close = True
+
+    try:
+        for admin_id in admin_ids:
+            try:
+                await bot.send_message(
+                    chat_id=admin_id,
+                    text=text,
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                log.warning("Не удалось отправить уведомление о пропуске автопокупки в TG %s: %s", admin_id, e)
+    finally:
+        if should_close:
+            await bot.session.close()
+

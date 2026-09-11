@@ -32,7 +32,16 @@ from curl_cffi import requests as cffi_requests
 from curl_cffi.requests import AsyncSession
 from dotenv import load_dotenv
 
-from account_pool import AccountPool, Slot, build_pool, build_pool_async, verify_token_async
+from account_pool import (
+    AccountPool,
+    Slot,
+    build_pool,
+    build_pool_async,
+    verify_token_async,
+    buy_gift_async,
+    verify_gift_in_vault_async,
+)
+from settings_manager import load_settings, save_settings
 
 load_dotenv()
 
@@ -69,7 +78,16 @@ TG_BOT_TOKEN     = os.getenv("TG_BOT_TOKEN", "").strip()
 TG_ADMIN_ID_RAW  = os.getenv("TG_ADMIN_ID", "").strip()
 TG_ADMIN_IDS     = {int(x.strip()) for x in TG_ADMIN_ID_RAW.split(",") if x.strip().isdigit()}
 
-from tg_bot import ScannerState, run_telegram_bot, send_deal_notification, _mask_token
+from tg_bot import (
+    ScannerState,
+    run_telegram_bot,
+    send_deal_notification,
+    send_autobuy_success_report,
+    send_autobuy_failed_report,
+    send_autobuy_skipped_notification,
+    _mask_token,
+)
+
 
 
 # ─────────────────────────────────────────────
@@ -865,9 +883,123 @@ def check_sold_alerts(
             asyncio.create_task(_edit_sold_alert_async(bot_token, info, elapsed_sec))
 
 
+async def process_deal_async(
+    deal: dict,
+    older_ids: set[str],
+    scanner_state: ScannerState,
+    bot_token: str,
+    admin_ids: set[int],
+    pool: AccountPool,
+) -> None:
+    """
+    Обрабатывает найденную сделку:
+    - Если AutoBuy ВКЛ: мгновенно выкупает через POST /gifts/buy без лишних задержек,
+      сверяя перед этим с последним известным балансом, затем проверяет Хранилище
+      и отправляет подробный отчёт.
+    - Если AutoBuy ВЫКЛ: отправляет стандартный алерт с кнопкой [💳 Купить за X.XX TON].
+    """
+    gift = deal.get("gift", {})
+    deal_gid = gift.get("id", "")
+    price_nano = deal.get("price", 0)
+    price_ton = price_nano / 1e9
+
+    if scanner_state.auto_buy:
+        known_balance = scanner_state.primary_balance_nano
+
+        # Сверка с последним известным балансом (БЕЗ доп сетевого запроса!)
+        if known_balance is not None and price_nano > known_balance:
+            bal_ton = known_balance / 1e9
+            reason = f"Недостаточно средств (баланс: {bal_ton:.2f} TON, цена: {price_ton:.2f} TON)"
+            log.warning("AutoBuy: %s для лота %s", reason, deal_gid)
+            await send_autobuy_skipped_notification(bot_token, admin_ids, deal, reason)
+            # Присылаем обычный алерт с кнопкой ручной покупки
+            await send_deal_notification(
+                bot_token,
+                admin_ids,
+                deal,
+                scanner_state=scanner_state,
+                older_ids=older_ids,
+                with_buy_button=True,
+            )
+            return
+
+        prim_slot = pool.get_primary_slot()
+        if not prim_slot:
+            log.error("AutoBuy: нет активного основного аккаунта в пуле!")
+            await send_deal_notification(
+                bot_token,
+                admin_ids,
+                deal,
+                scanner_state=scanner_state,
+                older_ids=older_ids,
+                with_buy_button=True,
+            )
+            return
+
+        log.info("⚡ [AutoBuy] Мгновенный выкуп лота %s за %.2f TON...", deal_gid, price_ton)
+        t_buy = time.monotonic()
+        # Оптимистичное списание баланса
+        if scanner_state.primary_balance_nano is not None:
+            scanner_state.primary_balance_nano = max(0, scanner_state.primary_balance_nano - price_nano)
+
+        buy_ok, buy_msg, buy_data = await buy_gift_async(
+            gift_id=deal_gid,
+            price_nano=price_nano,
+            token=prim_slot.token,
+            proxies=prim_slot.proxies,
+        )
+        elapsed = time.monotonic() - t_buy
+
+        # Фоновое обновление баланса
+        async def _refresh_primary_balance():
+            try:
+                ok_b, _, bdata = await verify_token_async(prim_slot.token, proxy=prim_slot.proxy)
+                if ok_b and "hard" in bdata:
+                    scanner_state.primary_balance_nano = int(bdata["hard"])
+            except Exception:
+                pass
+
+        asyncio.create_task(_refresh_primary_balance())
+
+        if buy_ok:
+            log.info("🎉 [AutoBuy] Лот %s успешно выкуплен за %.2f с!", deal_gid, elapsed)
+            # Проверяем попадание в Хранилище (инвентарь)
+            in_vault = await verify_gift_in_vault_async(deal_gid, prim_slot.token, prim_slot.proxies)
+            await send_autobuy_success_report(
+                bot_token=bot_token,
+                admin_ids=admin_ids,
+                deal=deal,
+                buy_data=buy_data,
+                in_vault=in_vault,
+                buy_elapsed=elapsed,
+                scanner_state=scanner_state,
+            )
+        else:
+            log.warning("❌ [AutoBuy] Не удалось выкупить лот %s: %s (%.2f с)", deal_gid, buy_msg, elapsed)
+            await send_autobuy_failed_report(
+                bot_token=bot_token,
+                admin_ids=admin_ids,
+                deal=deal,
+                reason=buy_msg,
+                buy_elapsed=elapsed,
+                scanner_state=scanner_state,
+            )
+    else:
+        # AutoBuy выключен — присылаем обычный алерт с кнопкой ручной покупки
+        await send_deal_notification(
+            bot_token=bot_token,
+            admin_ids=admin_ids,
+            deal=deal,
+            scanner_state=scanner_state,
+            older_ids=older_ids,
+            with_buy_button=True,
+        )
+
+
 # ─────────────────────────────────────────────
 #  Основной цикл
 # ─────────────────────────────────────────────
+
 
 _shutdown = asyncio.Event()
 
@@ -923,9 +1055,19 @@ async def main() -> None:
         except (NotImplementedError, RuntimeError):
             pass
 
-    # Стартовый интервал из пинга пула
+    # Стартовый интервал и персистентные настройки
+    saved_settings = load_settings()
+    init_min_ton_diff = float(saved_settings.get("min_ton_diff", MIN_TON_DIFF))
+    init_cheap_threshold = float(saved_settings.get("cheap_price_threshold", CHEAP_PRICE_THRESHOLD))
+    init_min_turnover = float(saved_settings.get("min_turnover_ratio", MIN_TURNOVER_RATIO))
+    init_filter_balance = bool(saved_settings.get("filter_by_balance", FILTER_BY_BALANCE))
+    init_autobuy = bool(saved_settings.get("auto_buy", False))
+
     avg_ping = pool.avg_ping_ms() if hasattr(pool, "avg_ping_ms") else None
-    if avg_ping and avg_ping > 0:
+    if "scan_interval" in saved_settings:
+        start_interval = float(saved_settings["scan_interval"])
+        log.info("Интервал из сохранённых настроек: %.2f с", start_interval)
+    elif avg_ping and avg_ping > 0:
         start_interval = max(MIN_SCAN_INTERVAL, min(avg_ping / 1000.0 * 1.5, SCAN_INTERVAL))
         log.info("Стартовый интервал из пинга %.0f мс: %.2f с", avg_ping, start_interval)
     else:
@@ -936,10 +1078,11 @@ async def main() -> None:
     scanner_state = ScannerState(
         pool=pool,
         is_paused=False,
-        min_ton_diff=MIN_TON_DIFF,
-        cheap_price_threshold=CHEAP_PRICE_THRESHOLD,
-        min_turnover_ratio=MIN_TURNOVER_RATIO,
-        filter_by_balance=FILTER_BY_BALANCE,
+        auto_buy=init_autobuy,
+        min_ton_diff=init_min_ton_diff,
+        cheap_price_threshold=init_cheap_threshold,
+        min_turnover_ratio=init_min_turnover,
+        filter_by_balance=init_filter_balance,
         scan_interval=adaptor.interval,
         scans_count=0,
         deals_count=0,
@@ -948,6 +1091,11 @@ async def main() -> None:
         collection_floors_count=0,
         rate_adaptor=adaptor,
     )
+    if "notify_categories" in saved_settings and isinstance(saved_settings["notify_categories"], dict):
+        scanner_state.notify_categories.update(saved_settings["notify_categories"])
+
+    save_settings(scanner_state)
+
 
     bot_task = None
     if TG_BOT_TOKEN and TG_ADMIN_IDS:
@@ -1015,7 +1163,10 @@ async def main() -> None:
         except Exception as err:
             log.warning("Ошибка обновления баланса: %s", err)
 
-    await init_primary_account_async(pool, scanner_state, explicit_token=PRIMARY_TOKEN)
+    saved_primary = str(saved_settings.get("primary_token") or PRIMARY_TOKEN).strip()
+    await init_primary_account_async(pool, scanner_state, explicit_token=saved_primary)
+    save_settings(scanner_state)
+
 
     seen_ids: dict[str, None] = {}
     black_floor: int | None = None
@@ -1145,14 +1296,16 @@ async def main() -> None:
                                                 found = True
 
                                         asyncio.create_task(
-                                            send_deal_notification(
-                                                TG_BOT_TOKEN,
-                                                TG_ADMIN_IDS,
-                                                deal,
-                                                scanner_state=scanner_state,
+                                            process_deal_async(
+                                                deal=deal,
                                                 older_ids=older_ids,
+                                                scanner_state=scanner_state,
+                                                bot_token=TG_BOT_TOKEN,
+                                                admin_ids=TG_ADMIN_IDS,
+                                                pool=pool,
                                             )
                                         )
+
                                     else:
                                         scanner_state.vault.append(deal)
                                         log.info("Сделка [%s] #%s → Хранилище (%d)", deal_type, deal.get("gift", {}).get("number"), len(scanner_state.vault))

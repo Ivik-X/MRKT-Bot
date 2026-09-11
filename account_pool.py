@@ -231,6 +231,18 @@ class AccountPool:
         tokens = self.get_tokens()
         return tokens[0] if tokens else None
 
+    def get_primary_slot(self) -> Optional[Slot]:
+        """Возвращает слот основного аккаунта (с его токеном и прокси)."""
+        with self._lock:
+            if not self._slots:
+                return None
+            prim_tok = self.primary_token
+            for s in self._slots:
+                if s.token == prim_tok:
+                    return s
+            return self._slots[0]
+
+
     def set_primary_token(self, token: str) -> None:
         """Перемещает токен на 1-е место, делая его основным, сохраняет в файл и перезагружает пул."""
         tokens = self.get_tokens()
@@ -515,5 +527,120 @@ async def verify_token_async(
         if "timeout" in err_msg.lower():
             err_msg = "Таймаут соединения"
         return False, err_msg, {}
+
+
+async def buy_gift_async(
+    gift_id: str,
+    price_nano: int,
+    token: str,
+    proxies: Optional[dict] = None,
+    timeout: float = 5.0,
+) -> tuple[bool, str, dict]:
+    """
+    Выполняет моментальную покупку подарка через POST /gifts/buy.
+    Возвращает (success: bool, status_message: str, response_data: dict).
+    """
+    from curl_cffi.requests import AsyncSession
+
+    url = "https://api.tgmrkt.io/api/v1/gifts/buy"
+    headers = {
+        "Authorization": token,
+        "Cookie": f"access_token={token}",
+        "Origin": "https://cdn.tgmrkt.io",
+        "Referer": "https://cdn.tgmrkt.io/",
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "ids": [gift_id],
+        "prices": {
+            gift_id: int(price_nano)
+        }
+    }
+
+    try:
+        async with AsyncSession(impersonate="chrome124", proxies=proxies) as session:
+            resp = await session.post(
+                url,
+                json=payload,
+                headers=headers,
+                timeout=timeout,
+            )
+            if resp.status_code in (200, 201):
+                data = resp.json()
+                item = data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else {})
+                return True, "Подарок успешно куплен", item
+            elif resp.status_code == 400:
+                err_text = resp.text
+                try:
+                    err_json = resp.json()
+                    msg = err_json.get("message") or err_json.get("error") or err_text
+                except Exception:
+                    msg = err_text
+                if "balance" in str(msg).lower():
+                    reason = "Недостаточно средств на балансе маркета"
+                elif "price" in str(msg).lower():
+                    reason = "Цена лота изменилась"
+                else:
+                    reason = f"Ошибка 400: {str(msg)[:80]}"
+                return False, reason, {}
+            elif resp.status_code in (404, 409):
+                return False, "Лот уже выкуплен другим пользователем или снят с продажи", {}
+            elif resp.status_code == 401:
+                return False, "401 Unauthorized (токен авторизации протух)", {}
+            elif resp.status_code == 429:
+                return False, "429 Too Many Requests (рейтлимит)", {}
+            else:
+                return False, f"HTTP {resp.status_code}: {resp.text[:80]}", {}
+    except Exception as e:
+        err_msg = str(e) or e.__class__.__name__
+        if "timeout" in err_msg.lower():
+            err_msg = "Таймаут запроса покупки"
+        return False, err_msg, {}
+
+
+async def verify_gift_in_vault_async(
+    gift_id: str,
+    token: str,
+    proxies: Optional[dict] = None,
+    timeout: float = 4.0,
+) -> bool:
+    """
+    Проверяет наличие подарка в Хранилище (инвентаре) пользователя через POST /gifts.
+    """
+    from curl_cffi.requests import AsyncSession
+
+    url = "https://api.tgmrkt.io/api/v1/gifts"
+    headers = {
+        "Authorization": token,
+        "Cookie": f"access_token={token}",
+        "Origin": "https://cdn.tgmrkt.io",
+        "Referer": "https://cdn.tgmrkt.io/",
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "isListed": False,
+        "count": 20,
+        "cursor": "",
+    }
+    try:
+        async with AsyncSession(impersonate="chrome124", proxies=proxies) as session:
+            resp = await session.post(
+                url,
+                json=payload,
+                headers=headers,
+                timeout=timeout,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                gifts = data.get("gifts", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                for g in gifts:
+                    if g.get("id") == gift_id:
+                        return True
+    except Exception:
+        pass
+    return False
+
 
 

@@ -9,3 +9,5 @@ services:
       - ./tokens.txt:/app/tokens.txt
       - ./proxies.txt:/app/proxies.txt:ro
       - ./logs:/app/logs
+      - ./data:/app/data
+

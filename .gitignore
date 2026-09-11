@@ -223,4 +223,7 @@ __marimo__/
 tokens.txt
 proxies.txt
 logs/
+data/
+settings.json
 debug_snapshot.py
+
