@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MRKT Token Grabber</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="container">
+    <!-- Header -->
+    <header class="header">
+      <div class="logo-group">
+        <div class="logo-icon">🔑</div>
+        <div>
+          <h1 class="title">MRKT Token Grabber</h1>
+          <p class="subtitle">Сборщик токенов аккаунтов</p>
+        </div>
+      </div>
+      <div id="statusBadge" class="badge badge-idle">ОЖИДАНИЕ</div>
+    </header>
+
+    <!-- Main Record Button -->
+    <div class="control-card">
+      <button id="toggleRecordBtn" class="btn btn-record">
+        <span class="btn-icon">⏺</span>
+        <span id="recordBtnText">Начать запись</span>
+      </button>
+      <div id="statusMessage" class="status-desc">
+        Нажмите «Начать запись», затем откройте <b>tgmrkt.io</b> под каждым аккаунтом
+      </div>
+    </div>
+
+    <!-- Stats Bar -->
+    <div class="stats-bar">
+      <div class="stat-item">
+        <span class="stat-label">Собрано токенов:</span>
+        <span id="tokenCount" class="stat-val">0</span>
+      </div>
+      <div id="lastTokenNotice" class="last-token-notice hidden">
+        Новый токен добавлен!
+      </div>
+    </div>
+
+    <!-- Tokens List Area -->
+    <div class="textarea-wrapper">
+      <textarea
+        id="tokensArea"
+        placeholder="Токены будут появляться здесь автоматически при открытии маркетплейса..."
+        readonly
+        spellcheck="false"
+      ></textarea>
+    </div>
+
+    <!-- Action Buttons -->
+    <div class="actions-grid">
+      <button id="copyBtn" class="btn btn-secondary">
+        <span>📋</span> Скопировать всё
+      </button>
+      <button id="downloadBtn" class="btn btn-secondary">
+        <span>💾</span> Скачать tokens.txt
+      </button>
+    </div>
+
+    <div class="danger-row">
+      <button id="clearBtn" class="btn btn-danger">
+        <span>🗑</span> Очистить список
+      </button>
+    </div>
+
+    <!-- Toast Notification -->
+    <div id="toast" class="toast hidden">✅ Скопировано в буфер!</div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

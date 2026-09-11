@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "MRKT Token Grabber",
+  "version": "1.0.0",
+  "description": "Автоматический перехват токенов авторизации MRKT (tgmrkt.io) при входе в аккаунты",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "permissions": [
+    "webRequest",
+    "storage",
+    "notifications"
+  ],
+  "host_permissions": [
+    "*://*.tgmrkt.io/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "MRKT Token Grabber",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js"
+  }
+}
