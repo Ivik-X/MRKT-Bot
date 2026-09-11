@@ -457,6 +457,188 @@ curl -X POST 'https://api.tgmrkt.io/api/v1/feed' \
 
 ---
 
+### 3.7. Получение подарков по списку ID (`POST /gifts/saling/by-ids`)
+
+Позволяет точечно запросить подробную информацию и актуальный статус продажи сразу для одного или нескольких лотов по их UUID. Идеально подходит для мгновенной верификации статуса (продан / снят / активен) и получения точных цен без поиска по пагинации.
+
+- **URL:** `https://api.tgmrkt.io/api/v1/gifts/saling/by-ids`
+- **Метод:** `POST`
+
+#### Тело запроса:
+```json
+{
+  "ids": [
+    "d9f8a69c-308d-4938-8cad-19f9624e263e"
+  ]
+}
+```
+
+#### Пример cURL:
+```bash
+curl -X POST 'https://api.tgmrkt.io/api/v1/gifts/saling/by-ids' \
+  -H 'Authorization: 661fd8b7-9ad5-4fb7-b756-d31c7fbdd5c0' \
+  -H 'Cookie: access_token=661fd8b7-9ad5-4fb7-b756-d31c7fbdd5c0' \
+  -H 'Content-Type: application/json' \
+  -H 'Origin: https://cdn.tgmrkt.io' \
+  -H 'Referer: https://cdn.tgmrkt.io/' \
+  --data-raw '{"ids":["d9f8a69c-308d-4938-8cad-19f9624e263e"]}'
+```
+
+#### Пример ответа:
+```json
+[
+  {
+    "id": "d9f8a69c-308d-4938-8cad-19f9624e263e",
+    "exportDate": "2026-04-15T11:11:05Z",
+    "receivedDate": "2026-03-27T17:39:29Z",
+    "giftId": 5918017157777589504,
+    "giftIdString": "5918017157777589504",
+    "maxUpgradedCount": 482271,
+    "totalUpgradedCount": 353819,
+    "backdropColorsCenterColor": 7055740,
+    "backdropColorsEdgeColor": 4094320,
+    "backdropColorsTextColor": 14218725,
+    "backdropColorsSymbolColor": 739379,
+    "backdropName": "Pine Green",
+    "backdropRarityPerMille": 15,
+    "backdropRarityName": null,
+    "modelName": "Spring Grove",
+    "modelRarityPerMille": 30,
+    "modelRarityName": null,
+    "modelStickerKey": "gifts/stickers/4368696c6c20466c616d655f537072696e672047726f7665.json",
+    "modelStickerThumbnailKey": "gifts/stickers/thumbnails/4368696c6c20466c616d655f537072696e672047726f7665.webp",
+    "symbolName": "Horned Helm",
+    "symbolRarityPerMille": null,
+    "symbolRarityName": null,
+    "symbolStickerKey": "gifts/symbols/4368696c6c20466c616d655f486f726e65642048656c6d.webp",
+    "symbolStickerThumbnailKey": "gifts/symbols/thumbnails/4368696c6c20466c616d655f486f726e65642048656c6d.webp",
+    "name": "ChillFlame-196993",
+    "number": 196993,
+    "title": "Chill Flame",
+    "collectionName": "Chill Flame",
+    "isOnAuction": false,
+    "isOnSale": true,
+    "salePrice": 4080000000,
+    "salePriceWithoutFee": 4000000000,
+    "salesCount": 1,
+    "promoteEndAt": "0001-01-01T00:00:00",
+    "isMine": false,
+    "isGiveawayReceived": false,
+    "nextResaleDate": "2026-04-15T11:11:05Z",
+    "nextTransferDate": "2026-04-15T11:11:05Z",
+    "isLocked": false,
+    "isLockedForSale": false,
+    "unlockDate": "2026-04-15T11:11:05Z",
+    "nextGiveAvailableAt": "0001-01-01T00:00:00",
+    "isOnPlatform": true,
+    "premarketStatus": "None",
+    "waitGiftUntil": null,
+    "giftsCollectionId": null,
+    "giftType": "Upgraded",
+    "collectionTitle": "Chill Flame",
+    "modelTitle": "Spring Grove",
+    "luckyBuy": true,
+    "regularGiftValidation": "None",
+    "validateRegularGiftAt": null,
+    "isSpaceMonkey": false,
+    "returnLockedUntil": null,
+    "returnLockReason": null,
+    "spaceMonkeysPoints": null,
+    "craftable": false,
+    "floorPriceNanoTONsByCollection": 4069800000,
+    "floorPriceNanoTONsByBackdropModel": null,
+    "isCrafted": false,
+    "tgCanBeCrafted": true,
+    "minted": false,
+    "staked": false,
+    "stakedByMe": false
+  }
+]
+```
+
+#### Ключевые поля:
+- `isOnSale`: `true`, если подарок прямо сейчас продаётся на маркете; `false`, если выкуплен или снят.
+- `salePrice`: текущая цена продажи в nanoTON.
+- `floorPriceNanoTONsByCollection`: актуальный флор коллекции подарка в nanoTON.
+- `isMine`: `true`, если подарок принадлежит авторизованному аккаунту.
+
+---
+
+### 3.8. Покупка подарка с баланса маркета (`POST /gifts/buy`)
+
+Основной эндпоинт для мгновенной автоматической покупки подарка. Списание средств происходит с внутреннего баланса TON (`hard`) авторизованного аккаунта.
+
+- **URL:** `https://api.tgmrkt.io/api/v1/gifts/buy`
+- **Метод:** `POST`
+
+#### Тело запроса:
+```json
+{
+  "ids": [
+    "d9f8a69c-308d-4938-8cad-19f9624e263e"
+  ],
+  "prices": {
+    "d9f8a69c-308d-4938-8cad-19f9624e263e": 4080000000
+  }
+}
+```
+
+> **Важно:** В объекте `prices` необходимо передать маппинг `{ "<GIFT_ID>": <PRICE_IN_NANOTON> }`. Это защищает от покупки в случае, если продавец резко повысил цену перед вашей транзакцией (Slippage protection).
+
+#### Пример cURL:
+```bash
+curl -X POST 'https://api.tgmrkt.io/api/v1/gifts/buy' \
+  -H 'Authorization: 661fd8b7-9ad5-4fb7-b756-d31c7fbdd5c0' \
+  -H 'Cookie: access_token=661fd8b7-9ad5-4fb7-b756-d31c7fbdd5c0' \
+  -H 'Content-Type: application/json' \
+  -H 'Origin: https://cdn.tgmrkt.io' \
+  -H 'Referer: https://cdn.tgmrkt.io/' \
+  --data-raw '{"ids":["d9f8a69c-308d-4938-8cad-19f9624e263e"],"prices":{"d9f8a69c-308d-4938-8cad-19f9624e263e":4080000000}}'
+```
+
+#### Пример успешного ответа:
+```json
+[
+  {
+    "type": "gift",
+    "userGift": {
+      "id": "d9f8a69c-308d-4938-8cad-19f9624e263e",
+      "exportDate": "2026-04-15T11:11:05Z",
+      "receivedDate": "2026-03-27T17:39:29Z",
+      "giftId": 5918017157777589504,
+      "giftIdString": "5918017157777589504",
+      "name": "ChillFlame-196993",
+      "number": 196993,
+      "title": "Chill Flame",
+      "collectionName": "Chill Flame",
+      "modelName": "Spring Grove",
+      "backdropName": "Pine Green",
+      "isOnSale": false,
+      "salePrice": 4080000000,
+      "salePriceWithoutFee": 4000000000,
+      "isMine": true,
+      "isOnPlatform": true,
+      "floorPriceNanoTONsByCollection": 4069800000
+    },
+    "price": 4080000000,
+    "priceWithoutFee": 4000000000,
+    "source": {
+      "type": "buy_gift"
+    },
+    "collectionName": null,
+    "modelName": null,
+    "backdropName": null
+  }
+]
+```
+
+#### Возможные ошибки при покупке:
+- **HTTP 400 Bad Request:** Недостаточно средств на балансе (`Not enough balance`) или цена лота изменилась/не совпадает с переданной в `prices`.
+- **HTTP 404 / 409 Conflict:** Подарок уже выкуплен другим пользователем или снят продавцом с продажи.
+- **HTTP 401 Unauthorized:** Истёк токен авторизации (требуется обновление сессии).
+
+---
+
 ## 4. Алгоритм расчёта ликвидности и критерии покупки
 
 Подарок признаётся **ликвидным для покупки**, если выполняется хотя бы одно из трёх условий:
