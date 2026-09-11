@@ -639,6 +639,139 @@ curl -X POST 'https://api.tgmrkt.io/api/v1/gifts/buy' \
 
 ---
 
+### 3.9. Выставление подарка на продажу (`POST /gifts/sale`)
+
+Позволяет выставить один или несколько принадлежащих пользователю подарков на продажу на маркетплейсе по заданной цене.
+
+- **URL:** `https://api.tgmrkt.io/api/v1/gifts/sale`
+- **Метод:** `POST`
+
+#### Тело запроса:
+```json
+{
+  "ids": [
+    "d9f8a69c-308d-4938-8cad-19f9624e263e"
+  ],
+  "price": 4200000000
+}
+```
+
+> **Особенности расчёта комиссии маркетплейса (Fee Calculation):**
+> - В поле `price` передаётся **желаемая чистая сумма**, которую продавец получит на баланс при продаже (в nanoTON, например `4200000000` = `4.20 TON`).
+> - Маркетплейс автоматически добавляет сервисную комиссию **2%**:
+>   $$\text{PublicPrice} = \text{price} \times 1.02 = 4\,200\,000\,000 \times 1.02 = 4\,284\,000\,000 \text{ nanoTON (4.284 TON)}$$
+> - В ответе сервера в массиве `prices` возвращаются итоговые публичные цены, с которыми лоты размещены на витрине.
+
+#### Пример cURL:
+```bash
+curl -X POST 'https://api.tgmrkt.io/api/v1/gifts/sale' \
+  -H 'Authorization: 661fd8b7-9ad5-4fb7-b756-d31c7fbdd5c0' \
+  -H 'Cookie: access_token=661fd8b7-9ad5-4fb7-b756-d31c7fbdd5c0' \
+  -H 'Content-Type: application/json' \
+  -H 'Origin: https://cdn.tgmrkt.io' \
+  -H 'Referer: https://cdn.tgmrkt.io/' \
+  --data-raw '{"ids":["d9f8a69c-308d-4938-8cad-19f9624e263e"],"price":4200000000}'
+```
+
+#### Пример ответа:
+```json
+{
+  "ids": [
+    "d9f8a69c-308d-4938-8cad-19f9624e263e"
+  ],
+  "prices": [
+    4284000000
+  ]
+}
+```
+
+---
+
+### 3.10. Мои подарки: Инвентарь и выставленные лоты (`POST /gifts`)
+
+Возвращает список подарков текущего авторизованного пользователя. Позволяет разделять подарки, находящиеся в Хранилище (инвентаре), и подарки, уже выставленные на витрину маркета.
+
+- **URL:** `https://api.tgmrkt.io/api/v1/gifts`
+- **Метод:** `POST`
+
+#### Ключевой параметр фильтрации:
+- `"isListed": true` — возвращает **только активные лоты пользователя, выставленные на продажу**.
+- `"isListed": false` — возвращает **только подарки в Хранилище/инвентаре** (не выставленные на продажу).
+- `"isListed": null` — возвращает все подарки пользователя независимо от статуса.
+
+#### Тело запроса:
+```json
+{
+  "isListed": true,
+  "count": 20,
+  "cursor": "",
+  "collectionNames": [],
+  "modelNames": [],
+  "backdropNames": [],
+  "symbolNames": [],
+  "number": null,
+  "isNew": null,
+  "isPremarket": null,
+  "luckyBuy": null,
+  "giftType": null,
+  "craftable": null,
+  "isCrafted": null,
+  "tgCanBeCraftedFrom": null,
+  "removeSelfSales": null,
+  "isTransferable": null,
+  "availableForStaking": null,
+  "forGame": null,
+  "minPrice": null,
+  "maxPrice": null,
+  "ordering": "None",
+  "lowToHigh": false,
+  "query": null
+}
+```
+
+#### Пример cURL:
+```bash
+curl -X POST 'https://api.tgmrkt.io/api/v1/gifts' \
+  -H 'Authorization: 661fd8b7-9ad5-4fb7-b756-d31c7fbdd5c0' \
+  -H 'Cookie: access_token=661fd8b7-9ad5-4fb7-b756-d31c7fbdd5c0' \
+  -H 'Content-Type: application/json' \
+  -H 'Origin: https://cdn.tgmrkt.io' \
+  -H 'Referer: https://cdn.tgmrkt.io/' \
+  --data-raw '{"isListed":true,"count":20,"cursor":"","collectionNames":[],"modelNames":[],"backdropNames":[],"symbolNames":[],"number":null,"ordering":"None","lowToHigh":false}'
+```
+
+#### Пример ответа:
+```json
+{
+  "gifts": [
+    {
+      "id": "d9f8a69c-308d-4938-8cad-19f9624e263e",
+      "exportDate": "2026-04-15T11:11:05Z",
+      "receivedDate": "2026-03-27T17:39:29Z",
+      "giftId": 5918017157777589504,
+      "giftIdString": "5918017157777589504",
+      "name": "ChillFlame-196993",
+      "number": 196993,
+      "title": "Chill Flame",
+      "collectionName": "Chill Flame",
+      "modelName": "Spring Grove",
+      "backdropName": "Pine Green",
+      "isOnSale": true,
+      "salePrice": 4284000000,
+      "salePriceWithoutFee": 0,
+      "salesCount": 1,
+      "isMine": true,
+      "isOnPlatform": true,
+      "floorPriceNanoTONsByCollection": 4059600000
+    }
+  ],
+  "cursor": null,
+  "total": 1
+}
+```
+
+---
+
 ## 4. Алгоритм расчёта ликвидности и критерии покупки
 
 Подарок признаётся **ликвидным для покупки**, если выполняется хотя бы одно из трёх условий:
