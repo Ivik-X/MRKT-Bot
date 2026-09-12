@@ -126,6 +126,7 @@ class BotStates(StatesGroup):
     waiting_for_scan_interval = State()
     waiting_for_turnover_ratio = State()
     waiting_for_log_time = State()
+    waiting_for_custom_proxies = State()
 
 
 # ─────────────────────────────────────────────
@@ -258,7 +259,11 @@ def proxies_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="⚡ Перепроверить пинг", callback_data="proxies_reping")],
-            [InlineKeyboardButton(text="🔍 Автопоиск быстрых прокси", callback_data="proxies_autosearch")],
+            [InlineKeyboardButton(text="🔍 Автопоиск быстрых (≤800мс)", callback_data="proxies_autosearch")],
+            [
+                InlineKeyboardButton(text="➕ Добавить свои прокси", callback_data="proxies_add_custom"),
+                InlineKeyboardButton(text="📋 Мои прокси", callback_data="proxies_list_custom"),
+            ],
             [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="nav_main")],
         ]
     )
@@ -1163,10 +1168,11 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
 
         await cb.answer("🔍 Запущен автопоиск прокси...")
         await cb.message.edit_text(
-            "⏳ <b>Автопоиск и замер быстрых прокси...</b>\n\n"
-            "• Скачиваем актуальную базу Proxifly (SOCKS5 / HTTP)...\n"
+            "⏳ <b>Автопоиск и замер быстрых прокси (≤800 мс)...</b>\n\n"
+            "• Проверяем ваши личные сохранённые прокси (custom)...\n"
+            "• Скачиваем базы <b>Databay</b> и <b>Proxifly</b> (SOCKS5 / HTTP)...\n"
             "• Параллельно замеряем пинг каждого кандидата к <code>api.tgmrkt.io</code>...\n"
-            "• Отбираем самые быстрые европейские и мировые серверы...\n\n"
+            "• <b>Бракуем любые серверы с пингом &gt; 800 мс</b>...\n\n"
             "<i>Обычно это занимает 10-15 секунд, пожалуйста подождите...</i>",
             parse_mode="HTML",
         )
@@ -1174,11 +1180,12 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
         from proxy_finder import find_fastest_proxies, save_proxies_to_file
 
         try:
-            fast_proxies = await find_fastest_proxies(
-                max_candidates=500,
-                timeout=2.5,
-                concurrency=100,
+            custom_fast, public_fast, total_candidates = await find_fastest_proxies(
+                max_candidates=1200,
+                max_ping_ms=800.0,
+                concurrency=120,
                 max_results=35,
+                include_custom=True,
             )
         except Exception as e:
             await cb.message.edit_text(
@@ -1188,37 +1195,155 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
             )
             return
 
-        if not fast_proxies:
+        all_fast = custom_fast + public_fast
+        if not all_fast:
             await cb.message.edit_text(
-                "⚠️ <b>Ни один публичный прокси не ответил на запросы к api.tgmrkt.io.</b>\n"
-                "Попробуйте повторить поиск через пару минут или используйте свои приватные прокси.",
+                "⚠️ <b>Ни один публичный прокси не прошёл порог скорости (≤800 мс).</b>\n\n"
+                "Серверы с пингом выше 800 мс были отбракованы. "
+                "Вы можете повторить поиск через пару минут или добавить свои приватные прокси кнопкой ниже.",
                 reply_markup=proxies_keyboard(),
                 parse_mode="HTML",
             )
             return
 
         # Применяем найденные прокси в активные слоты и горячий резерв
-        pool.apply_new_proxies(fast_proxies)
-        save_proxies_to_file(fast_proxies, use_direct=scanner_state.use_direct)
+        pool.apply_new_proxies(all_fast)
+        save_proxies_to_file(pool.get_proxies(), getattr(pool, "_reserve_proxies", []), use_direct=scanner_state.use_direct)
 
         active_count = len(pool.get_proxies())
         reserve_count = len(getattr(pool, "_reserve_proxies", []))
-        best_ms = fast_proxies[0].ping_ms
+        best_ms = all_fast[0].ping_ms
 
         lines = [
             f"✅ <b>Автопоиск завершён успешно!</b>\n",
-            f"🎯 Найдено рабочих прокси: <b>{len(fast_proxies)}</b> шт.",
+            f"🔍 Проверено кандидатов: <b>{total_candidates}</b> (Databay + Proxifly)",
+            f"🛡 Фильтр: <b>строго ≤ 800 мс</b> (медленные забракованы)",
+            f"⭐ Пользовательских в строю: <b>{len(custom_fast)}</b> шт.",
+            f"🌐 Отобрано публичных: <b>{len(public_fast)}</b> шт.",
             f"⚡ Лучший пинг: <code>{best_ms:.0f} мс</code>",
-            f"🟢 Назначено в активные слоты: <b>{active_count}</b>",
-            f"📦 В горячем резерве (авто-замена): <b>{reserve_count}</b>\n",
-            "<b>Топ самых быстрых серверов:</b>",
+            f"🟢 В активных слотах: <b>{active_count}</b> | 📦 В резерве: <b>{reserve_count}</b>\n",
+            "<b>Топ серверов в пуле:</b>",
         ]
-        for rank, p in enumerate(fast_proxies[:5], 1):
+        for rank, p in enumerate(all_fast[:6], 1):
             lines.append(f"{rank}. <b>[{p.cfg.name}]</b> — <code>{p.ping_ms:.0f} мс</code>")
 
-        lines.append("\n💡 <i>При сбое любого активного слота бот автоматически подменит его следующим быстрым прокси из резерва.</i>")
+        lines.append("\n💡 <i>Ваши личные прокси сохранены и всегда имеют приоритет. При сбоях бот моментально берёт следующий прокси из резерва.</i>")
 
         await cb.message.edit_text("\n".join(lines), reply_markup=proxies_keyboard(), parse_mode="HTML")
+
+    # ── Ручное управление своими прокси ──────────────────────────────────
+    @dp.callback_query(F.data == "proxies_add_custom")
+    async def cb_proxies_add_custom(cb: CallbackQuery, state: FSMContext):
+        await state.set_state(BotStates.waiting_for_custom_proxies)
+        await cb.message.edit_text(
+            "➕ <b>Добавление собственных прокси</b>\n\n"
+            "Отправьте список ваших прокси (по одному на строку).\n\n"
+            "<b>Поддерживаемые форматы:</b>\n"
+            "• <code>socks5://user:pass@ip:port</code>\n"
+            "• <code>http://user:pass@ip:port</code>\n"
+            "• <code>vless://uuid@host:port?...#Name</code>\n"
+            "• <code>trojan://pass@host:port?...#Name</code>\n"
+            "• <code>ss://base64@host:port#Name</code>\n"
+            "• <code>ip:port</code> <i>(будет распознан как SOCKS5)</i>\n\n"
+            "🔒 <i>Ваши прокси сохраняются в persistent файл и <b>никогда не перезаписываются</b> при автопоиске. В пуле они всегда получают наивысший приоритет.</i>",
+            reply_markup=back_to_menu_keyboard("nav_proxies"),
+            parse_mode="HTML",
+        )
+        await cb.answer()
+
+    @dp.message(BotStates.waiting_for_custom_proxies)
+    async def msg_add_custom_proxies(msg: Message, state: FSMContext):
+        raw_lines = [l.strip() for l in msg.text.splitlines() if l.strip() and not l.strip().startswith("#")]
+        if not raw_lines:
+            await msg.answer("❌ Вы не ввели ни одного валидного прокси.", reply_markup=back_to_menu_keyboard("nav_proxies"))
+            await state.clear()
+            return
+
+        from proxy_finder import add_custom_proxies, ping_custom_proxy, save_proxies_to_file
+        added_count, all_custom = add_custom_proxies(raw_lines)
+
+        wait_msg = await msg.answer("⏳ <i>Проверяем пинг добавленных прокси к api.tgmrkt.io...</i>", parse_mode="HTML")
+
+        sem = asyncio.Semaphore(10)
+        tasks = [ping_custom_proxy(l, idx, sem, max_ping_ms=2000.0) for idx, l in enumerate(raw_lines)]
+        results = await asyncio.gather(*tasks)
+
+        working_custom: list[Any] = []
+        result_lines = [f"✅ <b>Добавлено прокси:</b> {added_count} шт. (всего ваших: {len(all_custom)})\n"]
+        for line, res in zip(raw_lines, results):
+            short = line.split("@")[-1] if "@" in line else line
+            if len(short) > 40:
+                short = short[:38] + "…"
+            if res is not None:
+                p_obj, lat = res
+                working_custom.append(p_obj)
+                warn = " <i>(&gt;800мс)</i>" if lat > 800 else ""
+                result_lines.append(f"• 🟢 <code>{short}</code> — <b>{lat:.0f} мс</b>{warn}")
+            else:
+                result_lines.append(f"• 🔴 <code>{short}</code> — <i>не отвечает / ошибка</i>")
+
+        # Если есть подключённый пул, сразу внедряем их в слоты
+        pool = scanner_state.pool
+        if pool and working_custom:
+            pool.add_reserve_proxies(working_custom)
+            save_proxies_to_file(pool.get_proxies(), getattr(pool, "_reserve_proxies", []), use_direct=scanner_state.use_direct)
+            result_lines.append(f"\n⚡ <b>Подключено в пул:</b> +{len(working_custom)} рабочих прокси.")
+
+        await wait_msg.delete()
+        await msg.answer(
+            "\n".join(result_lines),
+            reply_markup=proxies_keyboard(),
+            parse_mode="HTML",
+        )
+        await state.clear()
+
+    @dp.callback_query(F.data == "proxies_list_custom")
+    async def cb_proxies_list_custom(cb: CallbackQuery):
+        from proxy_finder import load_custom_proxies
+        custom_lines = load_custom_proxies()
+        if not custom_lines:
+            text = (
+                "📋 <b>Ваши сохранённые прокси</b>\n\n"
+                "Вы ещё не добавили ни одного своего прокси.\n"
+                "Нажмите <b>«➕ Добавить свои прокси»</b>, чтобы привязать свои личные серверы."
+            )
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="➕ Добавить свои прокси", callback_data="proxies_add_custom")],
+                    [InlineKeyboardButton(text="⬅️ К списку прокси", callback_data="nav_proxies")],
+                ]
+            )
+        else:
+            lines = [f"📋 <b>Ваши сохранённые прокси</b> (Всего: <code>{len(custom_lines)}</code>):\n"]
+            for i, l in enumerate(custom_lines, 1):
+                mask = l.split("@")[-1] if "@" in l else l
+                lines.append(f"{i}. <code>{mask}</code>")
+            lines.append("\n💡 <i>Эти прокси защищены от удаления при перепоиске и имеют наивысший приоритет.</i>")
+            text = "\n".join(lines)
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="➕ Добавить ещё", callback_data="proxies_add_custom")],
+                    [InlineKeyboardButton(text="🗑 Очистить мои прокси", callback_data="proxies_clear_custom")],
+                    [InlineKeyboardButton(text="⬅️ К списку прокси", callback_data="nav_proxies")],
+                ]
+            )
+
+        await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        await cb.answer()
+
+    @dp.callback_query(F.data == "proxies_clear_custom")
+    async def cb_proxies_clear_custom(cb: CallbackQuery):
+        from proxy_finder import save_custom_proxies
+        save_custom_proxies([])
+        await cb.answer("Ваши сохранённые прокси очищены", show_alert=True)
+        text = "🗑 <b>Список ваших личных прокси очищен.</b>\n\nВ пуле теперь используются только публичные серверы."
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="➕ Добавить новые", callback_data="proxies_add_custom")],
+                [InlineKeyboardButton(text="⬅️ К списку прокси", callback_data="nav_proxies")],
+            ]
+        )
+        await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
 
     # ── Ручная покупка подарка из уведомления ─────────────────────────────
     @dp.callback_query(F.data.startswith("buy:"))
