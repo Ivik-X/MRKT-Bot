@@ -84,7 +84,21 @@ class ScannerState:
     sold_queue: list[str] = field(default_factory=list)  # gift_id выкупленных лотов
     buying_in_progress: set[str] = field(default_factory=set)  # gift_id покупаемых сейчас
     rate_adaptor: Optional[Any] = None  # RateAdaptor из scanner.py
+    penalties_429: list[float] = field(default_factory=list)  # таймстампы 429 за последний час
 
+    def record_429(self, ts: Optional[float] = None) -> None:
+        """Регистрирует факт получения 429 и очищает записи старше 1 часа."""
+        now = ts or time.time()
+        self.penalties_429.append(now)
+        cutoff = now - 3600.0
+        self.penalties_429 = [t for t in self.penalties_429 if t >= cutoff]
+
+    def get_429_count_last_hour(self) -> int:
+        """Возвращает количество штрафов 429 за последние 60 минут."""
+        now = time.time()
+        cutoff = now - 3600.0
+        self.penalties_429 = [t for t in self.penalties_429 if t >= cutoff]
+        return len(self.penalties_429)
 
     def uptime_str(self) -> str:
         elapsed = int(time.monotonic() - self.start_time)
@@ -94,6 +108,7 @@ class ScannerState:
         if hours > 0:
             return f"{hours}ч {minutes}м"
         return f"{minutes}м {secs}с"
+
 
 
 # ─────────────────────────────────────────────
@@ -210,6 +225,9 @@ def tokens_keyboard() -> InlineKeyboardMarkup:
 def settings_keyboard(state: ScannerState) -> InlineKeyboardMarkup:
     bal_toggle_text = "🟢 ВКЛ" if state.filter_by_balance else "🔴 ВЫКЛ"
     autobuy_toggle_text = "🟢 ВКЛ" if state.auto_buy else "🔴 ВЫКЛ"
+    p429 = state.get_429_count_last_hour()
+    p429_badge = f" (429: {p429}/ч)" if p429 > 0 else " (429: 0)"
+    interval_btn_text = f"✏️ Интервал: {state.scan_interval:.2f}с{p429_badge}"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=f"🤖 Авто-покупка (AutoBuy): {autobuy_toggle_text}", callback_data="toggle_autobuy")],
@@ -218,10 +236,11 @@ def settings_keyboard(state: ScannerState) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="👑 Сменить основной аккаунт", callback_data="nav_select_primary")],
             [InlineKeyboardButton(text="✏️ Порог выгоды (MIN_TON_DIFF)", callback_data="set_min_diff")],
             [InlineKeyboardButton(text="✏️ Порог дешёвых (CHEAP_THRESHOLD)", callback_data="set_cheap")],
-            [InlineKeyboardButton(text="✏️ Интервал сканов (SCAN_INTERVAL)", callback_data="set_interval")],
+            [InlineKeyboardButton(text=interval_btn_text, callback_data="set_interval")],
             [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="nav_main")],
         ]
     )
+
 
 
 
@@ -302,6 +321,9 @@ def format_main_text(state: ScannerState) -> str:
     else:
         interval_str = f"{state.scan_interval:.2f} с <i>(ручной)</i>"
 
+    p429 = state.get_429_count_last_hour()
+    p429_main = f" | ⚠️ <b>429: {p429}/ч</b>" if p429 > 0 else " | 429: <code>0/ч</code>"
+
     return (
         f"🤖 <b>MRKT Scanner Manager</b>\n\n"
         f"Статус: {status_icon}\n"
@@ -314,7 +336,7 @@ def format_main_text(state: ScannerState) -> str:
         f"• Дешёвые подарки: &lt; <code>{state.cheap_price_threshold:.2f} TON</code>\n"
         f"• Мин. оборот/цена: <code>{turnover_str}</code>\n"
         f"• Фильтр по балансу: <b>{filter_bal_str}</b>\n"
-        f"• ⚡ Интервал: {interval_str}\n\n"
+        f"• ⚡ Интервал: {interval_str}{p429_main}\n\n"
 
         f"👑 <b>Основной аккаунт:</b>\n"
         f"• Токен: <code>{primary_str}</code>\n"
@@ -375,6 +397,8 @@ def format_settings_text(state: ScannerState) -> str:
     adaptor = getattr(state, "rate_adaptor", None)
     auto_mode = adaptor.is_auto if adaptor is not None else True
     interval_mode = "авто" if auto_mode else "ручной"
+    p429 = state.get_429_count_last_hour()
+    p429_badge = f" [штрафов 429: <b>{p429}</b>/ч]" if p429 > 0 else " [штрафов 429: 0/ч]"
 
     return (
         f"⚙️ <b>Настройки сканера</b>\n\n"
@@ -390,7 +414,7 @@ def format_settings_text(state: ScannerState) -> str:
         f"   <i>(Подарок покупается, если он дешевле флора минимум на это значение)</i>\n\n"
         f"5. <b>Порог дешёвых (CHEAP_THRESHOLD):</b> <code>{state.cheap_price_threshold:.2f} TON</code>\n"
         f"   <i>(Любой подарок с ценой ниже этого порога считается выгодным)</i>\n\n"
-        f"6. <b>⚡ Интервал сканирования ({interval_mode}):</b> <code>{state.scan_interval:.2f} с</code>\n"
+        f"6. <b>⚡ Интервал сканирования ({interval_mode}):</b> <code>{state.scan_interval:.2f} с</code>{p429_badge}\n"
         f"   <i>(Пауза между запросами; при установке вручную авто-адаптация отключается)</i>"
     )
 
@@ -845,8 +869,11 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
         await state.set_state(BotStates.waiting_for_scan_interval)
         adaptor = getattr(scanner_state, "rate_adaptor", None)
         mode_str = "авто" if (adaptor and adaptor.is_auto) else "ручной"
+        p429 = scanner_state.get_429_count_last_hour()
+        p429_text = f"⚠️ Штрафов 429 за последний час: <b>{p429}</b>\n\n" if p429 > 0 else "Штрафов 429 за последний час: <code>0</code>\n\n"
         await cb.message.edit_text(
-            f"✏️ Текущий интервал: <code>{scanner_state.scan_interval:.2f} с</code> ({mode_str})\n\n"
+            f"✏️ Текущий интервал: <code>{scanner_state.scan_interval:.2f} с</code> ({mode_str})\n"
+            f"{p429_text}"
             f"Введите новый интервал в секундах (например <code>0.5</code>).\n"
             f"<i>После ручной установки авто-адаптация отключается.</i>\n"
             f"Введите <code>auto</code> для возврата в авто-режим:",

@@ -88,6 +88,8 @@ from tg_bot import (
     _mask_token,
 )
 
+_global_scanner_state: Optional[ScannerState] = None
+
 
 
 # ─────────────────────────────────────────────
@@ -311,60 +313,89 @@ class FloorTracker:
 
 class RateAdaptor:
     """
-    Адаптивный регулятор интервала сканирования.
-    429-rate > RATE_UP_THRESHOLD   → интервал +0.15с
-    429-rate < RATE_DOWN_THRESHOLD → интервал -0.05с
+    Адаптивный регулятор интервала сканирования с защитой от каскадов 429.
+    - Имеет динамический нижний порог effective_min, зависящий от количества слотов:
+      max(0.40, 1.6 / max(1, num_slots)).
+    - При получении 429 от ЛЮБОГО слота немедленно повышает интервал (+0.15с или +0.20с при штрафе >= 30с)
+      и сбрасывает серию чистых сканов.
+    - Снижает интервал только после серии из 50 успешных сканов подряд без единого 429
+      (шаг -0.02с) до effective_min.
     """
 
     def __init__(
         self,
         initial_interval: float,
-        min_interval: float = MIN_SCAN_INTERVAL,
+        min_interval: float = 0.40,
         max_interval: float = MAX_SCAN_INTERVAL,
-        window: int = RATE_ADAPT_WINDOW,
+        pool: Optional[AccountPool] = None,
     ):
-        self.interval = max(min_interval, min(max_interval, initial_interval))
-        self._min = min_interval
+        self._min_base = max(0.40, min_interval)
         self._max = max_interval
-        self._window = window
-        self._scans = 0
-        self._errors_429 = 0
+        self._pool = pool
         self._auto = True
+        self._clean_streak = 0
+        self.interval = max(self.effective_min, min(self._max, initial_interval))
 
-    def record_ok(self) -> None:
-        self._scans += 1
+    @property
+    def effective_min(self) -> float:
+        """
+        Динамический пол интервала.
+        tgmrkt держит ~1 req/s на IP. Чтобы не перегружать слоты,
+        интервал не должен быть меньше 1.6s / num_slots (и не меньше 0.40s).
+        """
+        num_slots = len(self._pool.slots) if (self._pool and self._pool.slots) else 1
+        return max(self._min_base, 1.6 / max(1, num_slots))
 
-    def record_429(self) -> None:
-        self._scans += 1
-        self._errors_429 += 1
+    def on_429(self, penalty_sec: float = 15.0) -> float:
+        """
+        Срочная реакция на 429 от любого слота.
+        Немедленно повышает интервал и сбрасывает серию чистых сканов.
+        """
+        self._clean_streak = 0
+        if not self._auto:
+            return self.interval
 
-    def maybe_adjust(self) -> bool:
-        if not self._auto or self._scans < self._window:
-            return False
-        rate = self._errors_429 / self._scans
         old = self.interval
-        if rate > RATE_UP_THRESHOLD:
-            self.interval = min(self._max, self.interval + 0.15)
-        elif rate < RATE_DOWN_THRESHOLD and self.interval > self._min:
-            self.interval = max(self._min, self.interval - 0.05)
-        changed = abs(self.interval - old) > 0.001
-        if changed:
-            log.info(
-                "RateAdaptor: интервал %.2fс → %.2fс (429-rate %.0f%% за %d сканов)",
-                old, self.interval, rate * 100, self._scans,
+        step = 0.20 if penalty_sec >= 30.0 else 0.15
+        self.interval = min(self._max, max(self.effective_min, self.interval + step))
+        if abs(self.interval - old) > 0.001:
+            log.warning(
+                "⚡ RateAdaptor [429]: экстренное увеличение интервала %.2fс → %.2fс (штраф %.0fс)",
+                old, self.interval, penalty_sec,
             )
-        self._scans = 0
-        self._errors_429 = 0
-        return changed
+        return self.interval
+
+    def record_ok(self) -> bool:
+        """
+        Вызывается после чистых сканов (где не было 429).
+        Каждые 50 чистых сканов осторожно снижает интервал на 0.02с до effective_min.
+        Возвращает True, если интервал изменился.
+        """
+        if not self._auto:
+            return False
+
+        self._clean_streak += 1
+        if self._clean_streak >= 50:
+            self._clean_streak = 0
+            cur_min = self.effective_min
+            if self.interval > cur_min + 0.005:
+                old = self.interval
+                self.interval = max(cur_min, self.interval - 0.02)
+                log.info(
+                    "⚡ RateAdaptor: серия 50 чистых сканов, интервал %.2fс → %.2fс (пол: %.2fс)",
+                    old, self.interval, cur_min,
+                )
+                return True
+        return False
 
     def set_manual(self, interval: float) -> None:
-        self.interval = max(self._min, min(self._max, interval))
+        self.interval = max(0.1, min(self._max, interval))
         self._auto = False
 
     def set_auto(self) -> None:
         self._auto = True
-        self._scans = 0
-        self._errors_429 = 0
+        self._clean_streak = 0
+        self.interval = max(self.effective_min, self.interval)
 
     @property
     def is_auto(self) -> bool:
@@ -433,6 +464,13 @@ async def api_request_async(
                 log.warning("429 | слот: %s | штраф: %.0fс", slot.label, retry_after)
                 pool.penalize(slot, retry_after)
                 stats_tracker.record_error("HTTP 429", f"penalty {retry_after}s", slot.label, endpoint)
+                if _global_scanner_state is not None:
+                    _global_scanner_state.record_429()
+                    adaptor = getattr(_global_scanner_state, "rate_adaptor", None)
+                    if adaptor is not None:
+                        adaptor.on_429(retry_after)
+                        _global_scanner_state.scan_interval = adaptor.interval
+                        save_settings(_global_scanner_state)
                 last_exc = Exception(f"HTTP 429 (слот: {slot.label})")
                 await asyncio.sleep(0.5)
                 continue
@@ -459,6 +497,13 @@ async def api_request_async(
                 pool.penalize(slot, PENALTY_429)
                 log.warning("429 (из исключения) | слот: %s | штраф: %.0fс", slot.label, PENALTY_429)
                 stats_tracker.record_error("HTTP 429", str(e), slot.label, endpoint)
+                if _global_scanner_state is not None:
+                    _global_scanner_state.record_429()
+                    adaptor = getattr(_global_scanner_state, "rate_adaptor", None)
+                    if adaptor is not None:
+                        adaptor.on_429(PENALTY_429)
+                        _global_scanner_state.scan_interval = adaptor.interval
+                        save_settings(_global_scanner_state)
             else:
                 log.warning("Ошибка %s %s | %s | %.2fс | %s", method.upper(), endpoint, slot.label, elapsed, e)
                 stats_tracker.record_error(err_name, str(e), slot.label, endpoint)
@@ -1073,7 +1118,7 @@ async def main() -> None:
     else:
         start_interval = SCAN_INTERVAL
 
-    adaptor = RateAdaptor(initial_interval=start_interval)
+    adaptor = RateAdaptor(initial_interval=start_interval, pool=pool)
 
     scanner_state = ScannerState(
         pool=pool,
@@ -1094,6 +1139,8 @@ async def main() -> None:
     if "notify_categories" in saved_settings and isinstance(saved_settings["notify_categories"], dict):
         scanner_state.notify_categories.update(saved_settings["notify_categories"])
 
+    global _global_scanner_state
+    _global_scanner_state = scanner_state
     save_settings(scanner_state)
 
 
@@ -1235,6 +1282,7 @@ async def main() -> None:
                 print(f"[{ts}] ⟳ Скан #{scan_count}{label}...", end=" ", flush=True)
 
                 try:
+                    scan_start_429 = scanner_state.get_429_count_last_hour()
                     t_scan = time.monotonic()
                     new_gifts, page_gifts = await fetch_new_listings_async(pool, seen_ids, first_run, session)
                     elapsed = time.monotonic() - t_scan
@@ -1319,10 +1367,11 @@ async def main() -> None:
                     print(f"+{len(new_gifts)} новых  |  в базе: {len(seen_ids)}  |  {elapsed:.1f}с")
                     log.info("Скан #%d: +%d новых | база: %d | %.1fс", scan_count, len(new_gifts), len(seen_ids), elapsed)
 
-                    adaptor.record_ok()
-                    if adaptor.maybe_adjust():
-                        scanner_state.scan_interval = adaptor.interval
-                        log.info("⚡ Авто-интервал: %.2fс", adaptor.interval)
+                    if scanner_state.get_429_count_last_hour() == scan_start_429:
+                        if adaptor.record_ok():
+                            scanner_state.scan_interval = adaptor.interval
+                            save_settings(scanner_state)
+                            log.info("⚡ Авто-интервал: %.2fс", adaptor.interval)
 
                 except AuthTokenExpiredError as e:
                     consecutive_401_errors += 1
@@ -1337,9 +1386,10 @@ async def main() -> None:
                         print(f"\n[{ts}] ⏳ 429 — пауза 3с...")
                         log.warning("Скан #%d: все слоты на штрафе (429).", scan_count)
                         stats_tracker.record_error("HTTP 429", err_str)
-                        adaptor.record_429()
-                        adaptor.maybe_adjust()
+                        scanner_state.record_429()
+                        adaptor.on_429(30.0)
                         scanner_state.scan_interval = adaptor.interval
+                        save_settings(scanner_state)
                         await asyncio.sleep(3.0)
                     else:
                         print(f"\n[{ts}] ❌ {e}")
