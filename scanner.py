@@ -50,7 +50,7 @@ load_dotenv()
 # ─────────────────────────────────────────────
 
 MARKET_API_URL        = "https://api.tgmrkt.io/api/v1"
-SCAN_INTERVAL         = float(os.getenv("SCAN_INTERVAL", 0.5))
+SCAN_INTERVAL         = float(os.getenv("SCAN_INTERVAL", 0.8))
 MIN_SCAN_INTERVAL     = float(os.getenv("MIN_SCAN_INTERVAL", 0.3))
 MAX_SCAN_INTERVAL     = float(os.getenv("MAX_SCAN_INTERVAL", 3.0))
 MIN_TON_DIFF          = float(os.getenv("MIN_TON_DIFF", 2.5))
@@ -1260,6 +1260,7 @@ async def main() -> None:
                         bf, cf, cv = await fetch_floors_async(pool, session, floor_tracker)
                         if cf:
                             collection_floors = cf
+                            scanner_state.collection_floors = cf
                             scanner_state.collection_floors_count = len(collection_floors)
                             scanner_state.collection_volumes = cv
                         if bf:

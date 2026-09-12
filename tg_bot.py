@@ -40,6 +40,7 @@ from account_pool import (
     verify_token_async,
     buy_gift_async,
     verify_gift_in_vault_async,
+    find_recent_cheap_buys_async,
 )
 from settings_manager import save_settings
 from xray_proxy import ping_proxy_async
@@ -59,11 +60,12 @@ class ScannerState:
     auto_buy: bool = False
     min_ton_diff: float = 2.5
     cheap_price_threshold: float = 3.0
-    scan_interval: float = 0.5
+    scan_interval: float = 0.8
     scans_count: int = 0
     deals_count: int = 0
     start_time: float = field(default_factory=time.monotonic)
     black_floor_nano: Optional[int] = None
+    collection_floors: dict[str, int] = field(default_factory=dict)
     collection_floors_count: int = 0           # Заменяет model_floors_count
     force_refresh_floors: bool = False          # Заменяет force_refresh_models
     last_deal: Optional[dict] = None
@@ -181,18 +183,19 @@ def main_keyboard(state: ScannerState) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [status_btn, InlineKeyboardButton(text="🔄 Обновить статус", callback_data="nav_main")],
             [
+                InlineKeyboardButton(text="🔍 Поиск дешёвых выкупов", callback_data="find_cheap_feed"),
                 InlineKeyboardButton(text=f"📦 Хранилище{vault_badge}", callback_data="nav_vault"),
+            ],
+            [
                 InlineKeyboardButton(text="🔔 Категории", callback_data="nav_categories"),
-            ],
-            [
                 InlineKeyboardButton(text="🔑 Токены", callback_data="nav_tokens"),
+            ],
+            [
                 InlineKeyboardButton(text="⚙️ Настройки", callback_data="nav_settings"),
-            ],
-            [
                 InlineKeyboardButton(text="🌐 Прокси и Пинг", callback_data="nav_proxies"),
-                InlineKeyboardButton(text="🔄 Обновить флоры", callback_data="refresh_floors"),
             ],
             [
+                InlineKeyboardButton(text="🔄 Обновить флоры", callback_data="refresh_floors"),
                 InlineKeyboardButton(text="📋 Просмотр логов", callback_data="nav_logs"),
             ],
         ]
@@ -227,7 +230,7 @@ def settings_keyboard(state: ScannerState) -> InlineKeyboardMarkup:
     autobuy_toggle_text = "🟢 ВКЛ" if state.auto_buy else "🔴 ВЫКЛ"
     p429 = state.get_429_count_last_hour()
     p429_badge = f" (429: {p429}/ч)" if p429 > 0 else " (429: 0)"
-    interval_btn_text = f"✏️ Интервал: {state.scan_interval:.2f}с{p429_badge}"
+    interval_btn_text = f"✏️ {state.scan_interval:.2f}с{p429_badge}"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=f"🤖 Авто-покупка (AutoBuy): {autobuy_toggle_text}", callback_data="toggle_autobuy")],
@@ -236,7 +239,11 @@ def settings_keyboard(state: ScannerState) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="👑 Сменить основной аккаунт", callback_data="nav_select_primary")],
             [InlineKeyboardButton(text="✏️ Порог выгоды (MIN_TON_DIFF)", callback_data="set_min_diff")],
             [InlineKeyboardButton(text="✏️ Порог дешёвых (CHEAP_THRESHOLD)", callback_data="set_cheap")],
-            [InlineKeyboardButton(text=interval_btn_text, callback_data="set_interval")],
+            [
+                InlineKeyboardButton(text="➖ 0.05с", callback_data="interval_minus_005"),
+                InlineKeyboardButton(text=interval_btn_text, callback_data="set_interval"),
+                InlineKeyboardButton(text="➕ 0.05с", callback_data="interval_plus_005"),
+            ],
             [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="nav_main")],
         ]
     )
@@ -490,6 +497,93 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
     async def cb_refresh_floors(cb: CallbackQuery):
         scanner_state.force_refresh_floors = True
         await cb.answer("🔄 Запущено обновление флоров коллекций...")
+
+    # ── Раздел: Поиск дешёвых выкупов в ленте (feed) ─────────────────────
+    @dp.callback_query(F.data == "find_cheap_feed")
+    async def cb_find_cheap_feed(cb: CallbackQuery):
+        await cb.answer("🔍 Запуск поиска выкупов...", show_alert=False)
+        thresh_ton = scanner_state.cheap_price_threshold
+        max_price_nano = int(round(thresh_ton * 1e9))
+
+        status_msg = await cb.message.answer(
+            f"🔍 <b>Поиск последних выкупов дешевле {thresh_ton:.2f} TON...</b>\n"
+            f"<i>Опрашиваю ленту маркетплейса (feed)...</i>",
+            parse_mode="HTML",
+        )
+
+        try:
+            pool = scanner_state.pool
+            if not pool or not pool.slots:
+                await status_msg.edit_text("❌ В пуле нет активных токенов.")
+                return
+
+            matched = await find_recent_cheap_buys_async(
+                pool=pool,
+                max_price_nano=max_price_nano,
+                limit=5,
+                max_pages=20,
+            )
+
+            if not matched:
+                await status_msg.edit_text(
+                    f"⚠️ В ленте не найдено выкупов дешевле <b>{thresh_ton:.2f} TON</b> за последние 20 страниц.",
+                    parse_mode="HTML",
+                )
+                return
+
+            await status_msg.edit_text(
+                f"✅ Найдено <b>{len(matched)}</b> последних быстрых выкупов (&lt; <code>{thresh_ton:.2f} TON</code>):",
+                parse_mode="HTML",
+            )
+
+            for i, m in enumerate(matched, 1):
+                gift = m.get("gift", {})
+                col_name = gift.get("collectionName") or gift.get("collectionTitle") or gift.get("title") or "NFT"
+                mod_name = gift.get("modelName") or gift.get("modelTitle") or ""
+                num = gift.get("number")
+                num_str = f" #{num}" if num else ""
+                name_str = f"{col_name} — {mod_name}{num_str}" if mod_name else f"{col_name}{num_str}"
+
+                amount_nano = m.get("amount", 0)
+                amount_ton = amount_nano / 1e9
+                delta_ms = m.get("delta_ms", 0)
+                delta_str = f"<code>{delta_ms} мс</code>" if delta_ms < 1000 else f"<code>{delta_ms / 1000:.2f} с</code> (<code>{delta_ms} мс</code>)"
+
+                nft_url = make_telegram_nft_url(col_name, num)
+
+                # Флор коллекции
+                floor_nano = scanner_state.collection_floors.get(col_name)
+                if floor_nano:
+                    floor_ton = floor_nano / 1e9
+                    diff = floor_ton - amount_ton
+                    profit_str = f" <i>(дешевле флора на +{diff:.2f} TON)</i>" if diff > 0 else ""
+                    floor_info = f"<code>{floor_ton:.2f} TON</code>{profit_str}"
+                else:
+                    floor_info = "<i>не определён</i>"
+
+                sale_dt = m.get("sale_date")
+                dt_str = sale_dt.strftime("%d.%m.%Y %H:%M:%S UTC") if sale_dt else "—"
+
+                text = (
+                    f"⚡ <b>Выкуп #{i}</b>\n\n"
+                    f"🎁 <b>{name_str}</b>\n"
+                    f"💸 <b>Цена лота:</b> <code>{amount_ton:.2f} TON</code>\n"
+                    f"📈 <b>Флор коллекции:</b> {floor_info}\n"
+                    f"⚡ <b>Выкуплен за:</b> {delta_str}\n"
+                    f"🕒 <b>Время сделки:</b> <code>{dt_str}</code>\n"
+                    f"🔗 <a href=\"{nft_url}\">Открыть подарок в Telegram</a>"
+                )
+                kb = InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text=f"🔗 Открыть {col_name}{num_str}", url=nft_url)]
+                    ]
+                )
+                await cb.message.answer(text, reply_markup=kb, parse_mode="HTML")
+                await asyncio.sleep(0.2)
+
+        except Exception as e:
+            log.error("Ошибка поиска по ленте: %s", e, exc_info=True)
+            await status_msg.edit_text(f"❌ Ошибка при поиске по ленте: {e}")
 
     # ── Раздел: Уведомления по категориям ────────────────────────────────
     @dp.callback_query(F.data == "nav_categories")
@@ -863,6 +957,42 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
             await state.clear()
         except ValueError:
             await msg.answer("❌ Пожалуйста, введите корректное положительное число (например 3.0):")
+
+    @dp.callback_query(F.data == "interval_minus_005")
+    async def cb_interval_minus_005(cb: CallbackQuery):
+        new_val = max(0.10, round(scanner_state.scan_interval - 0.05, 2))
+        scanner_state.scan_interval = new_val
+        adaptor = getattr(scanner_state, "rate_adaptor", None)
+        if adaptor:
+            adaptor.set_manual(new_val)
+        save_settings(scanner_state)
+        try:
+            await cb.message.edit_text(
+                format_settings_text(scanner_state),
+                reply_markup=settings_keyboard(scanner_state),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+        await cb.answer(f"Интервал: {new_val:.2f}с (ручной)")
+
+    @dp.callback_query(F.data == "interval_plus_005")
+    async def cb_interval_plus_005(cb: CallbackQuery):
+        new_val = min(5.0, round(scanner_state.scan_interval + 0.05, 2))
+        scanner_state.scan_interval = new_val
+        adaptor = getattr(scanner_state, "rate_adaptor", None)
+        if adaptor:
+            adaptor.set_manual(new_val)
+        save_settings(scanner_state)
+        try:
+            await cb.message.edit_text(
+                format_settings_text(scanner_state),
+                reply_markup=settings_keyboard(scanner_state),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+        await cb.answer(f"Интервал: {new_val:.2f}с (ручной)")
 
     @dp.callback_query(F.data == "set_interval")
     async def cb_set_interval(cb: CallbackQuery, state: FSMContext):

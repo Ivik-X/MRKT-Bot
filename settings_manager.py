@@ -26,7 +26,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "min_ton_diff": 2.5,
     "cheap_price_threshold": 3.0,
     "min_turnover_ratio": 0.0,
-    "scan_interval": 0.5,
+    "scan_interval": 0.8,
     "notify_categories": {
         "BLACK": True,
         "CHEAP": True,

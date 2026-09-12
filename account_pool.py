@@ -644,4 +644,110 @@ async def verify_gift_in_vault_async(
     return False
 
 
+async def find_recent_cheap_buys_async(
+    pool: AccountPool,
+    max_price_nano: int,
+    limit: int = 5,
+    max_pages: int = 20,
+) -> list[dict]:
+    """
+    Опрашивает ленту /feed через слоты пула с учетом задержек и кулдауна.
+    Ищет последние завершенные сделки (пары listing + sale) дешевле max_price_nano,
+    исключая lucky_buy, и вычисляет точное время выкупа в миллисекундах.
+    """
+    from datetime import datetime
+    from curl_cffi.requests import AsyncSession
+
+    cursor = None
+    matched: list[dict] = []
+    events_by_gift: dict[str, dict[str, Any]] = {}
+    matched_ids: set[str] = set()
+
+    for page in range(1, max_pages + 1):
+        slot = await pool.next_async()
+        payload: dict[str, Any] = {
+            "count": 20,
+            "type": ["sale", "listing"],
+            "maxPrice": max_price_nano,
+        }
+        if cursor:
+            payload["cursor"] = cursor
+
+        try:
+            async with AsyncSession(impersonate="chrome124", proxies=slot.proxies) as session:
+                r = await session.post(
+                    "https://api.tgmrkt.io/api/v1/feed",
+                    headers=slot.headers,
+                    json=payload,
+                    timeout=7.0,
+                )
+                if r.status_code == 429:
+                    pool.penalize(slot, 15.0)
+                    await asyncio.sleep(1.0)
+                    continue
+
+                if r.status_code != 200:
+                    break
+
+                data = r.json()
+                items = data.get("items", []) if isinstance(data, dict) else []
+                cursor = data.get("cursor") if isinstance(data, dict) else None
+
+                if not items:
+                    break
+
+                for item in items:
+                    itype = item.get("type")
+                    gift = item.get("gift", {})
+                    if not gift or gift.get("luckyBuy") or itype not in ("sale", "listing"):
+                        continue
+                    gid = gift.get("id")
+                    if not gid or gid in matched_ids:
+                        continue
+
+                    if gid not in events_by_gift:
+                        events_by_gift[gid] = {}
+                    events_by_gift[gid][itype] = item
+
+                    # Если найдены и listing, и sale для одного подарка
+                    if "sale" in events_by_gift[gid] and "listing" in events_by_gift[gid]:
+                        s = events_by_gift[gid]["sale"]
+                        l = events_by_gift[gid]["listing"]
+                        try:
+                            s_date = datetime.fromisoformat(s["date"].replace("Z", "+00:00"))
+                            l_date = datetime.fromisoformat(l["date"].replace("Z", "+00:00"))
+                            delta_ms = max(0, int((s_date - l_date).total_seconds() * 1000))
+                        except Exception:
+                            delta_ms = 0
+                            s_date = None
+                            l_date = None
+
+                        matched.append({
+                            "gift_id": gid,
+                            "gift": s.get("gift", {}),
+                            "amount": s.get("amount", 0),
+                            "delta_ms": delta_ms,
+                            "sale_date": s_date,
+                            "listing_date": l_date,
+                        })
+                        matched_ids.add(gid)
+                        if len(matched) >= limit:
+                            break
+
+                if len(matched) >= limit:
+                    break
+
+                if not cursor:
+                    break
+
+        except Exception:
+            pass
+
+        # Пауза между страницами для защиты от 429
+        await asyncio.sleep(0.4)
+
+    return matched[:limit]
+
+
+
 
