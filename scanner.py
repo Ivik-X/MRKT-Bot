@@ -313,13 +313,15 @@ class FloorTracker:
 
 class RateAdaptor:
     """
-    Адаптивный регулятор интервала сканирования с защитой от каскадов 429.
+    Адаптивный регулятор интервала сканирования с защитой от каскадов и лавинообразных 429.
     - Имеет динамический нижний порог effective_min, зависящий от количества слотов:
       max(0.40, 1.6 / max(1, num_slots)).
-    - При получении 429 от ЛЮБОГО слота немедленно повышает интервал (+0.15с или +0.20с при штрафе >= 30с)
-      и сбрасывает серию чистых сканов.
-    - Снижает интервал только после серии из 50 успешных сканов подряд без единого 429
-      (шаг -0.02с) до effective_min.
+    - Защита от лавины (burst debounce): если в течение 6.0 сек уже было повышение,
+      повторные 429 из того же всплеска на соседних слотах не раздувают интервал.
+    - Умеренный шаг повышения (+0.05с, либо +0.10с при штрафе >= 30с) с верхним пределом
+      (не выше effective_min + 0.35с), предотвращающим раздувание до 1.2с+.
+    - Быстрое восстановление: каждые 15 чистых сканов подряд (без 429) снижает интервал
+      на 0.05с до effective_min.
     """
 
     def __init__(
@@ -334,6 +336,7 @@ class RateAdaptor:
         self._pool = pool
         self._auto = True
         self._clean_streak = 0
+        self._last_429_time: float = 0.0
         self.interval = max(self.effective_min, min(self._max, initial_interval))
 
     @property
@@ -348,19 +351,28 @@ class RateAdaptor:
 
     def on_429(self, penalty_sec: float = 15.0) -> float:
         """
-        Срочная реакция на 429 от любого слота.
-        Немедленно повышает интервал и сбрасывает серию чистых сканов.
+        Реакция на 429 с защитой от лавинообразного каскада.
+        Не увеличивает интервал чаще чем раз в 6 секунд для одного всплеска.
         """
         self._clean_streak = 0
         if not self._auto:
             return self.interval
 
+        now = time.monotonic()
+        # Защита от лавины: если в последние 6.0 секунд интервал уже был поднят,
+        # не плюсуем задержку повторно от других слотов той же серии
+        if now - self._last_429_time < 6.0:
+            return self.interval
+
+        self._last_429_time = now
         old = self.interval
-        step = 0.20 if penalty_sec >= 30.0 else 0.15
-        self.interval = min(self._max, max(self.effective_min, self.interval + step))
+        step = 0.10 if penalty_sec >= 30.0 else 0.05
+        # Ограничиваем верхний потолок авто-инфляции, чтобы бот не застревал на 1.2+ с
+        adaptive_cap = min(self._max, self.effective_min + 0.35)
+        self.interval = min(adaptive_cap, max(self.effective_min, round(self.interval + step, 2)))
         if abs(self.interval - old) > 0.001:
             log.warning(
-                "⚡ RateAdaptor [429]: экстренное увеличение интервала %.2fс → %.2fс (штраф %.0fс)",
+                "⚡ RateAdaptor [429]: мягкое увеличение интервала %.2fс → %.2fс (штраф %.0fс)",
                 old, self.interval, penalty_sec,
             )
         return self.interval
@@ -368,21 +380,21 @@ class RateAdaptor:
     def record_ok(self) -> bool:
         """
         Вызывается после чистых сканов (где не было 429).
-        Каждые 50 чистых сканов осторожно снижает интервал на 0.02с до effective_min.
+        Каждые 15 чистых сканов динамично снижает интервал на 0.05с до effective_min.
         Возвращает True, если интервал изменился.
         """
         if not self._auto:
             return False
 
         self._clean_streak += 1
-        if self._clean_streak >= 50:
+        if self._clean_streak >= 15:
             self._clean_streak = 0
             cur_min = self.effective_min
             if self.interval > cur_min + 0.005:
                 old = self.interval
-                self.interval = max(cur_min, self.interval - 0.02)
+                self.interval = max(cur_min, round(self.interval - 0.05, 2))
                 log.info(
-                    "⚡ RateAdaptor: серия 50 чистых сканов, интервал %.2fс → %.2fс (пол: %.2fс)",
+                    "⚡ RateAdaptor: серия 15 чистых сканов, ускорение %.2fс → %.2fс (пол: %.2fс)",
                     old, self.interval, cur_min,
                 )
                 return True
@@ -419,20 +431,30 @@ class RateAdaptor:
 #  API с retry и логированием
 # ─────────────────────────────────────────────
 
+_notified_401_tokens: set[str] = set()
+
+
 async def api_request_async(
     method: str,
     endpoint: str,
     pool: AccountPool,
     session: AsyncSession,
-    json_data: dict | None = None,
+    json_data: Optional[dict] = None,
+    max_attempts: int = 4,
 ) -> Any:
-    last_exc: Exception | None = None
+    """
+    Выполняет HTTP запрос через cffi AsyncSession с LRU ротацией токенов/прокси.
+    При 429: штрафует слот, адаптирует интервал и пробует следующий слот.
+    При 401: отправляет алерт в Telegram и отключает слот.
+    При сбое сети/прокси: фиксирует таймаут и при необходимости заменяет прокси из резерва.
+    """
+    last_exc = None
 
-    for attempt in range(MAX_RETRIES):
+    for attempt in range(max_attempts):
         slot = await pool.next_async()
         t0 = time.monotonic()
 
-        log.debug("API %s %s | слот: %s | попытка %d/%d", method.upper(), endpoint, slot.label, attempt + 1, MAX_RETRIES)
+        log.debug("API %s %s | слот: %s | попытка %d/%d", method.upper(), endpoint, slot.label, attempt + 1, max_attempts)
 
         try:
             if method.upper() == "GET":
@@ -463,7 +485,22 @@ async def api_request_async(
 
             if r.status_code == 401:
                 log.error("HTTP 401 | Токен просрочен (слот: %s)", slot.label)
+                slot.disabled = True
                 stats_tracker.record_error("HTTP 401", f"Токен просрочен (слот: {slot.label})", slot.label, endpoint)
+                if TG_BOT_TOKEN and TG_ADMIN_IDS and slot.token not in _notified_401_tokens:
+                    _notified_401_tokens.add(slot.token)
+                    try:
+                        from tg_bot import send_token_expired_alert
+                        asyncio.create_task(
+                            send_token_expired_alert(
+                                TG_BOT_TOKEN,
+                                TG_ADMIN_IDS,
+                                slot.label,
+                                slot.token,
+                            )
+                        )
+                    except Exception as e:
+                        log.warning("Ошибка отправки 401 алерта: %s", e)
                 last_exc = AuthTokenExpiredError(f"HTTP 401: Токен просрочен (слот: {slot.label})")
                 continue
 
@@ -485,7 +522,8 @@ async def api_request_async(
                         _global_scanner_state.scan_interval = adaptor.interval
                         save_settings(_global_scanner_state)
                 last_exc = Exception(f"HTTP 429 (слот: {slot.label})")
-                await asyncio.sleep(0.5)
+                pacing = max(0.6, getattr(_global_scanner_state, "scan_interval", 0.6))
+                await asyncio.sleep(pacing)
                 continue
 
             r.raise_for_status()
@@ -529,6 +567,8 @@ async def api_request_async(
                         adaptor.on_429(PENALTY_429)
                         _global_scanner_state.scan_interval = adaptor.interval
                         save_settings(_global_scanner_state)
+                pacing = max(0.6, getattr(_global_scanner_state, "scan_interval", 0.6))
+                await asyncio.sleep(pacing)
             else:
                 log.warning("Ошибка %s %s | %s | %.2fс | %s", method.upper(), endpoint, slot.label, elapsed, e)
                 stats_tracker.record_error(err_name, str(e), slot.label, endpoint)

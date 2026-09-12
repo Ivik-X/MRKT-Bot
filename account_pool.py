@@ -865,5 +865,148 @@ async def find_recent_cheap_buys_async(
     return matched[:limit]
 
 
+async def find_recent_filter_buys_async(
+    pool: AccountPool,
+    scanner_state: Any,
+    limit: int = 5,
+    max_pages: int = 30,
+) -> list[dict]:
+    """
+    Опрашивает ленту /feed и ищет последние 5 завершённых покупок,
+    которые соответствовали бы активным фильтрам пользователя (флор коллекции,
+    чёрный фон, дешёвые подарки, редкие ID, оборот).
+    Вычисляет за сколько по времени их купили (если < 2 сек, то в мс, остальное в секундах).
+    """
+    from datetime import datetime
+    from curl_cffi.requests import AsyncSession
+    from scanner import check_gift
+
+    cursor = None
+    matched: list[dict] = []
+    events_by_gift: dict[str, dict[str, Any]] = {}
+    matched_ids: set[str] = set()
+
+    black_floor = getattr(scanner_state, "black_floor_nano", None)
+    collection_floors = getattr(scanner_state, "collection_floors", {})
+    collection_volumes = getattr(scanner_state, "collection_volumes", {})
+    min_ton_diff = getattr(scanner_state, "min_ton_diff", 0.5)
+    cheap_threshold = getattr(scanner_state, "cheap_price_threshold", 3.0)
+    min_turnover_ratio = getattr(scanner_state, "min_turnover_ratio", 0.0)
+    max_price_nano = getattr(scanner_state, "primary_balance_nano", None) if getattr(scanner_state, "filter_by_balance", False) else None
+    notify_cats = getattr(scanner_state, "notify_categories", {})
+
+    for page in range(1, max_pages + 1):
+        slot = await pool.next_async()
+        payload: dict[str, Any] = {
+            "count": 20,
+            "type": ["sale", "listing"],
+        }
+        if cursor:
+            payload["cursor"] = cursor
+
+        try:
+            async with AsyncSession(impersonate="chrome124", proxies=slot.proxies) as session:
+                r = await session.post(
+                    "https://api.tgmrkt.io/api/v1/feed",
+                    headers=slot.headers,
+                    json=payload,
+                    timeout=7.0,
+                )
+                if r.status_code == 429:
+                    pool.penalize(slot, 15.0)
+                    await asyncio.sleep(1.0)
+                    continue
+
+                if r.status_code != 200:
+                    break
+
+                data = r.json()
+                items = data.get("items", []) if isinstance(data, dict) else []
+                cursor = data.get("cursor") if isinstance(data, dict) else None
+
+                if not items:
+                    break
+
+                for item in items:
+                    itype = item.get("type")
+                    gift = item.get("gift", {})
+                    if not gift or gift.get("luckyBuy") or itype not in ("sale", "listing"):
+                        continue
+                    gid = gift.get("id")
+                    if not gid or gid in matched_ids:
+                        continue
+
+                    if gid not in events_by_gift:
+                        events_by_gift[gid] = {}
+                    events_by_gift[gid][itype] = item
+
+                    if "sale" in events_by_gift[gid] and "listing" in events_by_gift[gid]:
+                        s = events_by_gift[gid]["sale"]
+                        l = events_by_gift[gid]["listing"]
+
+                        # Проверяем лот на соответствие фильтрам бота
+                        g_for_check = dict(s.get("gift", {}))
+                        amount_nano = s.get("amount", 0)
+                        g_for_check["salePrice"] = amount_nano
+
+                        deals = check_gift(
+                            g_for_check,
+                            black_floor=black_floor,
+                            collection_floors=collection_floors,
+                            collection_volumes=collection_volumes,
+                            min_ton_diff=min_ton_diff,
+                            cheap_threshold=cheap_threshold,
+                            min_turnover_ratio=min_turnover_ratio,
+                            max_price_nano=max_price_nano,
+                        )
+
+                        valid_deals = [d for d in deals if notify_cats.get(d.get("type", ""), True)]
+                        if not valid_deals:
+                            continue
+
+                        best_deal = valid_deals[0]
+
+                        try:
+                            s_date = datetime.fromisoformat(s["date"].replace("Z", "+00:00"))
+                            l_date = datetime.fromisoformat(l["date"].replace("Z", "+00:00"))
+                            delta_ms = max(0, int((s_date - l_date).total_seconds() * 1000))
+                        except Exception:
+                            delta_ms = 0
+                            s_date = None
+                            l_date = None
+
+                        if delta_ms < 2000:
+                            delta_str = f"{delta_ms} мс"
+                        else:
+                            delta_str = f"{delta_ms / 1000.0:.2f} сек"
+
+                        matched.append({
+                            "gift_id": gid,
+                            "gift": s.get("gift", {}),
+                            "deal": best_deal,
+                            "amount": amount_nano,
+                            "delta_ms": delta_ms,
+                            "delta_str": delta_str,
+                            "sale_date": s_date,
+                            "listing_date": l_date,
+                        })
+                        matched_ids.add(gid)
+                        if len(matched) >= limit:
+                            break
+
+                if len(matched) >= limit:
+                    break
+
+                if not cursor:
+                    break
+
+        except Exception:
+            pass
+
+        await asyncio.sleep(0.4)
+
+    return matched[:limit]
+
+
 
 

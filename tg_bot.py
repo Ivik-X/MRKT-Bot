@@ -41,6 +41,7 @@ from account_pool import (
     buy_gift_async,
     verify_gift_in_vault_async,
     find_recent_cheap_buys_async,
+    find_recent_filter_buys_async,
 )
 from settings_manager import save_settings
 from xray_proxy import ping_proxy_async
@@ -141,6 +142,17 @@ def _mask_token(token: str) -> str:
     return token
 
 
+def get_tokens_updated_str(path: str = "tokens.txt") -> str:
+    """Возвращает дату и время последнего изменения файла tokens.txt."""
+    try:
+        if os.path.isfile(path):
+            mtime = os.path.getmtime(path)
+            return datetime.fromtimestamp(mtime).strftime("%d.%m %H:%M")
+    except Exception:
+        pass
+    return "неизвестно"
+
+
 def make_telegram_nft_url(collection_name: str, number: Any) -> str:
     """
     Генерирует официальную ссылку Telegram NFT вида:
@@ -185,19 +197,22 @@ def main_keyboard(state: ScannerState) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [status_btn, InlineKeyboardButton(text="🔄 Обновить статус", callback_data="nav_main")],
             [
-                InlineKeyboardButton(text="🔍 Поиск дешёвых выкупов", callback_data="find_cheap_feed"),
+                InlineKeyboardButton(text="🔍 Поиск дешёвых", callback_data="find_cheap_feed"),
+                InlineKeyboardButton(text="🎯 Выкупы под фильтры", callback_data="find_filter_feed"),
+            ],
+            [
                 InlineKeyboardButton(text=f"📦 Хранилище{vault_badge}", callback_data="nav_vault"),
-            ],
-            [
                 InlineKeyboardButton(text="🔔 Категории", callback_data="nav_categories"),
-                InlineKeyboardButton(text="🔑 Токены", callback_data="nav_tokens"),
             ],
             [
-                InlineKeyboardButton(text="⚙️ Настройки", callback_data="nav_settings"),
+                InlineKeyboardButton(text="🔑 Токены", callback_data="nav_tokens"),
                 InlineKeyboardButton(text="🌐 Прокси и Пинг", callback_data="nav_proxies"),
             ],
             [
+                InlineKeyboardButton(text="⚙️ Настройки", callback_data="nav_settings"),
                 InlineKeyboardButton(text="🔄 Обновить флоры", callback_data="refresh_floors"),
+            ],
+            [
                 InlineKeyboardButton(text="📋 Просмотр логов", callback_data="nav_logs"),
             ],
         ]
@@ -361,7 +376,7 @@ def format_main_text(state: ScannerState) -> str:
         f"• Флор чёрного фона: <code>{bf_str}</code>\n"
         f"• Коллекций в кэше: <code>{floors_count}</code>\n\n"
         f"🔌 <b>Ресурсы:</b>\n"
-        f"• Токенов: <code>{active_tokens}</code>\n"
+        f"• Токенов: <code>{active_tokens}</code> <i>(обновлены: {get_tokens_updated_str()})</i>\n"
         f"• Прокси: <code>{active_proxies}</code>{' <i>(+1 прямой IP)</i>' if getattr(state, 'use_direct', False) else ''}"
     )
 
@@ -440,10 +455,11 @@ def format_settings_text(state: ScannerState) -> str:
 
 
 def format_tokens_text(tokens: list[str], verified_info: Optional[dict] = None) -> str:
+    tok_upd = get_tokens_updated_str()
     if not tokens:
-        return "🔑 <b>Управление токенами</b>\n\n⚠️ В пуле нет активных токенов!"
+        return f"🔑 <b>Управление токенами</b>\n\n⚠️ В пуле нет активных токенов!\n🕒 Файл <code>tokens.txt</code> изменён: <code>{tok_upd}</code>"
 
-    lines = [f"🔑 <b>Управление токенами</b> (Всего: <code>{len(tokens)}</code>):\n"]
+    lines = [f"🔑 <b>Управление токенами</b> (Всего: <code>{len(tokens)}</code> | Обновлены: <code>{tok_upd}</code>):\n"]
     primary_tok = tokens[0] if tokens else None
     for i, tok in enumerate(tokens, 1):
         masked = _mask_token(tok)
@@ -595,6 +611,102 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
 
         except Exception as e:
             log.error("Ошибка поиска по ленте: %s", e, exc_info=True)
+            await status_msg.edit_text(f"❌ Ошибка при поиске по ленте: {e}")
+
+    # ── Раздел: Поиск выкупов под активные фильтры в ленте (feed) ───────
+    @dp.callback_query(F.data == "find_filter_feed")
+    async def cb_find_filter_feed(cb: CallbackQuery):
+        await cb.answer("🎯 Запуск поиска выкупов по фильтрам...", show_alert=False)
+
+        status_msg = await cb.message.answer(
+            "🎯 <b>Поиск последних выкупов под ваши фильтры...</b>\n"
+            "<i>Анализирую историю ленты (/feed) на соответствие флору, дешёвым лотам, редкостям...</i>",
+            parse_mode="HTML",
+        )
+
+        try:
+            pool = scanner_state.pool
+            if not pool or not pool.slots:
+                await status_msg.edit_text("❌ В пуле нет активных токенов.")
+                return
+
+            matched = await find_recent_filter_buys_async(
+                pool=pool,
+                scanner_state=scanner_state,
+                limit=5,
+                max_pages=30,
+            )
+
+            if not matched:
+                await status_msg.edit_text(
+                    "⚠️ В ленте не найдено выкупов, подходящих под текущие активные фильтры, за последние 30 страниц.\n"
+                    "<i>Возможно, пороги выгоды слишком строгие либо подходящие сделки были раньше.</i>",
+                    parse_mode="HTML",
+                )
+                return
+
+            await status_msg.edit_text(
+                f"✅ Найдено <b>{len(matched)}</b> последних сделок, подходивших под ваши фильтры:",
+                parse_mode="HTML",
+            )
+
+            cat_labels = {
+                "BLACK": "🖤 Чёрный фон",
+                "CHEAP": "💸 Сверхдешёвый",
+                "NFT": "🎯 Ниже флора коллекции",
+                "LOW_ID": "🏷️ Редкий ID (<100)",
+            }
+
+            for i, m in enumerate(matched, 1):
+                gift = m.get("gift", {})
+                col_name = gift.get("collectionName") or gift.get("collectionTitle") or gift.get("title") or "NFT"
+                mod_name = gift.get("modelName") or gift.get("modelTitle") or ""
+                num = gift.get("number")
+                num_str = f" #{num}" if num else ""
+                name_str = f"{col_name} — {mod_name}{num_str}" if mod_name else f"{col_name}{num_str}"
+
+                amount_nano = m.get("amount", 0)
+                amount_ton = amount_nano / 1e9
+                delta_str = m.get("delta_str", "—")
+                deal = m.get("deal", {})
+                cat_type = deal.get("type", "NFT")
+                cat_label = cat_labels.get(cat_type, cat_type)
+
+                nft_url = make_telegram_nft_url(col_name, num)
+
+                # Флор коллекции
+                floor_nano = scanner_state.collection_floors.get(col_name)
+                if floor_nano:
+                    floor_ton = floor_nano / 1e9
+                    diff = floor_ton - amount_ton
+                    profit_str = f" <i>(дешевле флора на +{diff:.2f} TON)</i>" if diff > 0 else ""
+                    floor_info = f"<code>{floor_ton:.2f} TON</code>{profit_str}"
+                else:
+                    floor_info = "<i>не определён</i>"
+
+                sale_dt = m.get("sale_date")
+                dt_str = sale_dt.strftime("%d.%m.%Y %H:%M:%S UTC") if sale_dt else "—"
+
+                text = (
+                    f"🎯 <b>Сделка #{i} (под фильтры)</b>\n\n"
+                    f"🎁 <b>{name_str}</b>\n"
+                    f"🏷️ <b>Категория:</b> {cat_label}\n"
+                    f"💸 <b>Цена покупки:</b> <code>{amount_ton:.2f} TON</code>\n"
+                    f"📈 <b>Флор коллекции:</b> {floor_info}\n"
+                    f"⚡ <b>Выкуплен за:</b> <b>{delta_str}</b>\n"
+                    f"🕒 <b>Время сделки:</b> <code>{dt_str}</code>\n"
+                    f"🔗 <a href=\"{nft_url}\">Открыть подарок в Telegram</a>"
+                )
+                kb = InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text=f"🔗 Открыть {col_name}{num_str}", url=nft_url)]
+                    ]
+                )
+                await cb.message.answer(text, reply_markup=kb, parse_mode="HTML")
+                await asyncio.sleep(0.2)
+
+        except Exception as e:
+            log.error("Ошибка поиска по фильтрам в ленте: %s", e, exc_info=True)
             await status_msg.edit_text(f"❌ Ошибка при поиске по ленте: {e}")
 
     # ── Раздел: Уведомления по категориям ────────────────────────────────
@@ -1799,4 +1911,52 @@ async def send_autobuy_skipped_notification(
     finally:
         if should_close:
             await bot.session.close()
+
+
+async def send_token_expired_alert(
+    bot_token: str,
+    admin_ids: set[int],
+    slot_label: str,
+    token_str: str,
+    bot: Optional[Bot] = None,
+) -> None:
+    """Уведомляет админов об аннулировании / просрочке токена (HTTP 401 Unauthorized)."""
+    if not bot_token or not admin_ids:
+        return
+
+    masked = _mask_token(token_str)
+    text = (
+        f"🚨 <b>ВНИМАНИЕ: ТОКЕН ПРОСРОЧЕН (HTTP 401)!</b>\n\n"
+        f"Слот: <code>{slot_label}</code>\n"
+        f"Токен: <code>{masked}</code>\n\n"
+        f"⚠️ Слот автоматически временно отключен от запросов.\n"
+        f"Пожалуйста, обновите токен через браузерное расширение или меню управления токенами."
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔑 Управление токенами", callback_data="nav_tokens")],
+            [InlineKeyboardButton(text="🧹 Удалить 401 токены", callback_data="tokens_cleanup_401")],
+        ]
+    )
+
+    should_close = False
+    if bot is None:
+        bot = Bot(token=bot_token)
+        should_close = True
+
+    try:
+        for admin_id in admin_ids:
+            try:
+                await bot.send_message(
+                    chat_id=admin_id,
+                    text=text,
+                    reply_markup=kb,
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                log.warning("Не удалось отправить 401 алерт в TG %s: %s", admin_id, e)
+    finally:
+        if should_close:
+            await bot.session.close()
+
 
