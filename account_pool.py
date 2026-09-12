@@ -36,7 +36,7 @@ PENALTY_SECONDS = float(os.getenv("PENALTY_SECONDS", 15.0))
 class Slot:
     """Один (токен + прокси) слот для API запросов."""
     token: str
-    proxy: Optional[XrayProcess] = None
+    proxy: Optional[Any] = None
     disabled: bool = False
     timeout_count: int = 0
     # Время когда слот снова доступен (monotonic)
@@ -114,7 +114,7 @@ class AccountPool:
     def __init__(
         self,
         slots: list[Slot],
-        reserve_proxies: Optional[list[XrayProcess]] = None,
+        reserve_proxies: Optional[list[Any]] = None,
         use_direct: bool = False,
     ):
         if not slots:
@@ -125,7 +125,38 @@ class AccountPool:
         self._async_lock = asyncio.Lock()
         self.use_direct = use_direct
 
-    def replace_slot_proxy(self, slot: Slot) -> Optional[XrayProcess]:
+    def set_use_direct(self, use_direct: bool) -> None:
+        """Переключает использование прямого IP сервера для первого слота на лету."""
+        with self._lock:
+            if self.use_direct == use_direct:
+                return
+            self.use_direct = use_direct
+            tokens = [s.token for s in self._slots]
+            # Собираем все прокси: те, что сейчас в слотах + резервные
+            all_proxies = []
+            for s in self._slots:
+                if s.proxy and s.proxy not in all_proxies:
+                    all_proxies.append(s.proxy)
+            for r in self._reserve_proxies:
+                if r not in all_proxies:
+                    all_proxies.append(r)
+
+            new_slots: list[Slot] = []
+            if use_direct and tokens:
+                new_slots.append(Slot(token=tokens[0], proxy=None))
+                for i, t in enumerate(tokens[1:]):
+                    prx = all_proxies[i] if i < len(all_proxies) else None
+                    new_slots.append(Slot(token=t, proxy=prx))
+                self._reserve_proxies = all_proxies[len(tokens[1:]):]
+            else:
+                for i, t in enumerate(tokens):
+                    prx = all_proxies[i] if i < len(all_proxies) else None
+                    new_slots.append(Slot(token=t, proxy=prx))
+                self._reserve_proxies = all_proxies[len(tokens):]
+
+            self._slots = new_slots
+
+    def replace_slot_proxy(self, slot: Slot) -> Optional[Any]:
         """Заменяет проблемный прокси в слоте на следующий быстрый из резерва."""
         with self._lock:
             if not self._reserve_proxies:
@@ -193,7 +224,7 @@ class AccountPool:
                     tokens.append(s.token)
             return tokens
 
-    def get_proxies(self) -> list[XrayProcess]:
+    def get_proxies(self) -> list[Any]:
         """Возвращает список уникальных активных прокси."""
         with self._lock:
             seen = set()
@@ -412,8 +443,8 @@ async def build_pool_async(
         proxies = []
 
     # Отбираем самые быстрые прокси под количество токенов
-    selected_proxies: list[XrayProcess] = []
-    reserve_proxies: list[XrayProcess] = []
+    selected_proxies: list[Any] = []
+    reserve_proxies: list[Any] = []
     num_proxies_needed = max(0, len(tokens) - 1) if use_direct else len(tokens)
 
     if proxies:

@@ -1120,6 +1120,9 @@ async def main() -> None:
     init_min_turnover = float(saved_settings.get("min_turnover_ratio", MIN_TURNOVER_RATIO))
     init_filter_balance = bool(saved_settings.get("filter_by_balance", FILTER_BY_BALANCE))
     init_autobuy = bool(saved_settings.get("auto_buy", False))
+    init_use_direct = bool(saved_settings.get("use_direct", pool.use_direct))
+    if pool.use_direct != init_use_direct:
+        pool.set_use_direct(init_use_direct)
 
     avg_ping = pool.avg_ping_ms() if hasattr(pool, "avg_ping_ms") else None
     if "scan_interval" in saved_settings:
@@ -1148,6 +1151,7 @@ async def main() -> None:
         black_floor_nano=None,
         collection_floors_count=0,
         rate_adaptor=adaptor,
+        use_direct=init_use_direct,
     )
     if "notify_categories" in saved_settings and isinstance(saved_settings["notify_categories"], dict):
         scanner_state.notify_categories.update(saved_settings["notify_categories"])

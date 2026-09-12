@@ -76,74 +76,229 @@ def parse_vless(url: str, local_port: int) -> VlessConfig:
     )
 
 
-def _build_xray_config(cfg: VlessConfig) -> dict:
-    """Генерирует JSON конфиг xray для данного VLESS."""
-    stream: dict = {"network": cfg.network}
+@dataclass
+class TrojanConfig:
+    url: str
+    password: str
+    host: str
+    port: int
+    name: str
+    sni: str = ""
+    security: str = "tls"
+    local_port: int = 0
 
-    # ── TLS ──────────────────────────────────────────────────────────────
-    if cfg.security == "tls":
-        tls: dict = {}
-        if cfg.sni:
-            tls["serverName"] = cfg.sni
-        if cfg.fp:
-            tls["fingerprint"] = cfg.fp
-        stream["security"] = "tls"
-        stream["tlsSettings"] = tls
 
-    # ── Reality ──────────────────────────────────────────────────────────
-    elif cfg.security == "reality":
-        rl: dict = {"publicKey": cfg.pbk, "shortId": cfg.sid}
-        if cfg.sni:
-            rl["serverName"] = cfg.sni
-        if cfg.fp:
-            rl["fingerprint"] = cfg.fp
-        if cfg.spx:
-            rl["spiderX"] = cfg.spx
-        stream["security"] = "reality"
-        stream["realitySettings"] = rl
+def parse_trojan(url: str, local_port: int) -> TrojanConfig:
+    """Парсит trojan://password@host:port?sni=...#name в TrojanConfig."""
+    p = urlparse(url)
+    q = parse_qs(p.query)
+    host = p.hostname or ""
+    return TrojanConfig(
+        url=url,
+        password=p.username or "",
+        host=host,
+        port=p.port or 443,
+        name=unquote(p.fragment or f"{host}:{p.port or 443}"),
+        sni=_q(q, "sni", host),
+        security=_q(q, "security", "tls"),
+        local_port=local_port,
+    )
 
+
+@dataclass
+class ShadowsocksConfig:
+    url: str
+    method: str
+    password: str
+    host: str
+    port: int
+    name: str
+    local_port: int = 0
+
+
+def parse_ss(url: str, local_port: int) -> ShadowsocksConfig:
+    """Парсит ss:// URL в ShadowsocksConfig."""
+    import base64
+    p = urlparse(url)
+    name = unquote(p.fragment or f"{p.hostname or ''}:{p.port or 8388}")
+    if "@" in p.netloc:
+        userinfo, hostport = p.netloc.split("@", 1)
+        pad = len(userinfo) % 4
+        if pad:
+            userinfo += "=" * (4 - pad)
+        try:
+            decoded = base64.urlsafe_b64decode(userinfo).decode("utf-8")
+            method, password = decoded.split(":", 1)
+        except Exception:
+            method, password = "aes-256-gcm", userinfo
+        hp = hostport.split(":")
+        host = hp[0]
+        port = int(hp[1]) if len(hp) > 1 and hp[1].isdigit() else 8388
     else:
-        stream["security"] = "none"
+        b64 = p.netloc
+        pad = len(b64) % 4
+        if pad:
+            b64 += "=" * (4 - pad)
+        try:
+            decoded = base64.urlsafe_b64decode(b64).decode("utf-8")
+            userpass, hostport = decoded.split("@", 1)
+            method, password = userpass.split(":", 1)
+            hp = hostport.split(":")
+            host = hp[0]
+            port = int(hp[1]) if len(hp) > 1 and hp[1].isdigit() else 8388
+        except Exception:
+            host = "127.0.0.1"
+            port = 8388
+            method = "aes-256-gcm"
+            password = b64
 
-    # ── Network-specific settings ─────────────────────────────────────────
-    if cfg.network == "ws":
-        stream["wsSettings"] = {
-            "path": cfg.path,
-            "headers": {"Host": cfg.ws_host or cfg.sni or cfg.host},
-        }
-    elif cfg.network == "grpc":
-        stream["grpcSettings"] = {"serviceName": cfg.path.lstrip("/")}
-    elif cfg.network in ("http", "h2"):
-        stream["httpSettings"] = {
-            "path": cfg.path,
-            "host": [cfg.ws_host or cfg.sni or cfg.host],
-        }
+    return ShadowsocksConfig(
+        url=url,
+        method=method,
+        password=password,
+        host=host,
+        port=port,
+        name=name,
+        local_port=local_port,
+    )
 
-    # ── User ──────────────────────────────────────────────────────────────
-    user: dict = {"id": cfg.uuid, "encryption": "none"}
-    if cfg.flow:
-        user["flow"] = cfg.flow
+
+class SimpleProxy:
+    """
+    Прямой SOCKS5 / HTTP / HTTPS прокси.
+    Работает нативно через curl_cffi без запуска сторонних Xray процессов.
+    """
+    def __init__(self, url: str):
+        self.url = url
+        p = urlparse(url)
+        self.name = unquote(p.fragment) if p.fragment else f"{p.scheme}://{p.hostname}:{p.port}"
+        clean = p._replace(fragment="")
+        self.proxy_url = clean.geturl()
+        self.ping_ms: float = 0.0
+        from types import SimpleNamespace
+        self.cfg = SimpleNamespace(name=self.name, local_port=p.port or 0)
+
+    @property
+    def socks_url(self) -> str:
+        return self.proxy_url
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def alive(self) -> bool:
+        return True
+
+    def __repr__(self) -> str:
+        return f"SimpleProxy({self.name!r}, {self.proxy_url})"
+
+
+def _build_xray_config(cfg: Any) -> dict:
+    """Генерирует JSON конфиг xray для VLESS, Trojan или Shadowsocks."""
+    inbounds = [{
+        "port": cfg.local_port,
+        "listen": "127.0.0.1",
+        "protocol": "socks",
+        "settings": {"auth": "noauth", "udp": True},
+    }]
+
+    if isinstance(cfg, TrojanConfig):
+        outbound = {
+            "protocol": "trojan",
+            "settings": {
+                "servers": [{
+                    "address": cfg.host,
+                    "port": cfg.port,
+                    "password": cfg.password,
+                }]
+            },
+            "streamSettings": {
+                "network": "tcp",
+                "security": "tls",
+                "tlsSettings": {
+                    "serverName": cfg.sni or cfg.host,
+                },
+            },
+        }
+    elif isinstance(cfg, ShadowsocksConfig):
+        outbound = {
+            "protocol": "shadowsocks",
+            "settings": {
+                "servers": [{
+                    "address": cfg.host,
+                    "port": cfg.port,
+                    "method": cfg.method,
+                    "password": cfg.password,
+                }]
+            },
+        }
+    else:
+        # VLESS
+        stream: dict = {"network": cfg.network}
+
+        # ── TLS ──────────────────────────────────────────────────────────────
+        if cfg.security == "tls":
+            tls: dict = {}
+            if cfg.sni:
+                tls["serverName"] = cfg.sni
+            if cfg.fp:
+                tls["fingerprint"] = cfg.fp
+            stream["security"] = "tls"
+            stream["tlsSettings"] = tls
+
+        # ── Reality ──────────────────────────────────────────────────────────
+        elif cfg.security == "reality":
+            rl: dict = {"publicKey": cfg.pbk, "shortId": cfg.sid}
+            if cfg.sni:
+                rl["serverName"] = cfg.sni
+            if cfg.fp:
+                rl["fingerprint"] = cfg.fp
+            if cfg.spx:
+                rl["spiderX"] = cfg.spx
+            stream["security"] = "reality"
+            stream["realitySettings"] = rl
+
+        else:
+            stream["security"] = "none"
+
+        # ── Network-specific settings ─────────────────────────────────────────
+        if cfg.network == "ws":
+            stream["wsSettings"] = {
+                "path": cfg.path,
+                "headers": {"Host": cfg.ws_host or cfg.sni or cfg.host},
+            }
+        elif cfg.network == "grpc":
+            stream["grpcSettings"] = {"serviceName": cfg.path.lstrip("/")}
+        elif cfg.network in ("http", "h2"):
+            stream["httpSettings"] = {
+                "path": cfg.path,
+                "host": [cfg.ws_host or cfg.sni or cfg.host],
+            }
+
+        # ── User ──────────────────────────────────────────────────────────────
+        user: dict = {"id": cfg.uuid, "encryption": "none"}
+        if cfg.flow:
+            user["flow"] = cfg.flow
+
+        outbound = {
+            "protocol": "vless",
+            "settings": {
+                "vnext": [{
+                    "address": cfg.host,
+                    "port": cfg.port,
+                    "users": [user],
+                }]
+            },
+            "streamSettings": stream,
+        }
 
     return {
         "log": {"loglevel": "warning"},
-        "inbounds": [{
-            "port": cfg.local_port,
-            "listen": "127.0.0.1",
-            "protocol": "socks",
-            "settings": {"auth": "noauth", "udp": True},
-        }],
+        "inbounds": inbounds,
         "outbounds": [
-            {
-                "protocol": "vless",
-                "settings": {
-                    "vnext": [{
-                        "address": cfg.host,
-                        "port": cfg.port,
-                        "users": [user],
-                    }]
-                },
-                "streamSettings": stream,
-            },
+            outbound,
             {"protocol": "freedom", "tag": "direct"},
         ],
     }
@@ -174,9 +329,9 @@ def find_xray_binary() -> Optional[str]:
 
 
 class XrayProcess:
-    """Один запущенный xray процесс = один VLESS прокси."""
+    """Один запущенный xray процесс = один VLESS/Trojan/Shadowsocks прокси."""
 
-    def __init__(self, cfg: VlessConfig, xray_bin: str):
+    def __init__(self, cfg: Any, xray_bin: str):
         self.cfg = cfg
         self.xray_bin = xray_bin
         self.ping_ms: float = 0.0
@@ -230,11 +385,15 @@ class XrayProcess:
 #  Загрузка прокси из proxies.txt
 # ─────────────────────────────────────────────
 
-def load_proxies(path: str = "proxies.txt") -> list[XrayProcess]:
+def load_proxies(path: str = "proxies.txt") -> list[Any]:
     """
-    Читает proxies.txt (одна vless:// строка на строку).
-    Запускает xray процесс для каждого прокси.
-    Возвращает список XrayProcess.
+    Читает proxies.txt:
+      - vless://...       (VLESS Reality / TLS через Xray)
+      - trojan://...      (Trojan через Xray)
+      - ss://...          (Shadowsocks через Xray)
+      - socks5://...      (Прямой SOCKS5 без Xray)
+      - http://...        (Прямой HTTP прокси без Xray)
+      - https://...       (Прямой HTTPS прокси без Xray)
     """
     file_to_read = None
     if os.path.isfile(path):
@@ -253,32 +412,67 @@ def load_proxies(path: str = "proxies.txt") -> list[XrayProcess]:
     with open(file_to_read, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
-            if line and not line.startswith("#") and line.startswith("vless://"):
-                lines.append(line)
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line and not line.startswith(("http", "socks", "vless", "trojan", "ss")):
+                continue
+            lines.append(line)
 
     if not lines:
         return []
 
-    xray_bin = find_xray_binary()
-    if not xray_bin:
-        print("⚠️  proxies.txt найден, но xray не обнаружен!")
-        print("   Установи: brew install xray")
-        print("   Или скачай: https://github.com/XTLS/Xray-core/releases")
-        print("   Или укажи путь: XRAY_BIN=/path/to/xray")
-        print("   Продолжаем без прокси...\n")
-        return []
-
-    processes = []
-    for i, url in enumerate(lines):
+    xray_bin = None
+    processes: list[Any] = []
+    for i, line in enumerate(lines):
         port = BASE_SOCKS_PORT + i
-        cfg = parse_vless(url, port)
-        proc = XrayProcess(cfg, xray_bin)
-        try:
-            proc.start()
-            print(f"  ✅ Прокси [{cfg.name}] → socks5://127.0.0.1:{port}")
+        if line.startswith(("http://", "https://", "socks5://", "socks5h://")):
+            proc = SimpleProxy(line)
+            print(f"  ✅ Прямой прокси [{proc.cfg.name}] → {proc.socks_url}")
             processes.append(proc)
-        except Exception as e:
-            print(f"  ❌ Прокси [{cfg.name}] не запустился: {e}")
+        elif line.startswith("trojan://"):
+            if not xray_bin:
+                xray_bin = find_xray_binary()
+            if not xray_bin:
+                print(f"  ⚠️  xray не найден для Trojan [{line[:35]}...]")
+                continue
+            cfg = parse_trojan(line, port)
+            proc = XrayProcess(cfg, xray_bin)
+            try:
+                proc.start()
+                print(f"  ✅ Trojan [{cfg.name}] → socks5://127.0.0.1:{port}")
+                processes.append(proc)
+            except Exception as e:
+                print(f"  ❌ Trojan [{cfg.name}] не запустился: {e}")
+        elif line.startswith("ss://"):
+            if not xray_bin:
+                xray_bin = find_xray_binary()
+            if not xray_bin:
+                print(f"  ⚠️  xray не найден для Shadowsocks [{line[:35]}...]")
+                continue
+            cfg = parse_ss(line, port)
+            proc = XrayProcess(cfg, xray_bin)
+            try:
+                proc.start()
+                print(f"  ✅ Shadowsocks [{cfg.name}] → socks5://127.0.0.1:{port}")
+                processes.append(proc)
+            except Exception as e:
+                print(f"  ❌ Shadowsocks [{cfg.name}] не запустился: {e}")
+        elif line.startswith("vless://"):
+            if not xray_bin:
+                xray_bin = find_xray_binary()
+            if not xray_bin:
+                print(f"  ⚠️  xray не найден для VLESS [{line[:35]}...]")
+                continue
+            cfg = parse_vless(line, port)
+            proc = XrayProcess(cfg, xray_bin)
+            try:
+                proc.start()
+                print(f"  ✅ VLESS [{cfg.name}] → socks5://127.0.0.1:{port}")
+                processes.append(proc)
+            except Exception as e:
+                print(f"  ❌ VLESS [{cfg.name}] не запустился: {e}")
+        else:
+            print(f"  ⚠️  Неподдерживаемый формат прокси: {line[:35]}...")
 
     return processes
 
@@ -288,7 +482,7 @@ def load_proxies(path: str = "proxies.txt") -> list[XrayProcess]:
 # ─────────────────────────────────────────────
 
 async def ping_proxy_async(
-    proc: XrayProcess,
+    proc: Any,
     test_url: str = "https://api.tgmrkt.io/api/v1/gifts/collections",
     timeout: float = 4.0,
 ) -> tuple[bool, float, str]:
@@ -319,10 +513,10 @@ async def ping_proxy_async(
 
 
 async def filter_fast_proxies_async(
-    processes: list[XrayProcess],
+    processes: list[Any],
     max_ping_seconds: float = 3.0,
     test_url: str = "https://api.tgmrkt.io/api/v1/gifts/collections",
-) -> list[XrayProcess]:
+) -> list[Any]:
     """
     Параллельно пингует все запущенные прокси.
     Отсеивает те, у которых пинг > max_ping_seconds или ошибка соединения.
@@ -337,7 +531,7 @@ async def filter_fast_proxies_async(
     tasks = [ping_proxy_async(p, test_url=test_url, timeout=timeout_val) for p in processes]
     results = await asyncio.gather(*tasks)
 
-    fast_proxies: list[XrayProcess] = []
+    fast_proxies: list[Any] = []
     max_ping_ms = max_ping_seconds * 1000.0
 
     for proc, (ok, latency_ms, err) in zip(processes, results):

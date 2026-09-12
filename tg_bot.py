@@ -87,6 +87,7 @@ class ScannerState:
     buying_in_progress: set[str] = field(default_factory=set)  # gift_id покупаемых сейчас
     rate_adaptor: Optional[Any] = None  # RateAdaptor из scanner.py
     penalties_429: list[float] = field(default_factory=list)  # таймстампы 429 за последний час
+    use_direct: bool = False  # 1 слот без VPN на прямом IP сервера
 
     def record_429(self, ts: Optional[float] = None) -> None:
         """Регистрирует факт получения 429 и очищает записи старше 1 часа."""
@@ -228,12 +229,14 @@ def tokens_keyboard() -> InlineKeyboardMarkup:
 def settings_keyboard(state: ScannerState) -> InlineKeyboardMarkup:
     bal_toggle_text = "🟢 ВКЛ" if state.filter_by_balance else "🔴 ВЫКЛ"
     autobuy_toggle_text = "🟢 ВКЛ" if state.auto_buy else "🔴 ВЫКЛ"
+    direct_toggle_text = "🟢 ВКЛ" if getattr(state, "use_direct", False) else "🔴 ВЫКЛ"
     p429 = state.get_429_count_last_hour()
     p429_badge = f" (429: {p429}/ч)" if p429 > 0 else " (429: 0)"
     interval_btn_text = f"✏️ {state.scan_interval:.2f}с{p429_badge}"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=f"🤖 Авто-покупка (AutoBuy): {autobuy_toggle_text}", callback_data="toggle_autobuy")],
+            [InlineKeyboardButton(text=f"🌐 Прямой IP сервера: {direct_toggle_text}", callback_data="toggle_use_direct")],
             [InlineKeyboardButton(text=f"💰 Фильтр по балансу: {bal_toggle_text}", callback_data="toggle_balance_filter")],
             [InlineKeyboardButton(text="📊 Мин. оборот/цена (NFT)", callback_data="set_turnover_ratio")],
             [InlineKeyboardButton(text="👑 Сменить основной аккаунт", callback_data="nav_select_primary")],
@@ -353,7 +356,7 @@ def format_main_text(state: ScannerState) -> str:
         f"• Коллекций в кэше: <code>{floors_count}</code>\n\n"
         f"🔌 <b>Ресурсы:</b>\n"
         f"• Токенов: <code>{active_tokens}</code>\n"
-        f"• Прокси: <code>{active_proxies}</code>"
+        f"• Прокси: <code>{active_proxies}</code>{' <i>(+1 прямой IP)</i>' if getattr(state, 'use_direct', False) else ''}"
     )
 
 
@@ -396,6 +399,7 @@ def format_vault_text(state: ScannerState) -> str:
 
 def format_settings_text(state: ScannerState) -> str:
     autobuy_str = "🟢 ВКЛ" if state.auto_buy else "🔴 ВЫКЛ"
+    direct_str = "🟢 ВКЛ (1 слот напрямую)" if getattr(state, "use_direct", False) else "🔴 ВЫКЛ (все через VPN)"
     bal_str = f"{state.primary_balance_nano / 1e9:.2f} TON" if state.primary_balance_nano is not None else "не проверен"
     filter_bal_str = "🟢 ВКЛ" if state.filter_by_balance else "🔴 ВЫКЛ"
     turnover_str = f"≥ {state.min_turnover_ratio:.1f}x" if state.min_turnover_ratio > 0 else "выключен (0.0)"
@@ -411,17 +415,19 @@ def format_settings_text(state: ScannerState) -> str:
         f"⚙️ <b>Настройки сканера</b>\n\n"
         f"0. <b>Авто-покупка (AutoBuy):</b> {autobuy_str}\n"
         f"   <i>(Моментальный выкуп подходящих подарков с основного аккаунта без задержек)</i>\n\n"
-        f"1. <b>Фильтр по балансу:</b> {filter_bal_str}\n"
+        f"1. <b>Прямой IP сервера (Direct):</b> {direct_str}\n"
+        f"   <i>(Один токен ходит напрямую с IP VPS без VPN overhead для максимальной скорости)</i>\n\n"
+        f"2. <b>Фильтр по балансу:</b> {filter_bal_str}\n"
         f"   <i>(Показывать только подарки, на которые хватает баланса основного аккаунта)</i>\n\n"
-        f"2. <b>Мин. оборот/цена для NFT:</b> <code>{turnover_str}</code>\n"
+        f"3. <b>Мин. оборот/цена для NFT:</b> <code>{turnover_str}</code>\n"
         f"   <i>(Отсекает мёртвый груз: оборот/цена ≥ X; кроме чёрного фона и подарков &lt; {state.cheap_price_threshold:.1f} TON)</i>\n\n"
-        f"3. <b>Основной аккаунт:</b> <code>{primary_str}</code>\n"
+        f"4. <b>Основной аккаунт:</b> <code>{primary_str}</code>\n"
         f"   <i>(Текущий баланс: <code>{bal_str}</code>; используется для покупок)</i>\n\n"
-        f"4. <b>Порог выгоды (MIN_TON_DIFF):</b> <code>{state.min_ton_diff:.2f} TON</code>\n"
+        f"5. <b>Порог выгоды (MIN_TON_DIFF):</b> <code>{state.min_ton_diff:.2f} TON</code>\n"
         f"   <i>(Подарок покупается, если он дешевле флора минимум на это значение)</i>\n\n"
-        f"5. <b>Порог дешёвых (CHEAP_THRESHOLD):</b> <code>{state.cheap_price_threshold:.2f} TON</code>\n"
+        f"6. <b>Порог дешёвых (CHEAP_THRESHOLD):</b> <code>{state.cheap_price_threshold:.2f} TON</code>\n"
         f"   <i>(Любой подарок с ценой ниже этого порога считается выгодным)</i>\n\n"
-        f"6. <b>⚡ Интервал сканирования ({interval_mode}):</b> <code>{state.scan_interval:.2f} с</code>{p429_badge}\n"
+        f"7. <b>⚡ Интервал сканирования ({interval_mode}):</b> <code>{state.scan_interval:.2f} с</code>{p429_badge}\n"
         f"   <i>(Пауза между запросами; при установке вручную авто-адаптация отключается)</i>"
     )
 
@@ -812,6 +818,17 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
         save_settings(scanner_state)
         status_text = "включена 🟢" if scanner_state.auto_buy else "выключена 🔴"
         await cb.answer(f"Авто-покупка {status_text}")
+        text = format_settings_text(scanner_state)
+        await cb.message.edit_text(text, reply_markup=settings_keyboard(scanner_state), parse_mode="HTML")
+
+    @dp.callback_query(F.data == "toggle_use_direct")
+    async def cb_toggle_use_direct(cb: CallbackQuery):
+        scanner_state.use_direct = not scanner_state.use_direct
+        if scanner_state.pool:
+            scanner_state.pool.set_use_direct(scanner_state.use_direct)
+        save_settings(scanner_state)
+        status_text = "включён 🟢 (1 слот напрямую)" if scanner_state.use_direct else "выключен 🔴 (все через VPN)"
+        await cb.answer(f"Прямой IP: {status_text}")
         text = format_settings_text(scanner_state)
         await cb.message.edit_text(text, reply_markup=settings_keyboard(scanner_state), parse_mode="HTML")
 

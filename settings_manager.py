@@ -34,6 +34,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "LOW_ID": True,
     },
     "primary_token": "",
+    "use_direct": False,
 }
 
 
@@ -113,6 +114,7 @@ def save_settings(state_or_dict: Any) -> bool:
             "scan_interval": float(getattr(state, "scan_interval", 0.5)),
             "notify_categories": dict(getattr(state, "notify_categories", DEFAULT_SETTINGS["notify_categories"])),
             "primary_token": str(prim_tok or ""),
+            "use_direct": bool(getattr(state, "use_direct", False)),
         }
     elif isinstance(state_or_dict, dict):
         data = state_or_dict
