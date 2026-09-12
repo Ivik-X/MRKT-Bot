@@ -156,27 +156,51 @@ class AccountPool:
 
             self._slots = new_slots
 
+    def _extract_host(self, proxy: Any) -> Optional[str]:
+        if not proxy:
+            return None
+        if hasattr(proxy, "cfg") and getattr(proxy.cfg, "host", None):
+            return str(proxy.cfg.host).lower().strip()
+        url = getattr(proxy, "url", None)
+        if url:
+            from urllib.parse import urlparse
+            p = urlparse(url)
+            if p.hostname:
+                return str(p.hostname).lower().strip()
+            clean = url.split("://")[-1].split("@")[-1].split("#")[0].split("?")[0]
+            return clean.split(":")[0].lower().strip()
+        return None
+
     def add_reserve_proxies(self, proxies: list[Any]) -> int:
-        """Добавляет новые прокси в горячий резерв без дубликатов."""
+        """Добавляет новые прокси в горячий резерв без пересечения IP."""
         with self._lock:
-            existing_urls = {getattr(s.proxy, "url", None) for s in self._slots if s.proxy}
-            existing_urls.update(getattr(r, "url", None) for r in self._reserve_proxies)
+            seen_hosts = {self._extract_host(s.proxy) for s in self._slots if s.proxy}
+            seen_hosts.update(self._extract_host(r) for r in self._reserve_proxies)
+            seen_hosts.discard(None)
             added = 0
             for p in proxies:
-                p_url = getattr(p, "url", None)
-                if p_url and p_url not in existing_urls:
+                host = self._extract_host(p)
+                if host and host not in seen_hosts:
                     self._reserve_proxies.append(p)
-                    existing_urls.add(p_url)
+                    seen_hosts.add(host)
                     added += 1
             return added
 
     def apply_new_proxies(self, fast_proxies: list[Any]) -> None:
-        """Обновляет активные слоты и горячий резерв свежими быстрыми прокси."""
+        """Обновляет активные слоты и горячий резерв свежими прокси с гарантией уникальности IP."""
         with self._lock:
+            seen_hosts: set[str] = set()
+            unique_proxies: list[Any] = []
+            for p in fast_proxies:
+                host = self._extract_host(p)
+                if host and host not in seen_hosts:
+                    seen_hosts.add(host)
+                    unique_proxies.append(p)
+
             tokens = [s.token for s in self._slots]
             num_needed = max(0, len(tokens) - 1) if self.use_direct else len(tokens)
-            active_proxies = fast_proxies[:num_needed]
-            self._reserve_proxies = list(fast_proxies[num_needed:])
+            active_proxies = unique_proxies[:num_needed]
+            self._reserve_proxies = list(unique_proxies[num_needed:])
 
             new_slots: list[Slot] = []
             if self.use_direct and tokens:

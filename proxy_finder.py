@@ -1,41 +1,63 @@
 """
-proxy_finder.py — Автопоиск, замер пинга и авто-пополнение пула прокси из Proxifly и Databay.
+proxy_finder.py — Автопоиск, замер пинга и авто-пополнение пула прокси.
 
 Источники:
-  1. Databay free-proxy-list (обновляется каждые 5 минут):
+  1. VLESS Reality подписки (быстрые европейские ноды):
+     - Gamededio: https://gamededio.com/v2/5859454259555645444f40 (UA: Happ)
+     - Ecobuy:    https://vpn.ecobuy.ltd/sub/... (UA: v2rayN)
+  2. Databay free-proxy-list (обновляется каждые 5 минут):
      - https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/socks5.txt
      - https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/http.txt
      - https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/socks4.txt
-  2. Proxifly free-proxy-list (обновляется каждые 5 минут):
+  3. Proxifly free-proxy-list (обновляется каждые 5 минут):
      - https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/all/data.json
      - https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/socks5/data.txt
      - https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/https/data.txt
 
 Особенности:
+  - 100% защита от пересечения IP: ни один слот или резерв не разделяет один и тот же IP/хост.
   - Жёсткий фильтр скорости: пинг строго <= 800 мс (всё что выше 800 мс бракуется).
   - Персистентный пул пользовательских прокси (custom_proxies.txt) — сохраняется навсегда
-    и имеет наивысший приоритет над публичными прокси при автопоиске.
+    и имеет наивысший приоритет при автопоиске.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import logging
 import os
+import ssl
 import time
+import urllib.request
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 
 from curl_cffi.requests import AsyncSession
 
-from xray_proxy import SimpleProxy, parse_vless, parse_trojan, parse_ss, XrayProcess, find_xray_binary
+from xray_proxy import (
+    BASE_SOCKS_PORT,
+    SimpleProxy,
+    XrayProcess,
+    find_xray_binary,
+    parse_ss,
+    parse_trojan,
+    parse_vless,
+    ping_proxy_async,
+)
 
 log = logging.getLogger("scanner")
 
-# ── Источники Proxifly ────────────────────────────────────────────────────────
-PROXIFLY_JSON_URL = "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/all/data.json"
-PROXIFLY_SOCKS5_URL = "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/socks5/data.txt"
-PROXIFLY_HTTPS_URL = "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/https/data.txt"
+# ── Подписки VLESS ────────────────────────────────────────────────────────────
+SUB_GAMEDEDIO_URL = "https://gamededio.com/v2/5859454259555645444f40"
+SUB_ECOBUY_URL = (
+    "https://vpn.ecobuy.ltd/sub/"
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+    "eyJpYXQiOjE3ODI1NzA1MTIsImV4cCI6MTc4NTE2MjUxMiwic3ViX2lkIjo5MjgzMDcsImNsaWVudCI6IjNmYzA1M2MyLTY2OTctNDlkYy1hMzU0LTg4ZTM5ZGJjZDQxOCIsInN1YiI6ImU0MGJkMWJhLThlYjgtNGQxMC1iZWIxLWNiNDMyNmRhOTRiZiIsInByb2plY3RfaWQiOjEsImNvdW50cnkiOiJhbGwifQ."
+    "Wb44AxhqgXXKHHzig7TdzKqWWX_AJ6q2mXXBuG-9SVo"
+)
 
 # ── Источники Databay ─────────────────────────────────────────────────────────
 DATABAY_SOCKS5_URL = "https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/socks5.txt"
@@ -45,10 +67,35 @@ DATABAY_HTTP_MIRROR = "https://cdn.jsdelivr.net/gh/databay-labs/free-proxy-list@
 DATABAY_SOCKS4_URL = "https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/socks4.txt"
 DATABAY_SOCKS4_MIRROR = "https://cdn.jsdelivr.net/gh/databay-labs/free-proxy-list@master/socks4.txt"
 
+# ── Источники Proxifly ────────────────────────────────────────────────────────
+PROXIFLY_JSON_URL = "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/all/data.json"
+PROXIFLY_SOCKS5_URL = "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/socks5/data.txt"
+PROXIFLY_HTTPS_URL = "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/https/data.txt"
+
 TEST_ENDPOINT = "https://api.tgmrkt.io/api/v1/gifts/collections"
 MAX_PING_THRESHOLD_MS = 800.0  # Порог отбраковки: не более 800 мс
 
 _replenish_lock = asyncio.Lock()
+
+
+def extract_proxy_host(proxy_or_url: Any) -> str:
+    """
+    Извлекает чистый IP или hostname прокси для проверки на уникальность.
+    Гарантирует, что разные порты одного и того же IP не будут считаться уникальными.
+    """
+    if hasattr(proxy_or_url, "cfg"):
+        host = getattr(proxy_or_url.cfg, "host", None)
+        if host:
+            return str(host).lower().strip()
+
+    url = getattr(proxy_or_url, "url", None) or str(proxy_or_url)
+    p = urlparse(url)
+    if p.hostname:
+        return str(p.hostname).lower().strip()
+
+    # fallback для raw ip:port или user:pass@ip:port
+    clean = url.split("://")[-1].split("@")[-1].split("#")[0].split("?")[0]
+    return clean.split(":")[0].lower().strip()
 
 
 # ─────────────────────────────────────────────
@@ -67,7 +114,6 @@ def load_custom_proxies() -> list[str]:
     """Загружает список сохранённых пользовательских прокси."""
     fpath = get_custom_proxies_file()
     if not fpath.is_file():
-        # Проверяем также корень если искали в data
         if Path("custom_proxies.txt").is_file():
             fpath = Path("custom_proxies.txt")
         else:
@@ -107,7 +153,7 @@ def add_custom_proxies(new_lines: list[str]) -> tuple[int, list[str]]:
     Возвращает (количество добавленных, итоговый список).
     """
     existing = load_custom_proxies()
-    seen = set(existing)
+    seen_ips = {extract_proxy_host(l) for l in existing if extract_proxy_host(l)}
     added = 0
     updated = list(existing)
 
@@ -115,16 +161,14 @@ def add_custom_proxies(new_lines: list[str]) -> tuple[int, list[str]]:
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        # Если прислали просто ip:port без схемы -> делаем socks5h://
         if "://" not in line:
             parts = line.split(":")
-            if len(parts) == 2 and parts[1].isdigit():
-                line = f"socks5h://{line}"
-            elif len(parts) >= 3:
+            if len(parts) >= 2:
                 line = f"socks5h://{line}"
 
-        if line not in seen:
-            seen.add(line)
+        host = extract_proxy_host(line)
+        if host and host not in seen_ips:
+            seen_ips.add(host)
             updated.append(line)
             added += 1
 
@@ -180,21 +224,117 @@ def create_proxy_object(line: str, port_offset: int = 10900) -> Optional[Any]:
 
 
 # ─────────────────────────────────────────────
+#  Загрузка VLESS подписок (Gamededio + Ecobuy)
+# ─────────────────────────────────────────────
+
+def fetch_vless_subscriptions(seen_ips: set[str]) -> list[tuple[str, str, str]]:
+    """
+    Загружает и парсит VLESS Reality узлы из подписок Gamededio и Ecobuy.
+    Фильтрует пересечения IP с уже имеющимися узлами.
+    Возвращает [(vless_url, ip_or_host, remarks), ...]
+    """
+    results: list[tuple[str, str, str]] = []
+    ctx = ssl._create_unverified_context()
+
+    # 1. Gamededio (UA: Happ)
+    try:
+        req = urllib.request.Request(SUB_GAMEDEDIO_URL, headers={"User-Agent": "Happ"})
+        with urllib.request.urlopen(req, timeout=8, context=ctx) as r:
+            data = json.loads(r.read().decode("utf-8"))
+
+        for item in data:
+            rem = item.get("remarks", "").strip()
+            if any(k in rem for k in ("Автовыбор", "Лучший")):
+                continue
+
+            for ob in item.get("outbounds", []):
+                if ob.get("protocol") != "vless":
+                    continue
+                vnext = ob.get("settings", {}).get("vnext", [])
+                if not vnext:
+                    continue
+                node = vnext[0]
+                users = node.get("users", [])
+                if not users:
+                    continue
+                uuid = users[0].get("id")
+                flow = users[0].get("flow", "")
+                addr = str(node.get("address", "")).strip()
+                port = node.get("port")
+                if not addr or not port or addr in seen_ips:
+                    continue
+
+                seen_ips.add(addr.lower())
+                stream = ob.get("streamSettings", {})
+                net = stream.get("network", "tcp")
+                sec = stream.get("security", "none")
+                params = {"type": net}
+                if flow:
+                    params["flow"] = flow
+                if sec in ("tls", "reality"):
+                    params["security"] = sec
+                    sk = "realitySettings" if sec == "reality" else "tlsSettings"
+                    sdata = stream.get(sk, {})
+                    if s := sdata.get("serverName"):
+                        params["sni"] = s
+                    if f := sdata.get("fingerprint"):
+                        params["fp"] = f
+                    if pb := sdata.get("publicKey"):
+                        params["pbk"] = pb
+                    if sid := sdata.get("shortId"):
+                        params["sid"] = sid
+                    if sp := sdata.get("spiderX"):
+                        params["spx"] = sp
+                query = urlencode(params)
+                v_url = f"vless://{uuid}@{addr}:{port}?{query}#{quote(rem)}"
+                results.append((v_url, addr, rem))
+    except Exception as e:
+        log.warning("Ошибка загрузки подписки Gamededio: %s", e)
+
+    # 2. Ecobuy (UA: v2rayN/6.23)
+    try:
+        req = urllib.request.Request(SUB_ECOBUY_URL, headers={"User-Agent": "v2rayN/6.23"})
+        with urllib.request.urlopen(req, timeout=8, context=ctx) as r:
+            raw = r.read().decode("utf-8", errors="ignore").strip()
+        pad = len(raw) % 4
+        if pad:
+            raw += "=" * (4 - pad)
+        decoded = base64.b64decode(raw).decode("utf-8", errors="ignore")
+
+        for line in decoded.splitlines():
+            line = line.strip()
+            if not line or not line.startswith("vless://"):
+                continue
+            p = urlparse(line)
+            host = p.hostname or ""
+            if not host or host.lower() in seen_ips:
+                continue
+            seen_ips.add(host.lower())
+            rem = unquote(p.fragment) if p.fragment else host
+            results.append((line, host, rem))
+    except Exception as e:
+        log.warning("Ошибка загрузки подписки Ecobuy: %s", e)
+
+    log.info("Загружено %d уникальных VLESS нод из подписок", len(results))
+    return results
+
+
+# ─────────────────────────────────────────────
 #  Загрузка кандидатов из Databay и Proxifly
 # ─────────────────────────────────────────────
 
-async def fetch_all_candidates(limit: int = 1200) -> list[tuple[str, str]]:
+async def fetch_all_public_candidates(seen_ips: set[str], limit: int = 1000) -> list[tuple[str, str, str]]:
     """
-    Загружает и объединяет кандидатов из Databay и Proxifly.
-    Возвращает [(proxy_url, display_name), ...], очищенных от дубликатов.
+    Загружает кандидатов из Databay и Proxifly.
+    Строго отбрасывает дубликаты IP, уже присутствующие в seen_ips.
+    Возвращает [(proxy_url, host_ip, display_name), ...]
     """
-    candidates: list[tuple[str, str]] = []
-    seen: set[str] = set()
+    candidates: list[tuple[str, str, str]] = []
 
     async with AsyncSession(impersonate="chrome124", verify=False) as s:
-        # 1. Proxifly JSON (с метаданными стран и протоколов)
+        # 1. Proxifly JSON
         try:
-            r = await s.get(PROXIFLY_JSON_URL, timeout=7.0)
+            r = await s.get(PROXIFLY_JSON_URL, timeout=6.0)
             if r.status_code == 200:
                 for item in r.json():
                     proto = item.get("protocol")
@@ -202,32 +342,33 @@ async def fetch_all_candidates(limit: int = 1200) -> list[tuple[str, str]]:
                     port = item.get("port")
                     if not ip or not port:
                         continue
-                    key = f"{ip}:{port}"
-                    if key in seen:
+                    ip_clean = str(ip).lower().strip()
+                    if ip_clean in seen_ips:
                         continue
-                    seen.add(key)
+                    seen_ips.add(ip_clean)
                     country = item.get("geolocation", {}).get("country", "XX")
                     if proto == "socks5":
-                        candidates.append((f"socks5h://{ip}:{port}", f"SOCKS5-{country}:{port}"))
+                        candidates.append((f"socks5h://{ip}:{port}", ip_clean, f"SOCKS5-{country}:{port}"))
                     elif proto in ("http", "https"):
-                        candidates.append((f"http://{ip}:{port}", f"HTTP-{country}:{port}"))
+                        candidates.append((f"http://{ip}:{port}", ip_clean, f"HTTP-{country}:{port}"))
         except Exception as e:
-            log.warning("Не удалось загрузить Proxifly JSON: %s", e)
+            log.warning("Ошибка загрузки Proxifly JSON: %s", e)
 
         # 2. Databay SOCKS5
         for url in (DATABAY_SOCKS5_URL, DATABAY_SOCKS5_MIRROR):
             try:
-                r = await s.get(url, timeout=6.0)
+                r = await s.get(url, timeout=5.0)
                 if r.status_code == 200:
                     for line in r.text.splitlines():
                         line = line.strip()
                         if not line or ":" not in line or line.startswith("#"):
                             continue
-                        if line in seen:
+                        ip_clean = line.split(":")[0].lower().strip()
+                        if ip_clean in seen_ips:
                             continue
-                        seen.add(line)
+                        seen_ips.add(ip_clean)
                         port = line.split(":")[-1]
-                        candidates.append((f"socks5h://{line}", f"DATABAY-SOCKS5:{port}"))
+                        candidates.append((f"socks5h://{line}", ip_clean, f"DATABAY-SOCKS5:{port}"))
                     break
             except Exception:
                 pass
@@ -235,17 +376,18 @@ async def fetch_all_candidates(limit: int = 1200) -> list[tuple[str, str]]:
         # 3. Databay HTTP
         for url in (DATABAY_HTTP_URL, DATABAY_HTTP_MIRROR):
             try:
-                r = await s.get(url, timeout=6.0)
+                r = await s.get(url, timeout=5.0)
                 if r.status_code == 200:
                     for line in r.text.splitlines():
                         line = line.strip()
                         if not line or ":" not in line or line.startswith("#"):
                             continue
-                        if line in seen:
+                        ip_clean = line.split(":")[0].lower().strip()
+                        if ip_clean in seen_ips:
                             continue
-                        seen.add(line)
+                        seen_ips.add(ip_clean)
                         port = line.split(":")[-1]
-                        candidates.append((f"http://{line}", f"DATABAY-HTTP:{port}"))
+                        candidates.append((f"http://{line}", ip_clean, f"DATABAY-HTTP:{port}"))
                     break
             except Exception:
                 pass
@@ -259,39 +401,17 @@ async def fetch_all_candidates(limit: int = 1200) -> list[tuple[str, str]]:
                         line = line.strip()
                         if not line or ":" not in line or line.startswith("#"):
                             continue
-                        if line in seen:
+                        ip_clean = line.split(":")[0].lower().strip()
+                        if ip_clean in seen_ips:
                             continue
-                        seen.add(line)
+                        seen_ips.add(ip_clean)
                         port = line.split(":")[-1]
-                        candidates.append((f"socks4://{line}", f"DATABAY-SOCKS4:{port}"))
+                        candidates.append((f"socks4://{line}", ip_clean, f"DATABAY-SOCKS4:{port}"))
                     break
             except Exception:
                 pass
 
-        # 5. Резервные Proxifly текстовые списки
-        if len(candidates) < 100:
-            for purl, proto, prefix in [
-                (PROXIFLY_SOCKS5_URL, "socks5h", "SOCKS5"),
-                (PROXIFLY_HTTPS_URL, "http", "HTTPS"),
-            ]:
-                try:
-                    r = await s.get(purl, timeout=5.0)
-                    if r.status_code == 200:
-                        for line in r.text.splitlines():
-                            line = line.strip()
-                            if not line or line.startswith("#"):
-                                continue
-                            raw = line.split("://")[-1]
-                            if raw in seen:
-                                continue
-                            seen.add(raw)
-                            port = raw.split(":")[-1]
-                            target = f"{proto}://{raw}"
-                            candidates.append((target, f"{prefix}:{port}"))
-                except Exception:
-                    pass
-
-    log.info("Собрано %d уникальных прокси-кандидатов из Databay и Proxifly", len(candidates))
+    log.info("Собрано %d уникальных публичных прокси из Databay и Proxifly", len(candidates))
     return candidates[:limit]
 
 
@@ -309,7 +429,7 @@ async def ping_candidate_under_threshold(
     Проверяет прокси к api.tgmrkt.io.
     Строго бракует любые серверы с задержкой > max_ping_ms (800 мс).
     """
-    timeout_sec = (max_ping_ms / 1000.0) + 0.15  # Обрываем сразу при превышении 800мс
+    timeout_sec = (max_ping_ms / 1000.0) + 0.15
     async with sem:
         t0 = time.monotonic()
         try:
@@ -327,6 +447,36 @@ async def ping_candidate_under_threshold(
         return None
 
 
+async def ping_vless_node(
+    url: str,
+    name: str,
+    port: int,
+    xbin: str,
+    sem: asyncio.Semaphore,
+    max_ping_ms: float = MAX_PING_THRESHOLD_MS,
+) -> Optional[tuple[Any, float]]:
+    """Пингует VLESS ноду через Xray. Возвращает (XrayProcess, latency_ms) или None."""
+    async with sem:
+        cfg = parse_vless(url, port)
+        proc = XrayProcess(cfg, xbin)
+        timeout_sec = (max_ping_ms / 1000.0) + 0.2
+        try:
+            proc.start()
+            ok, lat, _ = await ping_proxy_async(proc, timeout=timeout_sec)
+            if ok and lat <= max_ping_ms:
+                proc.ping_ms = lat
+                return (proc, lat)
+            else:
+                proc.stop()
+                return None
+        except Exception:
+            try:
+                proc.stop()
+            except Exception:
+                pass
+            return None
+
+
 async def ping_custom_proxy(
     line: str,
     index: int,
@@ -339,15 +489,12 @@ async def ping_custom_proxy(
         if not p_obj:
             return None
 
-        # Проверяем пинг
-        from xray_proxy import ping_proxy_async
         timeout_sec = (max_ping_ms / 1000.0) + 0.2
         ok, latency, _ = await ping_proxy_async(p_obj, timeout=timeout_sec)
         if ok and latency <= max_ping_ms:
             p_obj.ping_ms = latency
             return (p_obj, latency)
         else:
-            # Если отбракован или ошибка, останавливаем процесс если это Xray
             if hasattr(p_obj, "stop"):
                 try:
                     p_obj.stop()
@@ -357,7 +504,7 @@ async def ping_custom_proxy(
 
 
 # ─────────────────────────────────────────────
-#  Поиск быстрейших прокси с интеграцией Custom
+#  Комплексный автопоиск с защитой от пересечения IP
 # ─────────────────────────────────────────────
 
 async def find_fastest_proxies(
@@ -368,57 +515,82 @@ async def find_fastest_proxies(
     include_custom: bool = True,
 ) -> tuple[list[Any], list[Any], int]:
     """
-    Выполняет комплексный поиск:
-      1. Загружает и пингует пользовательские прокси (они имеют наивысший приоритет).
-      2. Скачивает и параллельно пингует кандидатов из Databay + Proxifly (строго <= 800 мс).
-      3. Возвращает (active_proxies, reserve_proxies, total_tested_candidates).
+    Выполняет поиск прокси по всем источникам с гарантией уникальности IP:
+      1. Проверяет пользовательские прокси (custom_proxies.txt) — высший приоритет.
+      2. Проверяет VLESS Reality ноды из подписок Gamededio и Ecobuy.
+      3. Скачивает и параллельно пингует кандидатов из Databay + Proxifly.
+      4. Все серверы строго <= 800 мс и без пересечения IP-адресов.
     """
     sem = asyncio.Semaphore(concurrency)
+    seen_ips: set[str] = set()
+
     custom_working: list[Any] = []
+    vless_working: list[Any] = []
+    public_working: list[SimpleProxy] = []
 
     # 1. Проверяем сохранённые пользовательские прокси
     if include_custom:
         custom_lines = load_custom_proxies()
         if custom_lines:
-            log.info("Проверка %d пользовательских прокси...", len(custom_lines))
             c_tasks = [ping_custom_proxy(l, idx, sem, max_ping_ms) for idx, l in enumerate(custom_lines)]
             c_results = await asyncio.gather(*c_tasks)
             for res in c_results:
                 if res is not None:
                     p_obj, lat = res
-                    # Помечаем имя как [Пользовательский]
-                    if hasattr(p_obj, "cfg") and not p_obj.cfg.name.startswith("⭐"):
-                        p_obj.cfg.name = f"⭐ {p_obj.cfg.name}"
-                    custom_working.append(p_obj)
+                    host = extract_proxy_host(p_obj)
+                    if host and host not in seen_ips:
+                        seen_ips.add(host)
+                        if hasattr(p_obj, "cfg") and not p_obj.cfg.name.startswith("⭐"):
+                            p_obj.cfg.name = f"⭐ {p_obj.cfg.name}"
+                        custom_working.append(p_obj)
             custom_working.sort(key=lambda p: getattr(p, "ping_ms", 9999))
-            log.info("Пользовательских прокси подошло: %d из %d", len(custom_working), len(custom_lines))
 
-    # 2. Скачиваем кандидатов из Databay и Proxifly
-    candidates = await fetch_all_candidates(limit=max_candidates)
-    total_candidates = len(candidates)
+    # 2. Проверяем VLESS ноды из подписок Gamededio и Ecobuy
+    xbin = find_xray_binary()
+    vless_candidates = fetch_vless_subscriptions(seen_ips)
+    if xbin and vless_candidates:
+        v_tasks = [
+            ping_vless_node(u, rem, 10910 + i, xbin, sem, max_ping_ms)
+            for i, (u, host, rem) in enumerate(vless_candidates[:25])
+        ]
+        v_results = await asyncio.gather(*v_tasks)
+        for res in v_results:
+            if res is not None:
+                proc, lat = res
+                host = extract_proxy_host(proc)
+                if host and host not in seen_ips:
+                    seen_ips.add(host)
+                    vless_working.append(proc)
+        vless_working.sort(key=lambda p: p.ping_ms)
+        log.info("VLESS нод подошло (<= %.0f мс): %d", max_ping_ms, len(vless_working))
 
-    public_working: list[SimpleProxy] = []
-    if candidates:
-        tasks = [ping_candidate_under_threshold(u, n, sem, max_ping_ms) for u, n in candidates]
+    # 3. Скачиваем и пингуем кандидатов из Databay и Proxifly
+    public_candidates = await fetch_all_public_candidates(seen_ips, limit=max_candidates)
+    total_candidates = len(vless_candidates) + len(public_candidates)
+
+    if public_candidates:
+        tasks = [ping_candidate_under_threshold(u, n, sem, max_ping_ms) for u, host, n in public_candidates]
         results = await asyncio.gather(*tasks)
         working_tuples = [r for r in results if r is not None]
-        working_tuples.sort(key=lambda x: x[2])  # сортировка по ms
+        working_tuples.sort(key=lambda x: x[2])
 
         for url, name, lat in working_tuples[:max_results]:
-            sp = SimpleProxy(f"{url}#{name}", name=name, ping_ms=lat)
-            public_working.append(sp)
+            host = extract_proxy_host(url)
+            if host and host not in seen_ips:
+                seen_ips.add(host)
+                sp = SimpleProxy(f"{url}#{name}", name=name, ping_ms=lat)
+                public_working.append(sp)
 
         log.info(
-            "Публичных прокси подошло (<= %.0f мс): %d из %d (топ: %.0f мс)",
+            "Публичных прокси подошло (<= %.0f мс): %d (топ: %.0f мс)",
             max_ping_ms,
             len(public_working),
-            len(candidates),
             public_working[0].ping_ms if public_working else 0,
         )
 
-    # 3. Объединяем: custom_working идут в самом начале!
-    combined_proxies = custom_working + public_working
-    return custom_working, public_working, total_candidates
+    # 4. Объединяем: Пользовательские -> VLESS подписки -> Databay/Proxifly
+    all_fast = custom_working + vless_working + public_working
+    return custom_working, vless_working + public_working, total_candidates
 
 
 def save_proxies_to_file(
@@ -428,40 +600,42 @@ def save_proxies_to_file(
     file_path: str = "proxies.txt",
 ) -> None:
     """
-    Сохраняет активные и резервные прокси в proxies.txt, сохраняя
-    пользовательские конфигурации и разделы.
+    Сохраняет активные и резервные прокси в proxies.txt с дедупликацией IP.
     """
     try:
         lines = [
-            "# MRKT Scanner Proxy Pool (Databay + Proxifly + Custom)",
+            "# MRKT Scanner Proxy Pool (Gamededio + Ecobuy + Databay + Proxifly + Custom)",
             f"# Обновлено: {time.strftime('%Y-%m-%d %H:%M:%S')}",
         ]
         if use_direct:
             lines.append("USE_DIRECT=true")
         lines.append("")
 
-        seen_urls = set()
+        seen_hosts = set()
 
-        # Записываем активные прокси
+        # Активные
         lines.append("# ── Активные прокси ──")
         for p in active_proxies:
             url = getattr(p, "url", None)
             if not url and hasattr(p, "cfg"):
                 url = getattr(p.cfg, "url", None)
-            if url and url not in seen_urls:
-                seen_urls.add(url)
+            host = extract_proxy_host(p)
+            if url and host not in seen_hosts:
+                seen_hosts.add(host)
                 name = getattr(p.cfg, "name", "")
                 suffix = f"#{name}" if name and "#" not in url else ""
                 lines.append(f"{url}{suffix}")
 
         lines.append("")
+        # Резервные
         lines.append("# ── Горячий резерв ──")
         for p in reserve_proxies:
             url = getattr(p, "url", None)
             if not url and hasattr(p, "cfg"):
                 url = getattr(p.cfg, "url", None)
-            if url and url not in seen_urls:
-                seen_urls.add(url)
+            host = extract_proxy_host(p)
+            if url and host not in seen_hosts:
+                seen_hosts.add(host)
                 name = getattr(p.cfg, "name", "")
                 suffix = f"#{name}" if name and "#" not in url else ""
                 lines.append(f"{url}{suffix}")
@@ -470,15 +644,14 @@ def save_proxies_to_file(
         target.parent.mkdir(parents=True, exist_ok=True)
         with open(target, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
-        log.info("Сохранено %d активных и %d резервных прокси в %s", len(active_proxies), len(reserve_proxies), file_path)
+        log.info("Сохранено %d активных и %d резервных прокси в %s (уникальных IP: %d)", len(active_proxies), len(reserve_proxies), file_path, len(seen_hosts))
     except Exception as e:
         log.error("Ошибка записи в %s: %s", file_path, e)
 
 
 async def auto_replenish_background(pool: Any) -> int:
     """
-    Фоновое пополнение горячего резерва прокси (<= 800 мс), если он истощился.
-    Запускается как background task без блокировки сканера.
+    Фоновое пополнение горячего резерва (<= 800 мс) с проверкой уникальности IP.
     """
     if _replenish_lock.locked():
         return 0
@@ -487,21 +660,21 @@ async def auto_replenish_background(pool: Any) -> int:
         if pool and len(getattr(pool, "_reserve_proxies", [])) >= 5:
             return 0
 
-        log.info("🔄 Фоновое пополнение резерва прокси (Databay + Proxifly, <= 800 мс)...")
+        log.info("🔄 Фоновое пополнение резерва прокси (<= 800 мс, уникальные IP)...")
         try:
-            _, public_fast, _ = await find_fastest_proxies(
+            _, fast_new, _ = await find_fastest_proxies(
                 max_candidates=400,
                 max_ping_ms=MAX_PING_THRESHOLD_MS,
                 concurrency=90,
                 max_results=20,
                 include_custom=False,
             )
-            if not public_fast or not pool:
+            if not fast_new or not pool:
                 return 0
 
-            added = pool.add_reserve_proxies(public_fast)
+            added = pool.add_reserve_proxies(fast_new)
             log.info("✅ Горячий резерв пополнен: +%d прокси (всего в резерве: %d)", added, len(pool._reserve_proxies))
             return added
         except Exception as err:
-            log.warning("Ошибка фонового пополнения резерва прокси: %s", err)
+            log.warning("Ошибка фонового пополнения резерва: %s", err)
             return 0
