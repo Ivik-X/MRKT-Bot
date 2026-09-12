@@ -200,7 +200,33 @@ class AccountPool:
             tokens = [s.token for s in self._slots]
             num_needed = max(0, len(tokens) - 1) if self.use_direct else len(tokens)
             active_proxies = unique_proxies[:num_needed]
-            self._reserve_proxies = list(unique_proxies[num_needed:])
+
+            # 1. Новые найденные сверх нужного количества идут в горячий резерв
+            new_reserve: list[Any] = list(unique_proxies[num_needed:])
+
+            # 2. Сохраняем ранее работавшие прокси из резерва (если IP не пересекается)
+            for old_r in self._reserve_proxies:
+                host = self._extract_host(old_r)
+                if host and host not in seen_hosts:
+                    seen_hosts.add(host)
+                    new_reserve.append(old_r)
+
+            # 3. Сохраняем ранее работавшие прокси из заменяемых слотов (если IP не пересекается)
+            for s in self._slots:
+                if s.proxy:
+                    host = self._extract_host(s.proxy)
+                    if host and host not in seen_hosts:
+                        seen_hosts.add(host)
+                        new_reserve.append(s.proxy)
+
+            # Держим до 25 прокси в резерве, лишние останавливаем
+            self._reserve_proxies = new_reserve[:25]
+            for extra in new_reserve[25:]:
+                if hasattr(extra, "stop"):
+                    try:
+                        extra.stop()
+                    except Exception:
+                        pass
 
             new_slots: list[Slot] = []
             if self.use_direct and tokens:

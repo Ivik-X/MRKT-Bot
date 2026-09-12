@@ -1132,8 +1132,14 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
                 lat_str = f" | ⚡ <code>{lat:.0f} мс</code>" if lat > 0 else ""
                 lines.append(f"{i}. <b>[{p.cfg.name}]</b>{lat_str}")
             if reserves:
-                lines.append(f"\n📦 <i>В горячем резерве (авто-замена при сбоях): <b>{len(reserves)}</b> шт.</i>")
-            lines.append("\n💡 <i>Нажмите «🔍 Автопоиск», чтобы спарсить свежие прокси из Proxifly и отобрать топ с наименьшим пингом.</i>")
+                lines.append(f"\n📦 <b>В горячем резерве:</b> <code>{len(reserves)}</code> шт. (авто-замена при сбоях):")
+                for idx, r in enumerate(reserves[:6], 1):
+                    r_lat = getattr(r, "ping_ms", 0)
+                    r_lat_str = f" | ⚡ <code>{r_lat:.0f} мс</code>" if r_lat > 0 else ""
+                    lines.append(f"  • <b>[{r.cfg.name}]</b>{r_lat_str}")
+                if len(reserves) > 6:
+                    lines.append(f"  • <i>... и ещё {len(reserves) - 6} в резерве</i>")
+            lines.append("\n💡 <i>Нажмите «🔍 Автопоиск», чтобы спарсить свежие прокси и отобрать топ с наименьшим пингом.</i>")
             text = "\n".join(lines)
 
         await cb.message.edit_text(text, reply_markup=proxies_keyboard(), parse_mode="HTML")

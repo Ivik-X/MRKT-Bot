@@ -28,6 +28,7 @@ import base64
 import json
 import logging
 import os
+import socket
 import ssl
 import time
 import urllib.request
@@ -49,6 +50,29 @@ from xray_proxy import (
 )
 
 log = logging.getLogger("scanner")
+
+_allocated_ports: set[int] = set()
+
+
+def allocate_local_port(start_port: int = 11000) -> int:
+    """Выделяет гарантированно свободный локальный порт TCP для запуска Xray."""
+    port = max(start_port, 11000)
+    while port < 60000:
+        if port not in _allocated_ports:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                try:
+                    s.bind(("127.0.0.1", port))
+                    _allocated_ports.add(port)
+                    return port
+                except OSError:
+                    pass
+        port += 1
+    return 10999
+
+
+def release_local_port(port: int) -> None:
+    """Освобождает порт из реестра."""
+    _allocated_ports.discard(port)
 
 # ── Подписки VLESS ────────────────────────────────────────────────────────────
 SUB_GAMEDEDIO_URL = "https://gamededio.com/v2/5859454259555645444f40"
@@ -240,7 +264,7 @@ def fetch_vless_subscriptions(exclude_ips: Optional[set[str]] = None) -> list[tu
     # 1. Gamededio (UA: Happ)
     try:
         req = urllib.request.Request(SUB_GAMEDEDIO_URL, headers={"User-Agent": "Happ"})
-        with urllib.request.urlopen(req, timeout=8, context=ctx) as r:
+        with urllib.request.urlopen(req, timeout=12, context=ctx) as r:
             data = json.loads(r.read().decode("utf-8"))
 
         for item in data:
@@ -295,7 +319,7 @@ def fetch_vless_subscriptions(exclude_ips: Optional[set[str]] = None) -> list[tu
     # 2. Ecobuy (UA: v2rayN/6.23)
     try:
         req = urllib.request.Request(SUB_ECOBUY_URL, headers={"User-Agent": "v2rayN/6.23"})
-        with urllib.request.urlopen(req, timeout=8, context=ctx) as r:
+        with urllib.request.urlopen(req, timeout=12, context=ctx) as r:
             raw = r.read().decode("utf-8", errors="ignore").strip()
         pad = len(raw) % 4
         if pad:
@@ -474,12 +498,14 @@ async def ping_vless_node(
                     proc.stop()
                 except Exception:
                     pass
+                release_local_port(port)
                 return None
         except Exception:
             try:
                 proc.stop()
             except Exception:
                 pass
+            release_local_port(port)
             return None
 
 
@@ -491,8 +517,10 @@ async def ping_custom_proxy(
 ) -> Optional[tuple[Any, float]]:
     """Пингует пользовательский прокси. Возвращает (proxy_obj, latency_ms) или None."""
     async with sem:
-        p_obj = create_proxy_object(line, port_offset=10950 + index)
+        port = allocate_local_port()
+        p_obj = create_proxy_object(line, port_offset=port)
         if not p_obj:
+            release_local_port(port)
             return None
 
         timeout_sec = max(2.5, (max_ping_ms / 1000.0) + 0.5)
@@ -506,6 +534,7 @@ async def ping_custom_proxy(
                     p_obj.stop()
                 except Exception:
                     pass
+            release_local_port(port)
             return None
 
 
@@ -519,6 +548,7 @@ async def find_fastest_proxies(
     concurrency: int = 120,
     max_results: int = 40,
     include_custom: bool = True,
+    exclude_ips: Optional[set[str]] = None,
 ) -> tuple[list[Any], list[Any], int]:
     """
     Выполняет поиск прокси по всем источникам с гарантией уникальности IP:
@@ -528,7 +558,7 @@ async def find_fastest_proxies(
       4. Все серверы строго <= 800 мс и без пересечения IP-адресов.
     """
     sem = asyncio.Semaphore(concurrency)
-    assigned_ips: set[str] = set()
+    assigned_ips: set[str] = set(exclude_ips or set())
 
     custom_working: list[Any] = []
     vless_working: list[Any] = []
@@ -549,6 +579,12 @@ async def find_fastest_proxies(
                         if hasattr(p_obj, "cfg") and not p_obj.cfg.name.startswith("⭐"):
                             p_obj.cfg.name = f"⭐ {p_obj.cfg.name}"
                         custom_working.append(p_obj)
+                    else:
+                        if hasattr(p_obj, "stop"):
+                            try:
+                                p_obj.stop()
+                            except Exception:
+                                pass
             custom_working.sort(key=lambda p: getattr(p, "ping_ms", 9999))
 
     # 2. Проверяем VLESS ноды из подписок Gamededio и Ecobuy
@@ -556,8 +592,8 @@ async def find_fastest_proxies(
     vless_candidates = fetch_vless_subscriptions(exclude_ips=assigned_ips)
     if xbin and vless_candidates:
         v_tasks = [
-            ping_vless_node(u, rem, 10910 + i, xbin, sem, max_ping_ms)
-            for i, (u, host, rem) in enumerate(vless_candidates[:25])
+            ping_vless_node(u, rem, allocate_local_port(), xbin, sem, max_ping_ms)
+            for u, host, rem in vless_candidates[:25]
         ]
         v_results = await asyncio.gather(*v_tasks)
         for res in v_results:
@@ -572,6 +608,8 @@ async def find_fastest_proxies(
                         proc.stop()
                     except Exception:
                         pass
+                    if hasattr(proc, "cfg") and hasattr(proc.cfg, "local_port"):
+                        release_local_port(proc.cfg.local_port)
         vless_working.sort(key=lambda p: p.ping_ms)
         log.info("VLESS нод подошло (<= %.0f мс): %d", max_ping_ms, len(vless_working))
 
@@ -674,17 +712,29 @@ async def auto_replenish_background(pool: Any) -> int:
 
         log.info("🔄 Фоновое пополнение резерва прокси (<= 800 мс, уникальные IP)...")
         try:
+            current_ips: set[str] = set()
+            if pool:
+                current_ips.update(pool._extract_host(s.proxy) for s in pool._slots if s.proxy)
+                current_ips.update(pool._extract_host(r) for r in pool._reserve_proxies)
+                current_ips.discard(None)
+
             _, fast_new, _ = await find_fastest_proxies(
                 max_candidates=400,
                 max_ping_ms=MAX_PING_THRESHOLD_MS,
                 concurrency=90,
                 max_results=20,
                 include_custom=False,
+                exclude_ips=current_ips,
             )
             if not fast_new or not pool:
                 return 0
 
             added = pool.add_reserve_proxies(fast_new)
+            save_proxies_to_file(
+                pool.get_proxies(),
+                getattr(pool, "_reserve_proxies", []),
+                use_direct=getattr(pool, "use_direct", False),
+            )
             log.info("✅ Горячий резерв пополнен: +%d прокси (всего в резерве: %d)", added, len(pool._reserve_proxies))
             return added
         except Exception as err:
