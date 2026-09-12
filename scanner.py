@@ -498,14 +498,26 @@ async def api_request_async(
         except Exception as e:
             elapsed = time.monotonic() - t0
             err_name = type(e).__name__
-            if "Timeout" in err_name or "timed out" in str(e).lower():
+            is_proxy_err = (
+                "Timeout" in err_name
+                or "timed out" in str(e).lower()
+                or "Proxy" in err_name
+                or "Connection" in err_name
+                or "Certificate" in err_name
+            )
+            if is_proxy_err and slot.proxy is not None:
                 needs_replace = slot.record_timeout()
                 if needs_replace:
                     new_prx = pool.replace_slot_proxy(slot)
                     if new_prx:
-                        log.warning("⚠️ Слот [%s] таймаут — заменён [%s]", slot.token[:8], new_prx.cfg.name)
+                        log.warning("⚠️ Слот [%s] сбой прокси — заменён на [%s]", slot.token[:8], getattr(new_prx.cfg, "name", "proxy"))
+                        if len(getattr(pool, "_reserve_proxies", [])) < 3:
+                            from proxy_finder import auto_replenish_background
+                            asyncio.create_task(auto_replenish_background(pool))
                     else:
-                        log.warning("⚠️ Слот [%s] таймаут — отключён", slot.label)
+                        log.warning("⚠️ Слот [%s] сбой прокси — резерв пуст", slot.label)
+                        from proxy_finder import auto_replenish_background
+                        asyncio.create_task(auto_replenish_background(pool))
             if "429" in str(e):
                 pool.penalize(slot, PENALTY_429)
                 log.warning("429 (из исключения) | слот: %s | штраф: %.0fс", slot.label, PENALTY_429)

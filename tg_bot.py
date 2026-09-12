@@ -258,6 +258,7 @@ def proxies_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="⚡ Перепроверить пинг", callback_data="proxies_reping")],
+            [InlineKeyboardButton(text="🔍 Автопоиск быстрых прокси", callback_data="proxies_autosearch")],
             [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="nav_main")],
         ]
     )
@@ -1108,14 +1109,26 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
     # ── Раздел: Прокси и Пинг ────────────────────────────────────────────
     @dp.callback_query(F.data == "nav_proxies")
     async def cb_nav_proxies(cb: CallbackQuery):
-        proxies = scanner_state.pool.get_proxies() if scanner_state.pool else []
-        if not proxies:
-            text = "🌐 <b>Прокси</b>\n\nПрокси не используются (прямое подключение direct)."
+        pool = scanner_state.pool
+        proxies = pool.get_proxies() if pool else []
+        reserves = getattr(pool, "_reserve_proxies", []) if pool else []
+        direct_str = " (Слот #1 напрямую с IP сервера)" if getattr(scanner_state, "use_direct", False) else ""
+        if not proxies and not reserves:
+            text = (
+                f"🌐 <b>Прокси</b>{direct_str}\n\n"
+                f"Прокси сейчас не назначены.\n"
+                f"Нажмите <b>«🔍 Автопоиск быстрых прокси»</b> для автоматического скачивания, "
+                f"замера пинга и наполнения активных слотов и резерва."
+            )
         else:
-            lines = [f"🌐 <b>Активные прокси в пуле</b> (Всего: <code>{len(proxies)}</code>):\n"]
+            lines = [f"🌐 <b>Прокси в пуле</b> (Активных: <code>{len(proxies)}</code>, Резерв: <code>{len(reserves)}</code>){direct_str}:\n"]
             for i, p in enumerate(proxies, 1):
-                lines.append(f"{i}. <b>[{p.cfg.name}]</b> → <code>127.0.0.1:{p.cfg.local_port}</code>")
-            lines.append("\n💡 <i>Нажмите «Перепроверить пинг» для замера задержки к api.tgmrkt.io.</i>")
+                lat = getattr(p, "ping_ms", 0)
+                lat_str = f" | ⚡ <code>{lat:.0f} мс</code>" if lat > 0 else ""
+                lines.append(f"{i}. <b>[{p.cfg.name}]</b>{lat_str}")
+            if reserves:
+                lines.append(f"\n📦 <i>В горячем резерве (авто-замена при сбоях): <b>{len(reserves)}</b> шт.</i>")
+            lines.append("\n💡 <i>Нажмите «🔍 Автопоиск», чтобы спарсить свежие прокси из Proxifly и отобрать топ с наименьшим пингом.</i>")
             text = "\n".join(lines)
 
         await cb.message.edit_text(text, reply_markup=proxies_keyboard(), parse_mode="HTML")
@@ -1128,7 +1141,6 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
             await cb.answer("Прокси нет", show_alert=True)
             return
 
-
         await cb.answer("⚡ Замеряем пинг прокси...")
         await cb.message.edit_text("⏳ <i>Замер пинга всех прокси к api.tgmrkt.io...</i>", parse_mode="HTML")
 
@@ -1139,6 +1151,72 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
         for p, (ok, lat, err) in zip(proxies, results):
             status = f"⚡ <code>{lat:.0f} мс</code> (OK)" if ok else f"❌ {err}"
             lines.append(f"• <b>[{p.cfg.name}]</b>: {status}")
+
+        await cb.message.edit_text("\n".join(lines), reply_markup=proxies_keyboard(), parse_mode="HTML")
+
+    @dp.callback_query(F.data == "proxies_autosearch")
+    async def cb_proxies_autosearch(cb: CallbackQuery):
+        pool = scanner_state.pool
+        if not pool:
+            await cb.answer("Пул аккаунтов не инициализирован", show_alert=True)
+            return
+
+        await cb.answer("🔍 Запущен автопоиск прокси...")
+        await cb.message.edit_text(
+            "⏳ <b>Автопоиск и замер быстрых прокси...</b>\n\n"
+            "• Скачиваем актуальную базу Proxifly (SOCKS5 / HTTP)...\n"
+            "• Параллельно замеряем пинг каждого кандидата к <code>api.tgmrkt.io</code>...\n"
+            "• Отбираем самые быстрые европейские и мировые серверы...\n\n"
+            "<i>Обычно это занимает 10-15 секунд, пожалуйста подождите...</i>",
+            parse_mode="HTML",
+        )
+
+        from proxy_finder import find_fastest_proxies, save_proxies_to_file
+
+        try:
+            fast_proxies = await find_fastest_proxies(
+                max_candidates=500,
+                timeout=2.5,
+                concurrency=100,
+                max_results=35,
+            )
+        except Exception as e:
+            await cb.message.edit_text(
+                f"❌ <b>Ошибка при автопоиске:</b> {e}",
+                reply_markup=proxies_keyboard(),
+                parse_mode="HTML",
+            )
+            return
+
+        if not fast_proxies:
+            await cb.message.edit_text(
+                "⚠️ <b>Ни один публичный прокси не ответил на запросы к api.tgmrkt.io.</b>\n"
+                "Попробуйте повторить поиск через пару минут или используйте свои приватные прокси.",
+                reply_markup=proxies_keyboard(),
+                parse_mode="HTML",
+            )
+            return
+
+        # Применяем найденные прокси в активные слоты и горячий резерв
+        pool.apply_new_proxies(fast_proxies)
+        save_proxies_to_file(fast_proxies, use_direct=scanner_state.use_direct)
+
+        active_count = len(pool.get_proxies())
+        reserve_count = len(getattr(pool, "_reserve_proxies", []))
+        best_ms = fast_proxies[0].ping_ms
+
+        lines = [
+            f"✅ <b>Автопоиск завершён успешно!</b>\n",
+            f"🎯 Найдено рабочих прокси: <b>{len(fast_proxies)}</b> шт.",
+            f"⚡ Лучший пинг: <code>{best_ms:.0f} мс</code>",
+            f"🟢 Назначено в активные слоты: <b>{active_count}</b>",
+            f"📦 В горячем резерве (авто-замена): <b>{reserve_count}</b>\n",
+            "<b>Топ самых быстрых серверов:</b>",
+        ]
+        for rank, p in enumerate(fast_proxies[:5], 1):
+            lines.append(f"{rank}. <b>[{p.cfg.name}]</b> — <code>{p.ping_ms:.0f} мс</code>")
+
+        lines.append("\n💡 <i>При сбое любого активного слота бот автоматически подменит его следующим быстрым прокси из резерва.</i>")
 
         await cb.message.edit_text("\n".join(lines), reply_markup=proxies_keyboard(), parse_mode="HTML")
 

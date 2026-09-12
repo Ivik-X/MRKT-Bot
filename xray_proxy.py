@@ -168,13 +168,13 @@ class SimpleProxy:
     Прямой SOCKS5 / HTTP / HTTPS прокси.
     Работает нативно через curl_cffi без запуска сторонних Xray процессов.
     """
-    def __init__(self, url: str):
+    def __init__(self, url: str, name: str = "", ping_ms: float = 0.0):
         self.url = url
         p = urlparse(url)
-        self.name = unquote(p.fragment) if p.fragment else f"{p.scheme}://{p.hostname}:{p.port}"
+        self.name = name or (unquote(p.fragment) if p.fragment else f"{p.scheme}://{p.hostname}:{p.port}")
         clean = p._replace(fragment="")
         self.proxy_url = clean.geturl()
-        self.ping_ms: float = 0.0
+        self.ping_ms: float = ping_ms
         from types import SimpleNamespace
         self.cfg = SimpleNamespace(name=self.name, local_port=p.port or 0)
 

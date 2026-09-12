@@ -156,6 +156,41 @@ class AccountPool:
 
             self._slots = new_slots
 
+    def add_reserve_proxies(self, proxies: list[Any]) -> int:
+        """Добавляет новые прокси в горячий резерв без дубликатов."""
+        with self._lock:
+            existing_urls = {getattr(s.proxy, "url", None) for s in self._slots if s.proxy}
+            existing_urls.update(getattr(r, "url", None) for r in self._reserve_proxies)
+            added = 0
+            for p in proxies:
+                p_url = getattr(p, "url", None)
+                if p_url and p_url not in existing_urls:
+                    self._reserve_proxies.append(p)
+                    existing_urls.add(p_url)
+                    added += 1
+            return added
+
+    def apply_new_proxies(self, fast_proxies: list[Any]) -> None:
+        """Обновляет активные слоты и горячий резерв свежими быстрыми прокси."""
+        with self._lock:
+            tokens = [s.token for s in self._slots]
+            num_needed = max(0, len(tokens) - 1) if self.use_direct else len(tokens)
+            active_proxies = fast_proxies[:num_needed]
+            self._reserve_proxies = list(fast_proxies[num_needed:])
+
+            new_slots: list[Slot] = []
+            if self.use_direct and tokens:
+                new_slots.append(Slot(token=tokens[0], proxy=None))
+                for i, t in enumerate(tokens[1:]):
+                    prx = active_proxies[i] if i < len(active_proxies) else None
+                    new_slots.append(Slot(token=t, proxy=prx))
+            else:
+                for i, t in enumerate(tokens):
+                    prx = active_proxies[i] if i < len(active_proxies) else None
+                    new_slots.append(Slot(token=t, proxy=prx))
+
+            self._slots = new_slots
+
     def replace_slot_proxy(self, slot: Slot) -> Optional[Any]:
         """Заменяет проблемный прокси в слоте на следующий быстрый из резерва."""
         with self._lock:
