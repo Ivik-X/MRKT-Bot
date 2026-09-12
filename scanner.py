@@ -388,6 +388,19 @@ class RateAdaptor:
                 return True
         return False
 
+    def shift_interval(self, delta: float) -> float:
+        """
+        Сдвигает интервал на delta (работает и для авто, и для ручного режима).
+        Если был авто-режим, остаётся авто (со сдвигом порога).
+        Если был ручной, остаётся ручным.
+        """
+        new_val = max(0.10, min(self._max, round(self.interval + delta, 2)))
+        self.interval = new_val
+        if self._auto:
+            self._min_base = max(0.10, round(self._min_base + delta, 2))
+        self._clean_streak = 0
+        return self.interval
+
     def set_manual(self, interval: float) -> None:
         self.interval = max(0.1, min(self._max, interval))
         self._auto = False
@@ -1237,11 +1250,8 @@ async def main() -> None:
                     asyncio.create_task(update_primary_balance_async(pool, scanner_state))
 
                 # Синхронизация интервала с адаптором
-                if scanner_state.scan_interval != adaptor.interval:
-                    if adaptor.is_auto:
-                        adaptor.set_manual(scanner_state.scan_interval)
-                    else:
-                        scanner_state.scan_interval = adaptor.interval
+                if abs(scanner_state.scan_interval - adaptor.interval) > 0.001:
+                    adaptor.interval = scanner_state.scan_interval
 
                 # Принудительное обновление флоров
                 if scanner_state.force_refresh_floors:

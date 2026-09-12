@@ -960,12 +960,14 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
 
     @dp.callback_query(F.data == "interval_minus_005")
     async def cb_interval_minus_005(cb: CallbackQuery):
-        new_val = max(0.10, round(scanner_state.scan_interval - 0.05, 2))
-        scanner_state.scan_interval = new_val
         adaptor = getattr(scanner_state, "rate_adaptor", None)
-        if adaptor:
-            adaptor.set_manual(new_val)
+        if adaptor and hasattr(adaptor, "shift_interval"):
+            new_val = adaptor.shift_interval(-0.05)
+        else:
+            new_val = max(0.10, round(scanner_state.scan_interval - 0.05, 2))
+        scanner_state.scan_interval = new_val
         save_settings(scanner_state)
+        mode_str = "авто" if (adaptor and adaptor.is_auto) else "ручной"
         try:
             await cb.message.edit_text(
                 format_settings_text(scanner_state),
@@ -974,16 +976,18 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
             )
         except Exception:
             pass
-        await cb.answer(f"Интервал: {new_val:.2f}с (ручной)")
+        await cb.answer(f"Интервал: {new_val:.2f}с ({mode_str})")
 
     @dp.callback_query(F.data == "interval_plus_005")
     async def cb_interval_plus_005(cb: CallbackQuery):
-        new_val = min(5.0, round(scanner_state.scan_interval + 0.05, 2))
-        scanner_state.scan_interval = new_val
         adaptor = getattr(scanner_state, "rate_adaptor", None)
-        if adaptor:
-            adaptor.set_manual(new_val)
+        if adaptor and hasattr(adaptor, "shift_interval"):
+            new_val = adaptor.shift_interval(0.05)
+        else:
+            new_val = min(5.0, round(scanner_state.scan_interval + 0.05, 2))
+        scanner_state.scan_interval = new_val
         save_settings(scanner_state)
+        mode_str = "авто" if (adaptor and adaptor.is_auto) else "ручной"
         try:
             await cb.message.edit_text(
                 format_settings_text(scanner_state),
@@ -992,7 +996,7 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
             )
         except Exception:
             pass
-        await cb.answer(f"Интервал: {new_val:.2f}с (ручной)")
+        await cb.answer(f"Интервал: {new_val:.2f}с ({mode_str})")
 
     @dp.callback_query(F.data == "set_interval")
     async def cb_set_interval(cb: CallbackQuery, state: FSMContext):
