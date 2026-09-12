@@ -227,13 +227,14 @@ def create_proxy_object(line: str, port_offset: int = 10900) -> Optional[Any]:
 #  Загрузка VLESS подписок (Gamededio + Ecobuy)
 # ─────────────────────────────────────────────
 
-def fetch_vless_subscriptions(seen_ips: set[str]) -> list[tuple[str, str, str]]:
+def fetch_vless_subscriptions(exclude_ips: Optional[set[str]] = None) -> list[tuple[str, str, str]]:
     """
     Загружает и парсит VLESS Reality узлы из подписок Gamededio и Ecobuy.
-    Фильтрует пересечения IP с уже имеющимися узлами.
+    Фильтрует дубликаты IP и исключает уже занятые exclude_ips.
     Возвращает [(vless_url, ip_or_host, remarks), ...]
     """
     results: list[tuple[str, str, str]] = []
+    local_seen: set[str] = set(exclude_ips or set())
     ctx = ssl._create_unverified_context()
 
     # 1. Gamededio (UA: Happ)
@@ -261,10 +262,10 @@ def fetch_vless_subscriptions(seen_ips: set[str]) -> list[tuple[str, str, str]]:
                 flow = users[0].get("flow", "")
                 addr = str(node.get("address", "")).strip()
                 port = node.get("port")
-                if not addr or not port or addr in seen_ips:
+                if not addr or not port or addr.lower() in local_seen:
                     continue
 
-                seen_ips.add(addr.lower())
+                local_seen.add(addr.lower())
                 stream = ob.get("streamSettings", {})
                 net = stream.get("network", "tcp")
                 sec = stream.get("security", "none")
@@ -307,9 +308,9 @@ def fetch_vless_subscriptions(seen_ips: set[str]) -> list[tuple[str, str, str]]:
                 continue
             p = urlparse(line)
             host = p.hostname or ""
-            if not host or host.lower() in seen_ips:
+            if not host or host.lower() in local_seen:
                 continue
-            seen_ips.add(host.lower())
+            local_seen.add(host.lower())
             rem = unquote(p.fragment) if p.fragment else host
             results.append((line, host, rem))
     except Exception as e:
@@ -323,13 +324,14 @@ def fetch_vless_subscriptions(seen_ips: set[str]) -> list[tuple[str, str, str]]:
 #  Загрузка кандидатов из Databay и Proxifly
 # ─────────────────────────────────────────────
 
-async def fetch_all_public_candidates(seen_ips: set[str], limit: int = 1000) -> list[tuple[str, str, str]]:
+async def fetch_all_public_candidates(exclude_ips: Optional[set[str]] = None, limit: int = 1000) -> list[tuple[str, str, str]]:
     """
     Загружает кандидатов из Databay и Proxifly.
-    Строго отбрасывает дубликаты IP, уже присутствующие в seen_ips.
+    Строго отбрасывает дубликаты IP, уже присутствующие в exclude_ips.
     Возвращает [(proxy_url, host_ip, display_name), ...]
     """
     candidates: list[tuple[str, str, str]] = []
+    local_seen: set[str] = set(exclude_ips or set())
 
     async with AsyncSession(impersonate="chrome124", verify=False) as s:
         # 1. Proxifly JSON
@@ -343,9 +345,9 @@ async def fetch_all_public_candidates(seen_ips: set[str], limit: int = 1000) -> 
                     if not ip or not port:
                         continue
                     ip_clean = str(ip).lower().strip()
-                    if ip_clean in seen_ips:
+                    if ip_clean in local_seen:
                         continue
-                    seen_ips.add(ip_clean)
+                    local_seen.add(ip_clean)
                     country = item.get("geolocation", {}).get("country", "XX")
                     if proto == "socks5":
                         candidates.append((f"socks5h://{ip}:{port}", ip_clean, f"SOCKS5-{country}:{port}"))
@@ -364,9 +366,9 @@ async def fetch_all_public_candidates(seen_ips: set[str], limit: int = 1000) -> 
                         if not line or ":" not in line or line.startswith("#"):
                             continue
                         ip_clean = line.split(":")[0].lower().strip()
-                        if ip_clean in seen_ips:
+                        if ip_clean in local_seen:
                             continue
-                        seen_ips.add(ip_clean)
+                        local_seen.add(ip_clean)
                         port = line.split(":")[-1]
                         candidates.append((f"socks5h://{line}", ip_clean, f"DATABAY-SOCKS5:{port}"))
                     break
@@ -383,9 +385,9 @@ async def fetch_all_public_candidates(seen_ips: set[str], limit: int = 1000) -> 
                         if not line or ":" not in line or line.startswith("#"):
                             continue
                         ip_clean = line.split(":")[0].lower().strip()
-                        if ip_clean in seen_ips:
+                        if ip_clean in local_seen:
                             continue
-                        seen_ips.add(ip_clean)
+                        local_seen.add(ip_clean)
                         port = line.split(":")[-1]
                         candidates.append((f"http://{line}", ip_clean, f"DATABAY-HTTP:{port}"))
                     break
@@ -402,9 +404,9 @@ async def fetch_all_public_candidates(seen_ips: set[str], limit: int = 1000) -> 
                         if not line or ":" not in line or line.startswith("#"):
                             continue
                         ip_clean = line.split(":")[0].lower().strip()
-                        if ip_clean in seen_ips:
+                        if ip_clean in local_seen:
                             continue
-                        seen_ips.add(ip_clean)
+                        local_seen.add(ip_clean)
                         port = line.split(":")[-1]
                         candidates.append((f"socks4://{line}", ip_clean, f"DATABAY-SOCKS4:{port}"))
                     break
@@ -429,7 +431,7 @@ async def ping_candidate_under_threshold(
     Проверяет прокси к api.tgmrkt.io.
     Строго бракует любые серверы с задержкой > max_ping_ms (800 мс).
     """
-    timeout_sec = (max_ping_ms / 1000.0) + 0.15
+    timeout_sec = max(1.5, (max_ping_ms / 1000.0) + 0.2)
     async with sem:
         t0 = time.monotonic()
         try:
@@ -459,15 +461,19 @@ async def ping_vless_node(
     async with sem:
         cfg = parse_vless(url, port)
         proc = XrayProcess(cfg, xbin)
-        timeout_sec = (max_ping_ms / 1000.0) + 0.2
+        timeout_sec = max(2.5, (max_ping_ms / 1000.0) + 0.5)
+        loop = asyncio.get_running_loop()
         try:
-            proc.start()
+            await loop.run_in_executor(None, proc.start)
             ok, lat, _ = await ping_proxy_async(proc, timeout=timeout_sec)
             if ok and lat <= max_ping_ms:
                 proc.ping_ms = lat
                 return (proc, lat)
             else:
-                proc.stop()
+                try:
+                    proc.stop()
+                except Exception:
+                    pass
                 return None
         except Exception:
             try:
@@ -489,7 +495,7 @@ async def ping_custom_proxy(
         if not p_obj:
             return None
 
-        timeout_sec = (max_ping_ms / 1000.0) + 0.2
+        timeout_sec = max(2.5, (max_ping_ms / 1000.0) + 0.5)
         ok, latency, _ = await ping_proxy_async(p_obj, timeout=timeout_sec)
         if ok and latency <= max_ping_ms:
             p_obj.ping_ms = latency
@@ -522,7 +528,7 @@ async def find_fastest_proxies(
       4. Все серверы строго <= 800 мс и без пересечения IP-адресов.
     """
     sem = asyncio.Semaphore(concurrency)
-    seen_ips: set[str] = set()
+    assigned_ips: set[str] = set()
 
     custom_working: list[Any] = []
     vless_working: list[Any] = []
@@ -538,8 +544,8 @@ async def find_fastest_proxies(
                 if res is not None:
                     p_obj, lat = res
                     host = extract_proxy_host(p_obj)
-                    if host and host not in seen_ips:
-                        seen_ips.add(host)
+                    if host and host not in assigned_ips:
+                        assigned_ips.add(host)
                         if hasattr(p_obj, "cfg") and not p_obj.cfg.name.startswith("⭐"):
                             p_obj.cfg.name = f"⭐ {p_obj.cfg.name}"
                         custom_working.append(p_obj)
@@ -547,7 +553,7 @@ async def find_fastest_proxies(
 
     # 2. Проверяем VLESS ноды из подписок Gamededio и Ecobuy
     xbin = find_xray_binary()
-    vless_candidates = fetch_vless_subscriptions(seen_ips)
+    vless_candidates = fetch_vless_subscriptions(exclude_ips=assigned_ips)
     if xbin and vless_candidates:
         v_tasks = [
             ping_vless_node(u, rem, 10910 + i, xbin, sem, max_ping_ms)
@@ -558,14 +564,19 @@ async def find_fastest_proxies(
             if res is not None:
                 proc, lat = res
                 host = extract_proxy_host(proc)
-                if host and host not in seen_ips:
-                    seen_ips.add(host)
+                if host and host not in assigned_ips:
+                    assigned_ips.add(host)
                     vless_working.append(proc)
+                else:
+                    try:
+                        proc.stop()
+                    except Exception:
+                        pass
         vless_working.sort(key=lambda p: p.ping_ms)
         log.info("VLESS нод подошло (<= %.0f мс): %d", max_ping_ms, len(vless_working))
 
     # 3. Скачиваем и пингуем кандидатов из Databay и Proxifly
-    public_candidates = await fetch_all_public_candidates(seen_ips, limit=max_candidates)
+    public_candidates = await fetch_all_public_candidates(exclude_ips=assigned_ips, limit=max_candidates)
     total_candidates = len(vless_candidates) + len(public_candidates)
 
     if public_candidates:
@@ -574,12 +585,14 @@ async def find_fastest_proxies(
         working_tuples = [r for r in results if r is not None]
         working_tuples.sort(key=lambda x: x[2])
 
-        for url, name, lat in working_tuples[:max_results]:
+        for url, name, lat in working_tuples:
             host = extract_proxy_host(url)
-            if host and host not in seen_ips:
-                seen_ips.add(host)
+            if host and host not in assigned_ips:
+                assigned_ips.add(host)
                 sp = SimpleProxy(f"{url}#{name}", name=name, ping_ms=lat)
                 public_working.append(sp)
+                if len(public_working) >= max_results:
+                    break
 
         log.info(
             "Публичных прокси подошло (<= %.0f мс): %d (топ: %.0f мс)",
@@ -589,7 +602,6 @@ async def find_fastest_proxies(
         )
 
     # 4. Объединяем: Пользовательские -> VLESS подписки -> Databay/Proxifly
-    all_fast = custom_working + vless_working + public_working
     return custom_working, vless_working + public_working, total_candidates
 
 

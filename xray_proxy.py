@@ -356,7 +356,7 @@ class XrayProcess:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
-        time.sleep(1.0)  # даём xray время подняться
+        time.sleep(0.3)  # даём xray время подняться
         if self._proc.poll() is not None:
             err = (self._proc.stderr.read(500) if self._proc.stderr else b"").decode(errors="replace")
             raise RuntimeError(f"xray [{self.cfg.name}] не запустился: {err.strip()}")
