@@ -177,10 +177,17 @@ def _extract_uuid_tokens(text: str) -> list[str]:
     return re.findall(pattern, text)
 
 
+def is_admin(user_id: int | None, admin_ids: set[int]) -> bool:
+    """Проверяет, является ли пользователь администратором."""
+    if not admin_ids:
+        return True
+    return bool(user_id and user_id in admin_ids)
+
+
 def _admin_filter(admin_ids: set[int]):
     def check(msg_or_cb: types.TelegramObject) -> bool:
         user = getattr(msg_or_cb, "from_user", None)
-        return bool(user and user.id in admin_ids)
+        return is_admin(getattr(user, "id", None), admin_ids)
     return check
 
 
@@ -1300,7 +1307,7 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
     # ── Кнопка: Загрузить обновление (Git Pull & Restart) ─────────────────
     @dp.callback_query(F.data == "btn_git_update")
     async def cb_btn_git_update(cb: CallbackQuery):
-        if not is_admin(cb.from_user.id, admin_ids):
+        if not is_admin(cb.from_user.id if cb.from_user else None, admin_ids):
             await cb.answer("⛔ Нет доступа", show_alert=True)
             return
 
