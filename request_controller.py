@@ -31,7 +31,7 @@ log = logging.getLogger("mrkt.controller")
 
 MARKET_API_URL = "https://api.tgmrkt.io/api/v1"
 PENALTY_429_DEFAULT = 15.0
-DEFAULT_REQUEST_TIMEOUT = 3.0
+DEFAULT_REQUEST_TIMEOUT = 3.5
 
 
 class RequestPriority(enum.Enum):
@@ -193,22 +193,48 @@ class RequestController:
                     or "Certificate" in err_name
                     or "curl: (28)" in err_str
                     or "curl: (7)" in err_str
+                    or "Resolving" in err_str
                 )
 
-                if is_timeout_or_net and getattr(current_slot, "proxy", None) is not None:
-                    needs_replace = False
-                    if hasattr(current_slot, "record_timeout"):
-                        needs_replace = current_slot.record_timeout()
+                if is_timeout_or_net:
+                    if getattr(current_slot, "proxy", None) is None:
+                        # Прямой IP не работает (таймаут DNS/сети/блокировка провайдера)
+                        log.warning(
+                            "⚠️ Слот [%s] на прямом IP не отвечает (%s). Автоматически отключаем direct и переводим слот на VPN/прокси.",
+                            current_slot.token[:8],
+                            err_str,
+                        )
+                        if hasattr(self.pool, "set_use_direct"):
+                            self.pool.set_use_direct(False)
+                        if self.scanner_state:
+                            self.scanner_state.use_direct = False
+                            try:
+                                from settings_manager import save_settings
+                                save_settings(self.scanner_state)
+                            except Exception:
+                                pass
+                        if hasattr(self.pool, "replace_slot_proxy"):
+                            new_prx = self.pool.replace_slot_proxy(current_slot)
+                            if new_prx:
+                                prx_name = getattr(new_prx.cfg, "name", "proxy")
+                                log.warning("⚠️ Слот [%s] переведён с direct на резервный прокси [%s]", current_slot.token[:8], prx_name)
+                                await self._notify_error("Direct IP отключён", f"Прямой IP сервера не отвечает: {err_str[:60]}. Слот переведён на VPN [{prx_name}].")
+                            else:
+                                await self._notify_error("Direct IP отключён", f"Прямой IP сервера не отвечает: {err_str[:60]}. Резерв пуст.")
+                    else:
+                        needs_replace = False
+                        if hasattr(current_slot, "record_timeout"):
+                            needs_replace = current_slot.record_timeout()
 
-                    if needs_replace and hasattr(self.pool, "replace_slot_proxy"):
-                        new_prx = self.pool.replace_slot_proxy(current_slot)
-                        if new_prx:
-                            prx_name = getattr(new_prx.cfg, "name", "proxy")
-                            log.warning("⚠️ Слот [%s] сбой прокси — заменён на [%s]", current_slot.token[:8], prx_name)
-                            await self._notify_error("Сбой прокси", f"Слот [{current_slot.token[:8]}] заменил прокси на [{prx_name}]")
-                        else:
-                            log.warning("⚠️ Слот [%s] сбой прокси — резерв пуст", getattr(current_slot, "label", ""))
-                            await self._notify_error("Резерв прокси пуст", f"Для слота [{getattr(current_slot, 'label', '')}] нет прокси в резерве")
+                        if needs_replace and hasattr(self.pool, "replace_slot_proxy"):
+                            new_prx = self.pool.replace_slot_proxy(current_slot)
+                            if new_prx:
+                                prx_name = getattr(new_prx.cfg, "name", "proxy")
+                                log.warning("⚠️ Слот [%s] сбой прокси — заменён на [%s]", current_slot.token[:8], prx_name)
+                                await self._notify_error("Сбой прокси", f"Слот [{current_slot.token[:8]}] заменил прокси на [{prx_name}]")
+                            else:
+                                log.warning("⚠️ Слот [%s] сбой прокси — резерв пуст", getattr(current_slot, "label", ""))
+                                await self._notify_error("Резерв прокси пуст", f"Для слота [{getattr(current_slot, 'label', '')}] нет прокси в резерве")
 
                 log.warning("Ошибка %s %s | %s | %.2fс | %s", method_upper, endpoint, getattr(current_slot, "label", ""), elapsed, e)
                 # Тактическая микропауза перед следующей попыткой

@@ -62,7 +62,7 @@ PRIMARY_TOKEN         = os.getenv("PRIMARY_TOKEN", "").strip()
 FLOOR_REFRESH         = int(os.getenv("FLOOR_REFRESH", 300))
 FLOOR_HISTORY_LEN     = int(os.getenv("FLOOR_HISTORY_LEN", 5))
 FLOOR_ANOMALY_PCT     = float(os.getenv("FLOOR_ANOMALY_PCT", 50.0))
-REQUEST_TIMEOUT       = max(2.5, float(os.getenv("REQUEST_TIMEOUT", 3.0)))
+REQUEST_TIMEOUT       = max(2.5, float(os.getenv("REQUEST_TIMEOUT", 3.5)))
 MAX_PING_SECONDS      = float(os.getenv("MAX_PING_SECONDS", 3.0))
 MAX_RETRIES           = int(os.getenv("MAX_RETRIES", 3))
 PENALTY_429           = float(os.getenv("PENALTY_429", 15.0))
@@ -1080,6 +1080,7 @@ async def main() -> None:
     init_autobuy = bool(saved_settings.get("auto_buy", False))
     init_use_direct = bool(saved_settings.get("use_direct", pool.use_direct))
     if pool.use_direct != init_use_direct:
+        log.info("Режим прямого IP из settings.json: %s (ранее было %s)", init_use_direct, pool.use_direct)
         pool.set_use_direct(init_use_direct)
 
     avg_ping = pool.avg_ping_ms() if hasattr(pool, "avg_ping_ms") else None

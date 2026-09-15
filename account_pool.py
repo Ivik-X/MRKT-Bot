@@ -158,6 +158,7 @@ class AccountPool:
                 self._reserve_proxies = all_proxies[len(tokens):]
 
             self._slots = new_slots
+            log.info("AccountPool: режим direct=%s | слотов: %d (%d через VPN), резерв: %d", use_direct, len(new_slots), sum(1 for s in new_slots if s.proxy), len(self._reserve_proxies))
 
     def _extract_host(self, proxy: Any) -> Optional[str]:
         if not proxy:
