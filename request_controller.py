@@ -197,6 +197,9 @@ class RequestController:
                 )
 
                 if is_timeout_or_net:
+                    if self.scanner_state and hasattr(self.scanner_state, "record_proxy_failure"):
+                        self.scanner_state.record_proxy_failure()
+
                     if getattr(current_slot, "proxy", None) is None:
                         # Прямой IP не работает (таймаут DNS/сети/блокировка провайдера)
                         log.warning(
@@ -218,9 +221,6 @@ class RequestController:
                             if new_prx:
                                 prx_name = getattr(new_prx.cfg, "name", "proxy")
                                 log.warning("⚠️ Слот [%s] переведён с direct на резервный прокси [%s]", current_slot.token[:8], prx_name)
-                                await self._notify_error("Direct IP отключён", f"Прямой IP сервера не отвечает: {err_str[:60]}. Слот переведён на VPN [{prx_name}].")
-                            else:
-                                await self._notify_error("Direct IP отключён", f"Прямой IP сервера не отвечает: {err_str[:60]}. Резерв пуст.")
                     else:
                         needs_replace = False
                         if hasattr(current_slot, "record_timeout"):
@@ -231,17 +231,17 @@ class RequestController:
                             if new_prx:
                                 prx_name = getattr(new_prx.cfg, "name", "proxy")
                                 log.warning("⚠️ Слот [%s] сбой прокси — заменён на [%s]", current_slot.token[:8], prx_name)
-                                await self._notify_error("Сбой прокси", f"Слот [{current_slot.token[:8]}] заменил прокси на [{prx_name}]")
                             else:
                                 log.warning("⚠️ Слот [%s] сбой прокси — резерв пуст", getattr(current_slot, "label", ""))
-                                await self._notify_error("Резерв прокси пуст", f"Для слота [{getattr(current_slot, 'label', '')}] нет прокси в резерве")
 
                 log.warning("Ошибка %s %s | %s | %.2fс | %s", method_upper, endpoint, getattr(current_slot, "label", ""), elapsed, e)
                 # Тактическая микропауза перед следующей попыткой
                 await asyncio.sleep(0.3)
 
         if last_exc:
-            await self._notify_error(f"Сбой {method_upper} {endpoint}", f"Все {max_attempts} попыток исчерпаны:\n{str(last_exc)[:200]}")
+            is_net = any(k in type(last_exc).__name__ or k in str(last_exc).lower() for k in ("timeout", "proxy", "connection", "curl: (28)", "curl: (7)"))
+            if not is_net:
+                await self._notify_error(f"Сбой {method_upper} {endpoint}", f"Все {max_attempts} попыток исчерпаны:\n{str(last_exc)[:200]}")
             raise last_exc
         raise RuntimeError(f"RequestController: все попытки исчерпаны: {method_upper} {endpoint}")
 

@@ -124,6 +124,7 @@ class AccountPool:
             raise ValueError("AccountPool: список слотов пуст")
         self._slots = slots
         self._reserve_proxies = list(reserve_proxies or [])
+        self._quarantined_proxies: list[dict[str, Any]] = []
         self._lock = threading.RLock()
         self._async_lock = asyncio.Lock()
         self.use_direct = use_direct
@@ -248,18 +249,112 @@ class AccountPool:
     def replace_slot_proxy(self, slot: Slot) -> Optional[Any]:
         """Заменяет проблемный прокси в слоте на следующий быстрый из резерва."""
         with self._lock:
-            if not self._reserve_proxies:
-                return None
             old_prx = slot.proxy
+            if old_prx:
+                host = self._extract_host(old_prx)
+                if host and not any(self._extract_host(item["proxy"]) == host for item in self._quarantined_proxies):
+                    self._quarantined_proxies.append({
+                        "proxy": old_prx,
+                        "failed_at": time.time(),
+                        "retry_count": 0,
+                    })
+                    if len(self._quarantined_proxies) > 30:
+                        evicted = self._quarantined_proxies.pop(0)
+                        if hasattr(evicted["proxy"], "stop"):
+                            try:
+                                evicted["proxy"].stop()
+                            except Exception:
+                                pass
+
+            if not self._reserve_proxies:
+                slot.reset_stats()
+                return None
             new_prx = self._reserve_proxies.pop(0)
             slot.proxy = new_prx
             slot.reset_stats()
-            if old_prx:
-                try:
-                    old_prx.stop()
-                except Exception:
-                    pass
             return new_prx
+
+    async def recheck_quarantined_proxies_async(
+        self,
+        min_quarantine_sec: float = 120.0,
+        max_ping_seconds: float = 3.0,
+    ) -> int:
+        """
+        Периодически перепроверяет временно сбойные прокси из карантина.
+        Если прокси снова начал отвечать — возвращает его в горячий резерв или пустой слот.
+        """
+        now = time.time()
+        candidates_to_check: list[dict[str, Any]] = []
+
+        with self._lock:
+            remaining: list[dict[str, Any]] = []
+            for item in self._quarantined_proxies:
+                if now - item["failed_at"] >= min_quarantine_sec:
+                    candidates_to_check.append(item)
+                else:
+                    remaining.append(item)
+            self._quarantined_proxies = remaining
+
+        if not candidates_to_check:
+            return 0
+
+        from xray_proxy import ping_proxy_async
+        tasks = [ping_proxy_async(item["proxy"], timeout=max_ping_seconds) for item in candidates_to_check]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        recovered_count = 0
+        with self._lock:
+            seen_hosts = {self._extract_host(s.proxy) for s in self._slots if s.proxy}
+            seen_hosts.update(self._extract_host(r) for r in self._reserve_proxies)
+            seen_hosts.discard(None)
+
+            for item, res in zip(candidates_to_check, results):
+                proxy = item["proxy"]
+                pname = getattr(getattr(proxy, "cfg", None), "name", "proxy")
+                is_ok = False
+                latency = 0.0
+                if isinstance(res, tuple) and len(res) >= 2 and res[0] is True:
+                    is_ok = True
+                    latency = res[1]
+
+                if is_ok:
+                    host = self._extract_host(proxy)
+                    if host and host not in seen_hosts:
+                        empty_slots = [
+                            s for s in (self._slots[1:] if self.use_direct else self._slots)
+                            if s.proxy is None or s.disabled
+                        ]
+                        if empty_slots:
+                            slot_to_fill = empty_slots[0]
+                            slot_to_fill.proxy = proxy
+                            slot_to_fill.reset_stats()
+                            seen_hosts.add(host)
+                            recovered_count += 1
+                            log.info("♻️ Прокси [%s] снова работает (пинг %.0f мс)! Назначен в слот [%s]", pname, latency, slot_to_fill.token[:8])
+                        else:
+                            self._reserve_proxies.append(proxy)
+                            seen_hosts.add(host)
+                            recovered_count += 1
+                            log.info("♻️ Прокси [%s] снова работает (пинг %.0f мс)! Возвращён в горячий резерв (всего: %d)", pname, latency, len(self._reserve_proxies))
+                    else:
+                        if hasattr(proxy, "stop"):
+                            try:
+                                proxy.stop()
+                            except Exception:
+                                pass
+                else:
+                    item["retry_count"] += 1
+                    item["failed_at"] = time.time()
+                    if item["retry_count"] < 6 and (now - item["failed_at"] < 3600.0):
+                        self._quarantined_proxies.append(item)
+                    else:
+                        if hasattr(proxy, "stop"):
+                            try:
+                                proxy.stop()
+                            except Exception:
+                                pass
+
+        return recovered_count
 
     async def next_async(self) -> Slot:
         """
@@ -946,9 +1041,14 @@ async def find_recent_filter_buys_async(
     чёрный фон, дешёвые подарки, редкие ID, оборот).
     Вычисляет за сколько по времени их купили (если < 2 сек, то в мс, остальное в секундах).
     """
+    import sys
     from datetime import datetime
     from curl_cffi.requests import AsyncSession
-    from scanner import check_gift
+
+    main_mod = sys.modules.get("scanner") or sys.modules.get("__main__")
+    check_gift = getattr(main_mod, "check_gift", None)
+    if check_gift is None:
+        from scanner import check_gift
 
     cursor = None
     matched: list[dict] = []

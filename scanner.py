@@ -21,6 +21,9 @@ import re
 import signal
 import sys
 import time
+
+if __name__ == "__main__":
+    sys.modules["scanner"] = sys.modules[__name__]
 from collections import deque
 from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
@@ -108,6 +111,7 @@ def setup_logging() -> tuple[logging.Logger, logging.Logger]:
     scanner_log = logging.getLogger("scanner")
     scanner_log.setLevel(logging.DEBUG)
     scanner_log.propagate = False  # не пропускаем в root — иначе aiogram даёт двойной вывод
+    scanner_log.handlers.clear()
 
     fh = TimedRotatingFileHandler(
         LOG_DIR / "scanner.log", when="midnight", interval=1, backupCount=30, encoding="utf-8",
@@ -125,6 +129,7 @@ def setup_logging() -> tuple[logging.Logger, logging.Logger]:
     deals_log = logging.getLogger("deals")
     deals_log.setLevel(logging.INFO)
     deals_log.propagate = False
+    deals_log.handlers.clear()
 
     dfh = logging.FileHandler(LOG_DIR / "deals.jsonl", mode="a", encoding="utf-8")
     dfh.setLevel(logging.INFO)
@@ -1152,6 +1157,27 @@ async def main() -> None:
     else:
         print("  ℹ️  Telegram бот отключён (не задан TG_BOT_TOKEN или TG_ADMIN_ID в .env)")
 
+    async def proxy_recovery_loop():
+        while not _shutdown.is_set():
+            try:
+                await asyncio.sleep(120.0)  # каждые 2 минуты
+                if pool and hasattr(pool, "recheck_quarantined_proxies_async"):
+                    recovered = await pool.recheck_quarantined_proxies_async(min_quarantine_sec=120.0)
+                    if recovered > 0:
+                        log.info("♻️ Восстановлено прокси: +%d (всего активных: %d, резерв: %d)", recovered, len(pool.get_proxies()), len(getattr(pool, "_reserve_proxies", [])))
+                if pool and len(getattr(pool, "_reserve_proxies", [])) < 3:
+                    try:
+                        from proxy_finder import replenish_reserve_background
+                        await replenish_reserve_background(pool)
+                    except Exception:
+                        pass
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.debug("proxy_recovery_loop: %s", e)
+
+    proxy_recovery_task = asyncio.create_task(proxy_recovery_loop())
+
     async def init_primary_account_async(pool_obj: AccountPool, state_obj: ScannerState, explicit_token: str = "") -> None:
         tokens = pool_obj.get_tokens()
         if not tokens:
@@ -1413,6 +1439,8 @@ async def main() -> None:
         stats_tracker.save()
         log.info("Остановка: сканов: %d, сделок: %d", scan_count, total_deals)
         print(f"\n👋 Остановлено. Сканов: {scan_count}, сделок: {total_deals}")
+        if proxy_recovery_task:
+            proxy_recovery_task.cancel()
         if bot_task:
             bot_task.cancel()
         pool.stop_all_proxies()

@@ -92,6 +92,27 @@ class ScannerState:
     rate_adaptor: Optional[Any] = None  # RateAdaptor из scanner.py
     penalties_429: list[float] = field(default_factory=list)  # таймстампы 429 за последний час
     use_direct: bool = False  # 1 слот без VPN на прямом IP сервера
+    proxy_failures: list[float] = field(default_factory=list)  # таймстампы сбоев прокси за последние 2 часа
+
+    def record_proxy_failure(self, ts: Optional[float] = None) -> None:
+        """Регистрирует факт сбоя прокси и очищает записи старше 2 часов."""
+        now = ts or time.time()
+        self.proxy_failures.append(now)
+        cutoff = now - 7200.0
+        self.proxy_failures = [t for t in self.proxy_failures if t >= cutoff]
+
+    def get_proxy_failures_stats(self) -> tuple[int, Optional[str]]:
+        """
+        Возвращает (количество сбоев за последние 2 часа, время последнего сбоя в HH:MM:SS или None).
+        """
+        now = time.time()
+        cutoff = now - 7200.0
+        self.proxy_failures = [t for t in self.proxy_failures if t >= cutoff]
+        if not self.proxy_failures:
+            return 0, None
+        last_ts = self.proxy_failures[-1]
+        last_str = datetime.fromtimestamp(last_ts).strftime("%H:%M:%S")
+        return len(self.proxy_failures), last_str
 
     def record_429(self, ts: Optional[float] = None) -> None:
         """Регистрирует факт получения 429 и очищает записи старше 1 часа."""
@@ -384,6 +405,9 @@ def format_main_text(state: ScannerState) -> str:
     p429 = state.get_429_count_last_hour()
     p429_main = f" | ⚠️ <b>429: {p429}/ч</b>" if p429 > 0 else " | 429: <code>0/ч</code>"
 
+    fail_cnt, fail_last = state.get_proxy_failures_stats()
+    fail_str = f"<b>{fail_cnt}</b> (посл: <code>{fail_last}</code>)" if fail_cnt > 0 else "<code>0</code>"
+
     return (
         f"🤖 <b>MRKT Scanner Manager</b>\n\n"
         f"Статус: {status_icon}\n"
@@ -406,7 +430,8 @@ def format_main_text(state: ScannerState) -> str:
         f"• Коллекций в кэше: <code>{floors_count}</code>\n\n"
         f"🔌 <b>Ресурсы:</b>\n"
         f"• Токенов: <code>{active_tokens}</code> <i>(обновлены: {get_tokens_updated_str()})</i>\n"
-        f"• Прокси: <code>{active_proxies}</code>{' <i>(+1 прямой IP)</i>' if getattr(state, 'use_direct', False) else ''}"
+        f"• Прокси: <code>{active_proxies}</code>{' <i>(+1 прямой IP)</i>' if getattr(state, 'use_direct', False) else ''}\n"
+        f"• Сбои прокси (2ч): {fail_str}"
     )
 
 
@@ -1397,16 +1422,24 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
         pool = scanner_state.pool
         proxies = pool.get_proxies() if pool else []
         reserves = getattr(pool, "_reserve_proxies", []) if pool else []
+        quarantined = getattr(pool, "_quarantined_proxies", []) if pool else []
         direct_str = " (Слот #1 напрямую с IP сервера)" if getattr(scanner_state, "use_direct", False) else ""
+
+        fail_cnt, fail_last = scanner_state.get_proxy_failures_stats()
+        if fail_cnt > 0:
+            fail_line = f"\n⚠️ <b>Сбоев прокси за 2ч:</b> <code>{fail_cnt}</code> (последний: <code>{fail_last}</code>)"
+        else:
+            fail_line = "\n🛡️ <b>Сбоев прокси за 2ч:</b> <code>0</code> (всё стабильно)"
+
         if not proxies and not reserves:
             text = (
-                f"🌐 <b>Прокси</b>{direct_str}\n\n"
+                f"🌐 <b>Прокси</b>{direct_str}{fail_line}\n\n"
                 f"Прокси сейчас не назначены.\n"
                 f"Нажмите <b>«🔍 Автопоиск быстрых прокси»</b> для автоматического скачивания, "
                 f"замера пинга и наполнения активных слотов и резерва."
             )
         else:
-            lines = [f"🌐 <b>Прокси в пуле</b> (Активных: <code>{len(proxies)}</code>, Резерв: <code>{len(reserves)}</code>){direct_str}:\n"]
+            lines = [f"🌐 <b>Прокси в пуле</b> (Активных: <code>{len(proxies)}</code>, Резерв: <code>{len(reserves)}</code>){direct_str}:{fail_line}\n"]
             for i, p in enumerate(proxies, 1):
                 lat = getattr(p, "ping_ms", 0)
                 lat_str = f" | ⚡ <code>{lat:.0f} мс</code>" if lat > 0 else ""
@@ -1419,6 +1452,8 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
                     lines.append(f"  • <b>[{r.cfg.name}]</b>{r_lat_str}")
                 if len(reserves) > 6:
                     lines.append(f"  • <i>... и ещё {len(reserves) - 6} в резерве</i>")
+            if quarantined:
+                lines.append(f"\n⏳ <b>На авто-перепроверке:</b> <code>{len(quarantined)}</code> шт. (проверяются каждые 2 мин)")
             lines.append("\n💡 <i>Нажмите «🔍 Автопоиск», чтобы спарсить свежие прокси и отобрать топ с наименьшим пингом.</i>")
             text = "\n".join(lines)
 
@@ -2257,6 +2292,11 @@ async def send_error_alert(
 ) -> None:
     """Уведомляет админов об ошибках и сбоях сканера с дебаунсом (анти-спамом)."""
     if not bot_token or not admin_ids:
+        return
+
+    # Не шлём алерты о сбоях прокси и direct IP (статистика сбоев отображается в меню)
+    err_low = (str(error_type) + " " + str(details)).lower()
+    if any(k in err_low for k in ("прокси", "proxy", "direct ip", "резерв прокси")):
         return
 
     now = time.monotonic()
