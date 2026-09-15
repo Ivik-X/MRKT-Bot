@@ -12,11 +12,14 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import logging
 import os
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Optional
+
+_log = logging.getLogger("scanner")
 
 from xray_proxy import XrayProcess, load_proxies, filter_fast_proxies_async
 
@@ -683,6 +686,7 @@ async def buy_gift_async(
                 headers=headers,
                 timeout=timeout,
             )
+            _log.debug("buy %s: HTTP %d | %.200s", gift_id[:8], resp.status_code, resp.text[:200])
             if resp.status_code in (200, 201):
                 try:
                     data = resp.json()
@@ -690,31 +694,38 @@ async def buy_gift_async(
                     data = None
 
                 if data is None:
+                    _log.warning("buy %s: HTTP 200 — тело не JSON: %.100s", gift_id[:8], resp.text[:100])
                     return False, "Не удалось разобрать ответ API (не JSON)", {}
 
                 # --- Детектируем явные ошибки при HTTP 200 ---
                 if isinstance(data, dict):
                     err_msg = data.get("error") or data.get("message") or data.get("msg") or ""
                     if err_msg and str(err_msg).lower() not in ("ok", "success", ""):
+                        _log.warning("buy %s: HTTP 200 — API ошибка: %s", gift_id[:8], err_msg)
                         return False, f"API: {str(err_msg)[:120]}", {}
                     if data.get("success") is False:
+                        _log.warning("buy %s: HTTP 200 — success=false", gift_id[:8])
                         return False, "API вернул success=false", {}
                     # Пустой словарь — покупка не подтверждена
                     if not data:
+                        _log.warning("buy %s: HTTP 200 — пустой ответ", gift_id[:8])
                         return False, "API вернул пустой ответ (покупка не подтверждена)", {}
                     item = data
 
                 elif isinstance(data, list):
                     # Пустой список — лот скорее всего уже выкуплен
                     if not data:
+                        _log.warning("buy %s: HTTP 200 — пустой лист", gift_id[:8])
                         return False, "Лот уже выкуплен или снят с продажи (пустой ответ)", {}
                     # Проверяем первый элемент на ошибку
                     first = data[0] if isinstance(data[0], dict) else {}
                     err_msg = first.get("error") or first.get("message") or ""
                     if err_msg and str(err_msg).lower() not in ("ok", "success", ""):
+                        _log.warning("buy %s: HTTP 200 list — %s", gift_id[:8], err_msg)
                         return False, f"API: {str(err_msg)[:120]}", {}
                     item = first
                 else:
+                    _log.warning("buy %s: HTTP 200 — нежданный тип %s", gift_id[:8], type(data).__name__)
                     return False, f"API вернул неожиданный формат: {type(data).__name__}", {}
 
                 return True, "Подарок успешно куплен", item

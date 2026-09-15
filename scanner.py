@@ -104,6 +104,7 @@ def setup_logging() -> tuple[logging.Logger, logging.Logger]:
 
     scanner_log = logging.getLogger("scanner")
     scanner_log.setLevel(logging.DEBUG)
+    scanner_log.propagate = False  # не пропускаем в root — иначе aiogram даёт двойной вывод
 
     fh = TimedRotatingFileHandler(
         LOG_DIR / "scanner.log", when="midnight", interval=1, backupCount=30, encoding="utf-8",
@@ -1009,6 +1010,8 @@ async def process_deal_async(
     """
     gift = deal.get("gift", {})
     deal_gid = gift.get("id", "")
+    deal_col = gift.get("collectionName", "?")
+    deal_num = gift.get("number", "?")
     price_nano = deal.get("price", 0)
     price_ton = price_nano / 1e9
 
@@ -1019,7 +1022,7 @@ async def process_deal_async(
         if known_balance is not None and price_nano > known_balance:
             bal_ton = known_balance / 1e9
             reason = f"Недостаточно средств (баланс: {bal_ton:.2f} TON, цена: {price_ton:.2f} TON)"
-            log.warning("AutoBuy: %s для лота %s", reason, deal_gid)
+            log.warning("✖ %s #%s — пропущено: %s", deal_col, deal_num, reason)
             await send_autobuy_skipped_notification(bot_token, admin_ids, deal, reason)
             # Присылаем обычный алерт с кнопкой ручной покупки
             await send_deal_notification(
@@ -1034,7 +1037,7 @@ async def process_deal_async(
 
         prim_slot = pool.get_primary_slot()
         if not prim_slot:
-            log.error("AutoBuy: нет активного основного аккаунта в пуле!")
+            log.error("Покупка: нет активного основного слота")
             await send_deal_notification(
                 bot_token,
                 admin_ids,
@@ -1045,7 +1048,7 @@ async def process_deal_async(
             )
             return
 
-        log.info("⚡ [AutoBuy] Мгновенный выкуп лота %s за %.2f TON...", deal_gid, price_ton)
+        log.info("⚡ %s #%s  %.2f TON", deal_col, deal_num, price_ton)
         t_buy = time.monotonic()
         # Оптимистичное списание баланса
         if scanner_state.primary_balance_nano is not None:
@@ -1071,9 +1074,10 @@ async def process_deal_async(
         asyncio.create_task(_refresh_primary_balance())
 
         if buy_ok:
-            log.info("🎉 [AutoBuy] Лот %s успешно выкуплен за %.2f с!", deal_gid, elapsed)
             # Проверяем попадание в Хранилище (инвентарь)
             in_vault = await verify_gift_in_vault_async(deal_gid, prim_slot.token, prim_slot.proxies)
+            vault_icon = "✅" if in_vault else "⚠️не в инвентаре!"
+            log.info("✅ Куплен %s #%s за %.2fс  %s", deal_col, deal_num, elapsed, vault_icon)
             await send_autobuy_success_report(
                 bot_token=bot_token,
                 admin_ids=admin_ids,
@@ -1084,7 +1088,7 @@ async def process_deal_async(
                 scanner_state=scanner_state,
             )
         else:
-            log.warning("❌ [AutoBuy] Не удалось выкупить лот %s: %s (%.2f с)", deal_gid, buy_msg, elapsed)
+            log.warning("❌ %s #%s: %s (%.2fс)", deal_col, deal_num, buy_msg, elapsed)
             await send_autobuy_failed_report(
                 bot_token=bot_token,
                 admin_ids=admin_ids,
@@ -1319,8 +1323,6 @@ async def main() -> None:
 
                 # ── Обновление флоров ─────────────────────────────────────────
                 if scan_count == 1 or scan_count % FLOOR_REFRESH == 0:
-                    label = "первый запуск" if scan_count == 1 else f"скан #{scan_count}"
-                    print(f"[{ts}] 🔄 Флоры ({label})...", end=" ", flush=True)
                     try:
                         bf, cf, cv = await fetch_floors_async(pool, session, floor_tracker)
                         if cf:
@@ -1331,21 +1333,15 @@ async def main() -> None:
                         if bf:
                             black_floor = bf
                             scanner_state.black_floor_nano = black_floor
-                        print(f"{len(collection_floors)} коллекций | 🖤 {tons_fmt(black_floor) if black_floor else 'N/A'}")
-                        log.info("Флоры: %d коллекций | чёрный: %s", len(collection_floors), tons_fmt(black_floor) if black_floor else "N/A")
-
+                        log.info("🔄 Флоры: %d кол. | 🖤 %s", len(collection_floors), tons_fmt(black_floor) if black_floor else "N/A")
                         anomalous = floor_tracker.pop_anomalous()
                         if anomalous:
-                            log.info("Зафиксированы колебания флора (%d коллекций): %s", len(anomalous), ", ".join(list(anomalous)[:5]))
-
+                            log.info("Аномалия флора (%d кол.): %s", len(anomalous), ", ".join(list(anomalous)[:5]))
                     except Exception as e:
-                        log.error("Не удалось обновить флоры: %s", e)
-                        print(f"ошибка: {e}")
+                        log.error("Флоры: ошибка обновления — %s", e)
 
                 # ── Скан ─────────────────────────────────────────────────────
-                label = " (первый скан)" if first_run else ""
-                log.debug("Скан #%d%s", scan_count, label)
-                print(f"[{ts}] ⟳ Скан #{scan_count}{label}...", end=" ", flush=True)
+                log.debug("➳ Скан #%d", scan_count)
 
                 try:
                     scan_start_429 = scanner_state.get_429_count_last_hour()
@@ -1391,8 +1387,6 @@ async def main() -> None:
                             scan_deals_count = len(scan_deals)
                             total_deals += scan_deals_count
                             scanner_state.deals_count = total_deals
-                            print(f"\n[{ts}]  ✅ {len(scan_deals)} предложений! (сессия: {total_deals})\n")
-                            log.info("!!! Найдено %d сделок (сессия: %d)", len(scan_deals), total_deals)
                             for deal in scan_deals:
                                 print_and_log_deal(deal)
                                 if TG_BOT_TOKEN and TG_ADMIN_IDS:
@@ -1430,27 +1424,27 @@ async def main() -> None:
 
                     stats_tracker.record_scan(new_gifts, scan_deals_count)
 
-                    print(f"+{len(new_gifts)} новых  |  в базе: {len(seen_ids)}  |  {elapsed:.1f}с")
-                    log.info("Скан #%d: +%d новых | база: %d | %.1fс", scan_count, len(new_gifts), len(seen_ids), elapsed)
+                    if new_gifts:
+                        log.info("#%d  +%d  %.1fс", scan_count, len(new_gifts), elapsed)
+                    else:
+                        log.debug("#%d  +0  %.1fс", scan_count, elapsed)
 
                     if scanner_state.get_429_count_last_hour() == scan_start_429:
                         if adaptor.record_ok():
                             scanner_state.scan_interval = adaptor.interval
                             save_settings(scanner_state)
-                            log.info("⚡ Авто-интервал: %.2fс", adaptor.interval)
+                            log.info("⚡ Интервал: %.2fс", adaptor.interval)
 
                 except AuthTokenExpiredError as e:
                     consecutive_401_errors += 1
-                    print(f"\n[{ts}] ❌ {e}")
+                    log.error("401: %s", e)
                     if consecutive_401_errors >= 3:
-                        log.critical("❌ Все токены просрочены (HTTP 401).")
-                        print(f"\n🛑 Все токены просрочены. Ожидание обновления через Telegram бота...")
+                        log.critical("Все токены просрочены — пауза.")
                         scanner_state.is_paused = True
                 except Exception as e:
                     err_str = str(e)
                     if "429" in err_str:
-                        print(f"\n[{ts}] ⏳ 429 — пауза 3с...")
-                        log.warning("Скан #%d: все слоты на штрафе (429).", scan_count)
+                        log.warning("429: все слоты на штрафе — пауза 3с.")
                         stats_tracker.record_error("HTTP 429", err_str)
                         scanner_state.record_429()
                         adaptor.on_429(30.0)
@@ -1458,8 +1452,7 @@ async def main() -> None:
                         save_settings(scanner_state)
                         await asyncio.sleep(3.0)
                     else:
-                        print(f"\n[{ts}] ❌ {e}")
-                        log.error("Ошибка в скане #%d: %s", scan_count, e, exc_info=True)
+                        log.error("Скан #%d: %s", scan_count, e, exc_info=True)
                         stats_tracker.record_error(type(e).__name__, str(e))
 
                 first_run = False
