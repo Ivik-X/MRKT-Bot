@@ -2229,3 +2229,60 @@ async def send_token_expired_alert(
             await bot.session.close()
 
 
+_last_error_alerts: dict[str, float] = {}
+
+async def send_error_alert(
+    bot_token: str,
+    admin_ids: set[int],
+    error_type: str,
+    details: str,
+    bot: Optional[Bot] = None,
+    min_interval: float = 60.0,
+) -> None:
+    """Уведомляет админов об ошибках и сбоях сканера с дебаунсом (анти-спамом)."""
+    if not bot_token or not admin_ids:
+        return
+
+    now = time.monotonic()
+    last_sent = _last_error_alerts.get(error_type, 0.0)
+    if now - last_sent < min_interval:
+        return  # Дебаунс: не шлем чаще раза в минуту на один тип ошибки
+    _last_error_alerts[error_type] = now
+
+    cur_time = datetime.now().strftime("%H:%M:%S")
+    text = (
+        f"⚠️ <b>ВНИМАНИЕ: СБОЙ СИСТЕМЫ!</b>\n\n"
+        f"⏰ <b>Время:</b> <code>{cur_time}</code>\n"
+        f"🚨 <b>Тип:</b> <code>{html.escape(error_type)}</code>\n\n"
+        f"📝 <b>Детали:</b>\n"
+        f"<pre>{html.escape(details[:500])}</pre>"
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📋 Посмотреть логи", callback_data="nav_logs")],
+            [InlineKeyboardButton(text="🔄 Главное меню", callback_data="nav_main")],
+        ]
+    )
+
+    should_close = False
+    if bot is None:
+        bot = Bot(token=bot_token)
+        should_close = True
+
+    try:
+        for admin_id in admin_ids:
+            try:
+                await bot.send_message(
+                    chat_id=admin_id,
+                    text=text,
+                    reply_markup=kb,
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                log.warning("Не удалось отправить алерт об ошибке в TG %s: %s", admin_id, e)
+    finally:
+        if should_close:
+            await bot.session.close()
+
+
+

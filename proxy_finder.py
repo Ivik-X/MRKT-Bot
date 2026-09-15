@@ -691,12 +691,19 @@ def save_proxies_to_file(
                 lines.append(f"{url}{suffix}")
 
         target = Path(file_path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        with open(target, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines) + "\n")
-        log.info("Сохранено %d активных и %d резервных прокси в %s (уникальных IP: %d)", len(active_proxies), len(reserve_proxies), file_path, len(seen_hosts))
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with open(target, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            log.info("Сохранено %d активных и %d резервных прокси в %s (уникальных IP: %d)", len(active_proxies), len(reserve_proxies), file_path, len(seen_hosts))
+        except OSError as oe:
+            fallback = Path("data") / "proxies_saved.txt"
+            fallback.parent.mkdir(parents=True, exist_ok=True)
+            with open(fallback, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            log.info("Файл %s только для чтения, копия сохранена в %s", file_path, fallback)
     except Exception as e:
-        log.error("Ошибка записи в %s: %s", file_path, e)
+        log.error("Ошибка сохранения прокси: %s", e)
 
 
 async def auto_replenish_background(pool: Any) -> int:

@@ -7,7 +7,7 @@ services:
       - .env
     volumes:
       - ./tokens.txt:/app/tokens.txt
-      - ./proxies.txt:/app/proxies.txt:ro
+      - ./proxies.txt:/app/proxies.txt
       - ./logs:/app/logs
       - ./data:/app/data
 

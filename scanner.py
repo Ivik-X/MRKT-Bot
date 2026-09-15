@@ -85,10 +85,13 @@ from tg_bot import (
     send_autobuy_success_report,
     send_autobuy_failed_report,
     send_autobuy_skipped_notification,
+    send_error_alert,
     _mask_token,
 )
+from request_controller import RequestController, RequestPriority
 
 _global_scanner_state: Optional[ScannerState] = None
+_global_controller: Optional[RequestController] = None
 
 
 
@@ -328,11 +331,11 @@ class RateAdaptor:
     def __init__(
         self,
         initial_interval: float,
-        min_interval: float = 0.40,
+        min_interval: float = 0.65,
         max_interval: float = MAX_SCAN_INTERVAL,
         pool: Optional[AccountPool] = None,
     ):
-        self._min_base = max(0.40, min_interval)
+        self._min_base = max(0.65, min_interval)
         self._max = max_interval
         self._pool = pool
         self._auto = True
@@ -344,11 +347,10 @@ class RateAdaptor:
     def effective_min(self) -> float:
         """
         Динамический пол интервала.
-        tgmrkt держит ~1 req/s на IP. Чтобы не перегружать слоты,
-        интервал не должен быть меньше 1.6s / num_slots (и не меньше 0.40s).
+        Безопасный пол не опускается ниже 0.65с, предотвращая 429 рейтлимиты маркета.
         """
         num_slots = len(self._pool.slots) if (self._pool and self._pool.slots) else 1
-        return max(self._min_base, 1.6 / max(1, num_slots))
+        return max(self._min_base, 2.4 / max(1, num_slots))
 
     def on_429(self, penalty_sec: float = 15.0) -> float:
         """
@@ -381,21 +383,21 @@ class RateAdaptor:
     def record_ok(self) -> bool:
         """
         Вызывается после чистых сканов (где не было 429).
-        Каждые 15 чистых сканов динамично снижает интервал на 0.05с до effective_min.
+        Каждые 30 чистых сканов динамично снижает интервал на 0.05с до effective_min.
         Возвращает True, если интервал изменился.
         """
         if not self._auto:
             return False
 
         self._clean_streak += 1
-        if self._clean_streak >= 15:
+        if self._clean_streak >= 30:
             self._clean_streak = 0
             cur_min = self.effective_min
             if self.interval > cur_min + 0.005:
                 old = self.interval
                 self.interval = max(cur_min, round(self.interval - 0.05, 2))
                 log.info(
-                    "⚡ RateAdaptor: серия 15 чистых сканов, ускорение %.2fс → %.2fс (пол: %.2fс)",
+                    "⚡ RateAdaptor: серия 30 чистых сканов, ускорение %.2fс → %.2fс (пол: %.2fс)",
                     old, self.interval, cur_min,
                 )
                 return True
@@ -439,150 +441,51 @@ async def api_request_async(
     method: str,
     endpoint: str,
     pool: AccountPool,
-    session: AsyncSession,
+    session: Optional[AsyncSession] = None,
     json_data: Optional[dict] = None,
     max_attempts: int = 4,
 ) -> Any:
     """
-    Выполняет HTTP запрос через cffi AsyncSession с LRU ротацией токенов/прокси.
-    При 429: штрафует слот, адаптирует интервал и пробует следующий слот.
-    При 401: отправляет алерт в Telegram и отключает слот.
-    При сбое сети/прокси: фиксирует таймаут и при необходимости заменяет прокси из резерва.
+    Выполняет HTTP запрос к MRKT API через централизованный RequestController.
+    Контроллер управляет интервалами, индивидуальными кулдаунами слотов,
+    защитой от каскадов 429 и изоляцией сессий.
     """
-    last_exc = None
+    global _global_controller
+    if _global_controller is not None:
+        return await _global_controller.request(
+            method=method,
+            endpoint=endpoint,
+            json_data=json_data,
+            max_attempts=max_attempts,
+        )
 
+    # Fallback (на случай прямого вызова до инициализации контроллера)
+    last_exc = None
     for attempt in range(max_attempts):
         slot = await pool.next_async()
-        t0 = time.monotonic()
-
-        log.debug("API %s %s | слот: %s | попытка %d/%d", method.upper(), endpoint, slot.label, attempt + 1, max_attempts)
-
         try:
-            if method.upper() == "GET":
-                r = await session.get(
-                    f"{MARKET_API_URL}{endpoint}",
-                    headers=slot.headers,
-                    proxies=slot.proxies,
-                    timeout=REQUEST_TIMEOUT,
-                )
-            else:
-                r = await session.post(
-                    f"{MARKET_API_URL}{endpoint}",
-                    headers=slot.headers,
-                    json=json_data or {},
-                    proxies=slot.proxies,
-                    timeout=REQUEST_TIMEOUT,
-                )
-            elapsed = time.monotonic() - t0
-
-            if elapsed > REQUEST_TIMEOUT:
-                needs_replace = slot.record_timeout()
-                if needs_replace:
-                    new_prx = pool.replace_slot_proxy(slot)
-                    if new_prx:
-                        log.warning("⚠️ Слот [%s] ответил за %.2fс — заменён [%s]", slot.token[:8], elapsed, new_prx.cfg.name)
-                    else:
-                        log.warning("⚠️ Слот [%s] ответил за %.2fс — отключён", slot.label, elapsed)
-
-            if r.status_code == 401:
-                log.error("HTTP 401 | Токен просрочен (слот: %s)", slot.label)
-                slot.disabled = True
-                stats_tracker.record_error("HTTP 401", f"Токен просрочен (слот: {slot.label})", slot.label, endpoint)
-                if TG_BOT_TOKEN and TG_ADMIN_IDS and slot.token not in _notified_401_tokens:
-                    _notified_401_tokens.add(slot.token)
-                    try:
-                        from tg_bot import send_token_expired_alert
-                        asyncio.create_task(
-                            send_token_expired_alert(
-                                TG_BOT_TOKEN,
-                                TG_ADMIN_IDS,
-                                slot.label,
-                                slot.token,
-                            )
-                        )
-                    except Exception as e:
-                        log.warning("Ошибка отправки 401 алерта: %s", e)
-                last_exc = AuthTokenExpiredError(f"HTTP 401: Токен просрочен (слот: {slot.label})")
-                continue
-
-            if r.status_code == 429:
-                raw_retry = r.headers.get("Retry-After")
-                try:
-                    retry_val = float(raw_retry) if raw_retry else 0.0
-                except (ValueError, TypeError):
-                    retry_val = 0.0
-                retry_after = retry_val if retry_val > 0 else PENALTY_429
-                log.warning("429 | слот: %s | штраф: %.0fс", slot.label, retry_after)
-                pool.penalize(slot, retry_after)
-                stats_tracker.record_error("HTTP 429", f"penalty {retry_after}s", slot.label, endpoint)
-                if _global_scanner_state is not None:
-                    _global_scanner_state.record_429()
-                    adaptor = getattr(_global_scanner_state, "rate_adaptor", None)
-                    if adaptor is not None:
-                        adaptor.on_429(retry_after)
-                        _global_scanner_state.scan_interval = adaptor.interval
-                        save_settings(_global_scanner_state)
-                last_exc = Exception(f"HTTP 429 (слот: {slot.label})")
-                # Слот уже пенализирован; next_async() на следующей итерации
-                # сам подберёт свободный слот — дополнительный sleep не нужен.
-                continue
-
+            proxies = slot.proxies
+            headers = slot.headers
+            async with AsyncSession(impersonate="chrome124", proxies=proxies) as s:
+                if method.upper() == "GET":
+                    r = await s.get(f"{MARKET_API_URL}{endpoint}", headers=headers, timeout=REQUEST_TIMEOUT, discard_cookies=True)
+                else:
+                    r = await s.post(f"{MARKET_API_URL}{endpoint}", headers=headers, json=json_data or {}, timeout=REQUEST_TIMEOUT, discard_cookies=True)
             r.raise_for_status()
             slot.record_success()
-            log.debug("API ответ: %d | %.2fс | %s", r.status_code, elapsed, slot.label)
             return r.json()
-
-        except asyncio.CancelledError:
-            raise
         except Exception as e:
-            elapsed = time.monotonic() - t0
-            err_name = type(e).__name__
-            is_proxy_err = (
-                "Timeout" in err_name
-                or "timed out" in str(e).lower()
-                or "Proxy" in err_name
-                or "Connection" in err_name
-                or "Certificate" in err_name
-            )
-            if is_proxy_err and slot.proxy is not None:
-                needs_replace = slot.record_timeout()
-                if needs_replace:
-                    new_prx = pool.replace_slot_proxy(slot)
-                    if new_prx:
-                        log.warning("⚠️ Слот [%s] сбой прокси — заменён на [%s]", slot.token[:8], getattr(new_prx.cfg, "name", "proxy"))
-                        if len(getattr(pool, "_reserve_proxies", [])) < 3:
-                            from proxy_finder import auto_replenish_background
-                            asyncio.create_task(auto_replenish_background(pool))
-                    else:
-                        log.warning("⚠️ Слот [%s] сбой прокси — резерв пуст", slot.label)
-                        from proxy_finder import auto_replenish_background
-                        asyncio.create_task(auto_replenish_background(pool))
-            if "429" in str(e):
-                pool.penalize(slot, PENALTY_429)
-                log.warning("429 (из исключения) | слот: %s | штраф: %.0fс", slot.label, PENALTY_429)
-                stats_tracker.record_error("HTTP 429", str(e), slot.label, endpoint)
-                if _global_scanner_state is not None:
-                    _global_scanner_state.record_429()
-                    adaptor = getattr(_global_scanner_state, "rate_adaptor", None)
-                    if adaptor is not None:
-                        adaptor.on_429(PENALTY_429)
-                        _global_scanner_state.scan_interval = adaptor.interval
-                        save_settings(_global_scanner_state)
-                # Слот пенализирован — next_async() сам выберет свободный слот.
-            else:
-                log.warning("Ошибка %s %s | %s | %.2fс | %s", method.upper(), endpoint, slot.label, elapsed, e)
-                stats_tracker.record_error(err_name, str(e), slot.label, endpoint)
             last_exc = e
-            # Нет sleep(0.3) — сразу берём следующий слот
+            await asyncio.sleep(0.5)
 
     raise last_exc or RuntimeError(f"Все попытки исчерпаны: {method} {endpoint}")
 
 
-async def api_post_async(endpoint: str, json_data: dict, pool: AccountPool, session: AsyncSession) -> dict:
+async def api_post_async(endpoint: str, json_data: dict, pool: AccountPool, session: Optional[AsyncSession] = None) -> dict:
     return await api_request_async("POST", endpoint, pool, session, json_data)
 
 
-async def api_get_async(endpoint: str, pool: AccountPool, session: AsyncSession) -> Any:
+async def api_get_async(endpoint: str, pool: AccountPool, session: Optional[AsyncSession] = None) -> Any:
     return await api_request_async("GET", endpoint, pool, session)
 
 
@@ -1211,9 +1114,27 @@ async def main() -> None:
     if "notify_categories" in saved_settings and isinstance(saved_settings["notify_categories"], dict):
         scanner_state.notify_categories.update(saved_settings["notify_categories"])
 
-    global _global_scanner_state
+    global _global_scanner_state, _global_controller
     _global_scanner_state = scanner_state
     save_settings(scanner_state)
+
+    controller = RequestController(
+        pool=pool,
+        scanner_state=scanner_state,
+        min_global_interval=0.65,
+        slot_cooldown=1.5,
+        anti_cascade_delay=0.8,
+    )
+    _global_controller = controller
+
+    async def _send_tg_error(err_type: str, details: str):
+        if TG_BOT_TOKEN and TG_ADMIN_IDS:
+            try:
+                await send_error_alert(TG_BOT_TOKEN, TG_ADMIN_IDS, err_type, details)
+            except Exception as ex:
+                log.debug("Не удалось отправить алерт об ошибке в TG: %s", ex)
+
+    controller.set_error_notifier(_send_tg_error)
 
 
     bot_task = None
@@ -1454,6 +1375,18 @@ async def main() -> None:
                     else:
                         log.error("Скан #%d: %s", scan_count, e, exc_info=True)
                         stats_tracker.record_error(type(e).__name__, str(e))
+                        if TG_BOT_TOKEN and TG_ADMIN_IDS:
+                            try:
+                                asyncio.create_task(
+                                    send_error_alert(
+                                        TG_BOT_TOKEN,
+                                        TG_ADMIN_IDS,
+                                        f"Сбой скан-цикла #{scan_count}",
+                                        str(e),
+                                    )
+                                )
+                            except Exception:
+                                pass
 
                 first_run = False
 

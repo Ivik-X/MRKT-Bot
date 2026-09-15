@@ -691,6 +691,7 @@ async def buy_gift_async(
                 json=payload,
                 headers=headers,
                 timeout=timeout,
+                discard_cookies=True,
             )
             req_sec = time.monotonic() - t_start
             _log.info(
@@ -808,6 +809,7 @@ async def verify_gift_in_vault_async(
                 json=payload,
                 headers=headers,
                 timeout=timeout,
+                discard_cookies=True,
             )
             if resp.status_code == 200:
                 data = resp.json()
