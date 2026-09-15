@@ -13,14 +13,17 @@ tg_bot.py — Управление MRKT-сканером через Telegram-б�
 from __future__ import annotations
 
 import asyncio
+import collections
+import html
 import logging
 import os
 import re
+import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command, CommandStart
@@ -214,6 +217,25 @@ def main_keyboard(state: ScannerState) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(text="📋 Просмотр логов", callback_data="nav_logs"),
+                InlineKeyboardButton(text="🚀 Загрузить обновление", callback_data="btn_git_update"),
+            ],
+        ]
+    )
+
+
+def logs_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="⚡ Последние 30 строк", callback_data="logs_tail_30"),
+                InlineKeyboardButton(text="📜 Последние 100 строк", callback_data="logs_tail_100"),
+            ],
+            [
+                InlineKeyboardButton(text="🛒 Логи покупок", callback_data="logs_filter_buy"),
+                InlineKeyboardButton(text="⚠️ Ошибки (WARN/ERR)", callback_data="logs_filter_err"),
+            ],
+            [
+                InlineKeyboardButton(text="⬅️ Главное меню", callback_data="nav_main"),
             ],
         ]
     )
@@ -1178,50 +1200,180 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
 
 
     # ── Раздел: Просмотр логов ────────────────────────────────────────────
+    async def _send_logs_to_user(target: Union[Message, CallbackQuery], query_str: str):
+        log_dir = Path(os.getenv("LOG_DIR", "logs"))
+        title, lines = read_logs_smart(query_str, log_dir)
+
+        send_fn = target.answer if isinstance(target, Message) else target.message.answer
+
+        if not lines:
+            await send_fn(
+                f"📋 <b>{html.escape(title)}</b>",
+                parse_mode="HTML",
+                reply_markup=back_to_menu_keyboard("nav_logs"),
+            )
+            return
+
+        header = f"<b>{html.escape(title)}</b>\n\n"
+        full_body = "\n".join(lines)
+        if len(header) + len(full_body) + 15 <= 4000:
+            await send_fn(
+                f"{header}<pre>{html.escape(full_body)}</pre>",
+                parse_mode="HTML",
+                reply_markup=back_to_menu_keyboard("nav_logs"),
+            )
+            return
+
+        # Разбиваем на порции для Telegram (< 3800 символов)
+        chunks = []
+        cur_lines = []
+        cur_len = 0
+        for l in lines:
+            if cur_len + len(l) + 1 > 3500:
+                chunks.append("\n".join(cur_lines))
+                cur_lines = [l]
+                cur_len = len(l)
+            else:
+                cur_lines.append(l)
+                cur_len += len(l) + 1
+        if cur_lines:
+            chunks.append("\n".join(cur_lines))
+
+        for idx, chunk in enumerate(chunks):
+            is_last = (idx == len(chunks) - 1)
+            prefix = header if idx == 0 else ""
+            markup = back_to_menu_keyboard("nav_logs") if is_last else None
+            await send_fn(
+                f"{prefix}<pre>{html.escape(chunk)}</pre>",
+                parse_mode="HTML",
+                reply_markup=markup,
+            )
+            if not is_last:
+                await asyncio.sleep(0.15)
+
     @dp.callback_query(F.data == "nav_logs")
     async def cb_nav_logs(cb: CallbackQuery, state: FSMContext):
         await state.set_state(BotStates.waiting_for_log_time)
+        now = datetime.now()
+        now_str = now.strftime("%H:%M:%S")
         text = (
             "📋 <b>Просмотр логов</b>\n\n"
-            "Отправьте временную метку для поиска строк в диапазоне ±10 секунд.\n\n"
-            "Форматы:\n"
-            "• <code>20:15:33</code> — время в формате ЧЧ:ММ:СС\n"
-            "• <code>20:15</code> — время ЧЧ:ММ (секунды = 0)\n"
-            "• <code>now</code> — последние 60 секунд логов\n"
+            f"🕒 Время сервера: <code>{now_str}</code>\n\n"
+            "Нажмите быструю кнопку или отправьте:\n"
+            "• <code>now</code> или число (напр. <code>50</code>) — последние строки\n"
+            "• Время <code>11:04:53</code> или <code>11:04</code> — поиск (±30с)\n"
+            "• Слово: <code>buy</code>, <code>429</code>, <code>error</code> — фильтр"
         )
-        await cb.message.edit_text(text, reply_markup=back_to_menu_keyboard("nav_main"), parse_mode="HTML")
+        await cb.message.edit_text(text, reply_markup=logs_keyboard(), parse_mode="HTML")
         await cb.answer()
+
+    @dp.callback_query(F.data == "logs_tail_30")
+    async def cb_logs_tail_30(cb: CallbackQuery, state: FSMContext):
+        await state.clear()
+        await cb.answer()
+        await _send_logs_to_user(cb, "30")
+
+    @dp.callback_query(F.data == "logs_tail_100")
+    async def cb_logs_tail_100(cb: CallbackQuery, state: FSMContext):
+        await state.clear()
+        await cb.answer()
+        await _send_logs_to_user(cb, "100")
+
+    @dp.callback_query(F.data == "logs_filter_buy")
+    async def cb_logs_filter_buy(cb: CallbackQuery, state: FSMContext):
+        await state.clear()
+        await cb.answer()
+        await _send_logs_to_user(cb, "buy")
+
+    @dp.callback_query(F.data == "logs_filter_err")
+    async def cb_logs_filter_err(cb: CallbackQuery, state: FSMContext):
+        await state.clear()
+        await cb.answer()
+        await _send_logs_to_user(cb, "err")
 
     @dp.message(BotStates.waiting_for_log_time)
     async def msg_log_time(msg: Message, state: FSMContext):
         raw = (msg.text or "").strip()
-        log_dir = Path(os.getenv("LOG_DIR", "logs"))
-        lines = read_log_window(raw, log_dir)
         await state.clear()
-        if not lines:
-            await msg.answer(
-                f"📋 По запросу <code>{raw}</code> ничего не найдено в логах.\n"
-                "<i>Убедитесь, что время указано в формате ЧЧ:ММ:СС или ЧЧ:ММ.</i>",
-                parse_mode="HTML",
-                reply_markup=back_to_menu_keyboard("nav_main"),
-            )
+        await _send_logs_to_user(msg, raw)
+
+    # ── Кнопка: Загрузить обновление (Git Pull & Restart) ─────────────────
+    @dp.callback_query(F.data == "btn_git_update")
+    async def cb_btn_git_update(cb: CallbackQuery):
+        if not is_admin(cb.from_user.id, admin_ids):
+            await cb.answer("⛔ Нет доступа", show_alert=True)
             return
 
-        full_text = f"📋 <b>Логи ±10с от {raw}:</b>\n\n" + "\n".join(lines)
-        # Разбиваем на части если слишком длинно
-        MAX_LEN = 4000
-        chunks = [full_text[i:i+MAX_LEN] for i in range(0, len(full_text), MAX_LEN)]
-        for i, chunk in enumerate(chunks):
-            if i == len(chunks) - 1:
-                await msg.answer(
-                    f"<code>{chunk}</code>",
+        await cb.answer()
+        status_msg = await cb.message.answer(
+            "⏳ <b>Загрузка обновления...</b>\n\nВыполняю <code>git pull origin main</code>...",
+            parse_mode="HTML",
+        )
+
+        try:
+            # Настройка git safe.directory на случай работы в Docker с разными правами
+            try:
+                conf_proc = await asyncio.create_subprocess_exec(
+                    "git", "config", "--global", "--add", "safe.directory", "*",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await conf_proc.communicate()
+            except Exception:
+                pass
+
+            repo_dir = Path(__file__).resolve().parent
+            proc = await asyncio.create_subprocess_exec(
+                "git", "pull", "origin", "main",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(repo_dir),
+            )
+            stdout, stderr = await proc.communicate()
+            out = stdout.decode("utf-8", errors="replace").strip()
+            err = stderr.decode("utf-8", errors="replace").strip()
+
+            if proc.returncode != 0:
+                await status_msg.edit_text(
+                    f"❌ <b>Ошибка при обновлении git (код {proc.returncode}):</b>\n\n"
+                    f"<code>{html.escape(err or out or 'Неизвестная ошибка')}</code>",
                     parse_mode="HTML",
                     reply_markup=back_to_menu_keyboard("nav_main"),
                 )
-            else:
-                await msg.answer(f"<code>{chunk}</code>", parse_mode="HTML")
-            if len(chunks) > 1:
-                await asyncio.sleep(0.1)
+                return
+
+            if "Already up to date" in out or "Уже обновлено" in out:
+                await status_msg.edit_text(
+                    f"✅ <b>Бот уже обновлен до последней версии!</b>\n\n"
+                    f"<code>{html.escape(out)}</code>",
+                    parse_mode="HTML",
+                    reply_markup=back_to_menu_keyboard("nav_main"),
+                )
+                return
+
+            # Успешно стянуто обновление
+            await status_msg.edit_text(
+                f"✅ <b>Обновление успешно загружено!</b>\n\n"
+                f"<code>{html.escape(out)}</code>\n\n"
+                "🔄 <b>Перезапуск бота...</b>\n"
+                "<i>Бот применит изменения через 2 секунды.</i>",
+                parse_mode="HTML",
+            )
+            log.info("🚀 Обновление через Git успешно применено: %s. Перезапуск бота...", out)
+
+            async def _do_restart():
+                await asyncio.sleep(2.0)
+                os._exit(0)
+
+            asyncio.create_task(_do_restart())
+
+        except Exception as e:
+            log.error("Ошибка при обновлении бота: %s", e, exc_info=True)
+            await status_msg.edit_text(
+                f"❌ <b>Ошибка:</b>\n<code>{html.escape(str(e))}</code>",
+                parse_mode="HTML",
+                reply_markup=back_to_menu_keyboard("nav_main"),
+            )
 
     # ── Раздел: Прокси и Пинг ────────────────────────────────────────────
     @dp.callback_query(F.data == "nav_proxies")
@@ -1581,65 +1733,182 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
 
 
 # ─────────────────────────────────────────────
-#  Чтение логов по временному диапазону
+#  Умное чтение логов
 # ─────────────────────────────────────────────
 
-def read_log_window(timestamp_str: str, log_dir: Path, window_sec: int = 10) -> list[str]:
+def read_logs_smart(query: str, log_dir: Path, max_lines: int = 50) -> tuple[str, list[str]]:
     """
-    Читает строки из scanner.log в окне [ts - window_sec, ts + window_sec].
-    timestamp_str: 'ЧЧ:ММ:СС', 'ЧЧ:ММ', или 'now'.
+    Умное чтение логов:
+    - 'now', пусто, или число (напр. '50') -> последние N строк из scanner.log
+    - 'buy', 'покупка' -> последние логи покупок
+    - 'err', 'error', 'ошибки' -> последние ошибки и предупреждения
+    - время '11:04:53' или '11:04' -> поиск строк в окрестности времени
+    - ключевое слово -> строки содержащие слово
     """
-    now = datetime.now()
-    raw = timestamp_str.strip().lower()
+    raw = (query or "").strip()
+    raw_lower = raw.lower()
 
-    if raw == "now":
-        target_dt = now
-        window_sec = 30
-    else:
+    candidates: list[Path] = []
+    main_log = log_dir / "scanner.log"
+    if main_log.exists():
+        candidates.append(main_log)
+    for p in sorted(log_dir.glob("scanner.log.*"), key=lambda f: f.stat().st_mtime, reverse=True):
+        if p not in candidates:
+            candidates.append(p)
+
+    if not candidates:
+        return "Лог-файлы не найдены в директории logs.", []
+
+    # 1. Запрос хвоста логов (tail): 'now', пусто, или число (напр. '30', '50', '100')
+    is_tail = False
+    n_lines = max_lines
+    if not raw or raw_lower in ("now", "сейчас", "хвост", "последние", "tail"):
+        is_tail = True
+        n_lines = 40
+    elif raw.isdigit():
+        is_tail = True
+        n_lines = max(5, min(int(raw), 150))
+
+    if is_tail:
+        collected: collections.deque[str] = collections.deque(maxlen=n_lines)
+        for log_path in candidates:
+            try:
+                with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        line_s = line.rstrip()
+                        if line_s:
+                            collected.append(line_s)
+                if len(collected) >= n_lines:
+                    break
+            except OSError:
+                pass
+        title = f"📋 Последние {len(collected)} строк лога:"
+        return title, list(collected)
+
+    # 2. Фильтр покупок ('buy', 'покупка', 'autobuy', 'сделка')
+    if raw_lower in ("buy", "покупка", "покупки", "autobuy", "сделка", "сделки"):
+        buy_lines: list[str] = []
+        keywords = ("buy", "покуп", "купил", "сделка", "[buy]", "[vault]")
+        for log_path in candidates:
+            try:
+                with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        line_lower = line.lower()
+                        if any(k in line_lower for k in keywords):
+                            buy_lines.append(line.rstrip())
+            except OSError:
+                pass
+            if len(buy_lines) >= 60:
+                break
+        buy_res = buy_lines[-50:]
+        title = f"🛒 Логи покупок ({len(buy_res)}):" if buy_res else "🛒 Логи покупок пока пусты."
+        return title, buy_res
+
+    # 3. Фильтр ошибок ('err', 'error', 'ошибки', 'warn', 'warning')
+    if raw_lower in ("err", "error", "errors", "ошибка", "ошибки", "warn", "warning"):
+        err_lines: list[str] = []
+        keywords = ("[error", "[warn", "[critical", "traceback", "exception")
+        for log_path in candidates:
+            try:
+                with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        line_lower = line.lower()
+                        if any(k in line_lower for k in keywords):
+                            err_lines.append(line.rstrip())
+            except OSError:
+                pass
+            if len(err_lines) >= 60:
+                break
+        err_res = err_lines[-50:]
+        title = f"⚠️ Ошибки и предупреждения ({len(err_res)}):" if err_res else "✅ Ошибок в логах не обнаружено."
+        return title, err_res
+
+    # 4. Поиск по времени (ЧЧ:ММ:СС или ЧЧ:ММ)
+    time_match = re.match(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?$", raw)
+    if time_match:
+        h = int(time_match.group(1))
+        m = int(time_match.group(2))
+        s = int(time_match.group(3)) if time_match.group(3) is not None else 0
+        has_sec = time_match.group(3) is not None
+        window = 30 if has_sec else 60
+
+        def search_by_time(target_h: int, target_m: int, target_s: int, win_s: int) -> list[str]:
+            target_sec = (target_h % 24) * 3600 + (target_m % 60) * 60 + (target_s % 60)
+            res: list[str] = []
+            _re_ts = re.compile(r"(\d{2}):(\d{2}):(\d{2})")
+            for log_path in candidates:
+                try:
+                    with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                        for line in f:
+                            m_ts = _re_ts.search(line[:30])
+                            if not m_ts:
+                                continue
+                            lh, lm, ls = int(m_ts.group(1)), int(m_ts.group(2)), int(m_ts.group(3))
+                            l_sec = lh * 3600 + lm * 60 + ls
+                            diff = abs(l_sec - target_sec)
+                            if diff <= win_s or diff >= (86400 - win_s):
+                                res.append(line.rstrip())
+                except OSError:
+                    pass
+                if len(res) >= 100:
+                    break
+            return res
+
+        matched = search_by_time(h, m, s, window)
+        note = ""
+        if not matched:
+            for offset_hours in (-3, -4, 3, 4):
+                try_matched = search_by_time((h + offset_hours) % 24, m, s, window)
+                if try_matched:
+                    matched = try_matched
+                    sign = "+" if offset_hours > 0 else ""
+                    note = f" (с поправкой на часовой пояс: {sign}{offset_hours}ч)"
+                    break
+
+        if matched:
+            return f"📋 Логи около {raw}{note} ({len(matched)} строк):", matched[-80:]
+
+        latest_ts = "неизвестно"
         try:
-            parts = raw.split(":")
-            h = int(parts[0])
-            m = int(parts[1]) if len(parts) > 1 else 0
-            s = int(parts[2]) if len(parts) > 2 else 0
-            target_dt = now.replace(hour=h, minute=m, second=s, microsecond=0)
-        except (ValueError, IndexError):
-            return []
+            with open(candidates[0], "r", encoding="utf-8", errors="replace") as f:
+                for line in collections.deque(f, maxlen=10):
+                    m_ts = re.search(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
+                    if m_ts:
+                        latest_ts = m_ts.group(1)
+        except Exception:
+            pass
 
-    start_dt = target_dt - timedelta(seconds=window_sec)
-    end_dt   = target_dt + timedelta(seconds=window_sec)
+        now_srv = datetime.now().strftime("%H:%M:%S")
+        return (
+            f"❌ В районе времени {raw} записей не найдено.\n"
+            f"🕒 Время сервера: {now_srv}\n"
+            f"🕒 Последняя запись в логе: {latest_ts}",
+            [],
+        )
 
-    # Ищем текущий лог-файл и вчерашний (на случай перехода через полночь)
-    date_str_today = now.strftime("%Y-%m-%d")
-    date_str_prev  = (now - timedelta(days=1)).strftime("%Y-%m-%d")
-    candidates = [
-        log_dir / "scanner.log",
-        log_dir / f"scanner.log.{date_str_today}",
-        log_dir / f"scanner.log.{date_str_prev}",
-    ]
-
-    matched: list[str] = []
-    # Формат строки: 2026-09-07 20:15:33 [INFO    ] ...
-    _ts_re = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
-
+    found_lines: list[str] = []
+    q_low = raw_lower
     for log_path in candidates:
-        if not log_path.exists():
-            continue
         try:
             with open(log_path, "r", encoding="utf-8", errors="replace") as f:
                 for line in f:
-                    m = _ts_re.match(line)
-                    if not m:
-                        continue
-                    try:
-                        line_dt = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
-                    except ValueError:
-                        continue
-                    if start_dt <= line_dt <= end_dt:
-                        matched.append(line.rstrip())
+                    if q_low in line.lower():
+                        found_lines.append(line.rstrip())
         except OSError:
             pass
+        if len(found_lines) >= 80:
+            break
 
-    return matched
+    if found_lines:
+        return f"🔍 Найдено по запросу '{raw}' ({len(found_lines)} строк):", found_lines[-60:]
+    else:
+        return f"❌ По запросу '{raw}' ничего не найдено в логах.", []
+
+
+def read_log_window(timestamp_str: str, log_dir: Path, window_sec: int = 10) -> list[str]:
+    """Сохраняем обратную совместимость."""
+    _, lines = read_logs_smart(timestamp_str, log_dir)
+    return lines
 
 
 # ─────────────────────────────────────────────

@@ -678,6 +678,12 @@ async def buy_gift_async(
         }
     }
 
+    t_start = time.monotonic()
+    _log.info(
+        "🛒 [BUY START] Лот ID=%s | цена=%.2f TON (%d nano) | proxy=%s",
+        gift_id, price_nano / 1e9, price_nano, "да" if proxies else "нет (прямой IP)",
+    )
+
     try:
         async with AsyncSession(impersonate="chrome124", proxies=proxies) as session:
             resp = await session.post(
@@ -686,48 +692,53 @@ async def buy_gift_async(
                 headers=headers,
                 timeout=timeout,
             )
-            _log.debug("buy %s: HTTP %d | %.200s", gift_id[:8], resp.status_code, resp.text[:200])
+            req_sec = time.monotonic() - t_start
+            _log.info(
+                "🛒 [BUY RESP] Лот ID=%s: HTTP %d (за %.2fс) | Body: %.500s",
+                gift_id, resp.status_code, req_sec, resp.text[:500],
+            )
             if resp.status_code in (200, 201):
                 try:
                     data = resp.json()
-                except Exception:
+                except Exception as json_err:
                     data = None
+                    _log.error("🛒 [BUY FAIL] Лот ID=%s: тело не JSON (%s): %.300s", gift_id, json_err, resp.text[:300])
 
                 if data is None:
-                    _log.warning("buy %s: HTTP 200 — тело не JSON: %.100s", gift_id[:8], resp.text[:100])
                     return False, "Не удалось разобрать ответ API (не JSON)", {}
 
                 # --- Детектируем явные ошибки при HTTP 200 ---
                 if isinstance(data, dict):
                     err_msg = data.get("error") or data.get("message") or data.get("msg") or ""
                     if err_msg and str(err_msg).lower() not in ("ok", "success", ""):
-                        _log.warning("buy %s: HTTP 200 — API ошибка: %s", gift_id[:8], err_msg)
+                        _log.warning("🛒 [BUY FAIL] Лот ID=%s: API вернул ошибку: %s", gift_id, err_msg)
                         return False, f"API: {str(err_msg)[:120]}", {}
                     if data.get("success") is False:
-                        _log.warning("buy %s: HTTP 200 — success=false", gift_id[:8])
+                        _log.warning("🛒 [BUY FAIL] Лот ID=%s: API вернул success=false: %s", gift_id, data)
                         return False, "API вернул success=false", {}
                     # Пустой словарь — покупка не подтверждена
                     if not data:
-                        _log.warning("buy %s: HTTP 200 — пустой ответ", gift_id[:8])
+                        _log.warning("🛒 [BUY FAIL] Лот ID=%s: API вернул пустой dict {}", gift_id)
                         return False, "API вернул пустой ответ (покупка не подтверждена)", {}
                     item = data
 
                 elif isinstance(data, list):
                     # Пустой список — лот скорее всего уже выкуплен
                     if not data:
-                        _log.warning("buy %s: HTTP 200 — пустой лист", gift_id[:8])
+                        _log.warning("🛒 [BUY FAIL] Лот ID=%s: API вернул пустой список [] (лот уже выкуплен)", gift_id)
                         return False, "Лот уже выкуплен или снят с продажи (пустой ответ)", {}
                     # Проверяем первый элемент на ошибку
                     first = data[0] if isinstance(data[0], dict) else {}
                     err_msg = first.get("error") or first.get("message") or ""
                     if err_msg and str(err_msg).lower() not in ("ok", "success", ""):
-                        _log.warning("buy %s: HTTP 200 list — %s", gift_id[:8], err_msg)
+                        _log.warning("🛒 [BUY FAIL] Лот ID=%s: API список вернул ошибку: %s", gift_id, err_msg)
                         return False, f"API: {str(err_msg)[:120]}", {}
                     item = first
                 else:
-                    _log.warning("buy %s: HTTP 200 — нежданный тип %s", gift_id[:8], type(data).__name__)
+                    _log.warning("🛒 [BUY FAIL] Лот ID=%s: нежданный тип %s: %.200s", gift_id, type(data).__name__, resp.text[:200])
                     return False, f"API вернул неожиданный формат: {type(data).__name__}", {}
 
+                _log.info("🛒 [BUY SUCCESS] Лот ID=%s успешно куплен! Ответ: %.300s", gift_id, str(item)[:300])
                 return True, "Подарок успешно куплен", item
             elif resp.status_code == 400:
                 err_text = resp.text
@@ -736,6 +747,7 @@ async def buy_gift_async(
                     msg = err_json.get("message") or err_json.get("error") or err_text
                 except Exception:
                     msg = err_text
+                _log.warning("🛒 [BUY 400] Лот ID=%s: %s | Ответ: %.500s", gift_id, msg, err_text[:500])
                 if "balance" in str(msg).lower():
                     reason = "Недостаточно средств на балансе маркета"
                 elif "price" in str(msg).lower():
@@ -744,15 +756,21 @@ async def buy_gift_async(
                     reason = f"Ошибка 400: {str(msg)[:80]}"
                 return False, reason, {}
             elif resp.status_code in (404, 409):
+                _log.warning("🛒 [BUY %d] Лот ID=%s уже выкуплен/снят | Ответ: %.300s", resp.status_code, gift_id, resp.text[:300])
                 return False, "Лот уже выкуплен другим пользователем или снят с продажи", {}
             elif resp.status_code == 401:
+                _log.error("🛒 [BUY 401] Лот ID=%s: токен просрочен! Ответ: %.300s", gift_id, resp.text[:300])
                 return False, "401 Unauthorized (токен авторизации протух)", {}
             elif resp.status_code == 429:
+                _log.warning("🛒 [BUY 429] Лот ID=%s: Too Many Requests | Ответ: %.300s", gift_id, resp.text[:300])
                 return False, "429 Too Many Requests (рейтлимит)", {}
             else:
+                _log.warning("🛒 [BUY HTTP %d] Лот ID=%s: Ответ: %.500s", resp.status_code, gift_id, resp.text[:500])
                 return False, f"HTTP {resp.status_code}: {resp.text[:80]}", {}
     except Exception as e:
+        elapsed_err = time.monotonic() - t_start
         err_msg = str(e) or e.__class__.__name__
+        _log.error("🛒 [BUY EXCEPTION] Лот ID=%s (%.2fс): %s", gift_id, elapsed_err, e, exc_info=True)
         if "timeout" in err_msg.lower():
             err_msg = "Таймаут запроса покупки"
         return False, err_msg, {}
@@ -794,11 +812,17 @@ async def verify_gift_in_vault_async(
             if resp.status_code == 200:
                 data = resp.json()
                 gifts = data.get("gifts", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
-                for g in gifts:
-                    if g.get("id") == gift_id:
-                        return True
-    except Exception:
-        pass
+                found = any(g.get("id") == gift_id for g in gifts)
+                if found:
+                    _log.info("🔍 [VAULT] Лот ID=%s подтверждён в инвентаре! ✅", gift_id)
+                else:
+                    first_ids = [g.get("id") for g in gifts[:5]]
+                    _log.warning("🔍 [VAULT] Лот ID=%s НЕ найден в инвентаре (в ответе %d шт, первые ID: %s)", gift_id, len(gifts), first_ids)
+                return found
+            else:
+                _log.warning("🔍 [VAULT] Запрос инвентаря вернул HTTP %d: %.200s", resp.status_code, resp.text[:200])
+    except Exception as e:
+        _log.warning("🔍 [VAULT] Ошибка запроса инвентаря ID=%s: %s", gift_id, e)
     return False
 
 

@@ -1022,7 +1022,7 @@ async def process_deal_async(
         if known_balance is not None and price_nano > known_balance:
             bal_ton = known_balance / 1e9
             reason = f"Недостаточно средств (баланс: {bal_ton:.2f} TON, цена: {price_ton:.2f} TON)"
-            log.warning("✖ %s #%s — пропущено: %s", deal_col, deal_num, reason)
+            log.warning("✖ [AUTOBUY SKIP] %s #%s — пропущено: %s", deal_col, deal_num, reason)
             await send_autobuy_skipped_notification(bot_token, admin_ids, deal, reason)
             # Присылаем обычный алерт с кнопкой ручной покупки
             await send_deal_notification(
@@ -1037,7 +1037,7 @@ async def process_deal_async(
 
         prim_slot = pool.get_primary_slot()
         if not prim_slot:
-            log.error("Покупка: нет активного основного слота")
+            log.error("❌ [AUTOBUY ERROR] Покупка %s #%s: нет активного основного слота!", deal_col, deal_num)
             await send_deal_notification(
                 bot_token,
                 admin_ids,
@@ -1048,7 +1048,7 @@ async def process_deal_async(
             )
             return
 
-        log.info("⚡ %s #%s  %.2f TON", deal_col, deal_num, price_ton)
+        log.info("🛒 [AUTOBUY START] %s #%s (ID=%s)  %.2f TON | Слот: %s", deal_col, deal_num, deal_gid, price_ton, prim_slot.label)
         t_buy = time.monotonic()
         # Оптимистичное списание баланса
         if scanner_state.primary_balance_nano is not None:
@@ -1077,7 +1077,7 @@ async def process_deal_async(
             # Проверяем попадание в Хранилище (инвентарь)
             in_vault = await verify_gift_in_vault_async(deal_gid, prim_slot.token, prim_slot.proxies)
             vault_icon = "✅" if in_vault else "⚠️не в инвентаре!"
-            log.info("✅ Куплен %s #%s за %.2fс  %s", deal_col, deal_num, elapsed, vault_icon)
+            log.info("✅ [AUTOBUY SUCCESS] Куплен %s #%s за %.2fс | Инвентарь: %s", deal_col, deal_num, elapsed, vault_icon)
             await send_autobuy_success_report(
                 bot_token=bot_token,
                 admin_ids=admin_ids,
@@ -1088,7 +1088,7 @@ async def process_deal_async(
                 scanner_state=scanner_state,
             )
         else:
-            log.warning("❌ %s #%s: %s (%.2fс)", deal_col, deal_num, buy_msg, elapsed)
+            log.warning("❌ [AUTOBUY FAIL] %s #%s: %s (%.2fс)", deal_col, deal_num, buy_msg, elapsed)
             await send_autobuy_failed_report(
                 bot_token=bot_token,
                 admin_ids=admin_ids,

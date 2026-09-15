@@ -6,6 +6,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     unzip \
     procps \
+    git \
  && rm -rf /var/lib/apt/lists/*
 
 # Install Xray core binary for Linux (amd64 / arm64)
