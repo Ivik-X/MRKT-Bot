@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-_log = logging.getLogger("scanner")
+_log = log = logging.getLogger("scanner")
 
 from xray_proxy import XrayProcess, load_proxies, filter_fast_proxies_async
 
