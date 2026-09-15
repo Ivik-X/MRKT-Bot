@@ -1767,7 +1767,7 @@ async def send_autobuy_success_report(
     floor_ton = floor / 1e9
     backdrop = gift.get("backdropName", "—")
 
-    vault_str = "Подтверждено в Хранилище ✅" if in_vault else "В Хранилище (по чеку покупки) ✅"
+    vault_str = "✅ Подтверждено в инвентаре" if in_vault else "⚠️ <b>Не найден в инвентаре!</b> Проверьте вручную."
     bal_str = (
         f"{scanner_state.primary_balance_nano / 1e9:.2f} TON"
         if scanner_state and scanner_state.primary_balance_nano is not None

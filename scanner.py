@@ -522,8 +522,8 @@ async def api_request_async(
                         _global_scanner_state.scan_interval = adaptor.interval
                         save_settings(_global_scanner_state)
                 last_exc = Exception(f"HTTP 429 (слот: {slot.label})")
-                pacing = max(0.6, getattr(_global_scanner_state, "scan_interval", 0.6))
-                await asyncio.sleep(pacing)
+                # Слот уже пенализирован; next_async() на следующей итерации
+                # сам подберёт свободный слот — дополнительный sleep не нужен.
                 continue
 
             r.raise_for_status()
@@ -567,8 +567,7 @@ async def api_request_async(
                         adaptor.on_429(PENALTY_429)
                         _global_scanner_state.scan_interval = adaptor.interval
                         save_settings(_global_scanner_state)
-                pacing = max(0.6, getattr(_global_scanner_state, "scan_interval", 0.6))
-                await asyncio.sleep(pacing)
+                # Слот пенализирован — next_async() сам выберет свободный слот.
             else:
                 log.warning("Ошибка %s %s | %s | %.2fс | %s", method.upper(), endpoint, slot.label, elapsed, e)
                 stats_tracker.record_error(err_name, str(e), slot.label, endpoint)

@@ -684,8 +684,39 @@ async def buy_gift_async(
                 timeout=timeout,
             )
             if resp.status_code in (200, 201):
-                data = resp.json()
-                item = data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else {})
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = None
+
+                if data is None:
+                    return False, "Не удалось разобрать ответ API (не JSON)", {}
+
+                # --- Детектируем явные ошибки при HTTP 200 ---
+                if isinstance(data, dict):
+                    err_msg = data.get("error") or data.get("message") or data.get("msg") or ""
+                    if err_msg and str(err_msg).lower() not in ("ok", "success", ""):
+                        return False, f"API: {str(err_msg)[:120]}", {}
+                    if data.get("success") is False:
+                        return False, "API вернул success=false", {}
+                    # Пустой словарь — покупка не подтверждена
+                    if not data:
+                        return False, "API вернул пустой ответ (покупка не подтверждена)", {}
+                    item = data
+
+                elif isinstance(data, list):
+                    # Пустой список — лот скорее всего уже выкуплен
+                    if not data:
+                        return False, "Лот уже выкуплен или снят с продажи (пустой ответ)", {}
+                    # Проверяем первый элемент на ошибку
+                    first = data[0] if isinstance(data[0], dict) else {}
+                    err_msg = first.get("error") or first.get("message") or ""
+                    if err_msg and str(err_msg).lower() not in ("ok", "success", ""):
+                        return False, f"API: {str(err_msg)[:120]}", {}
+                    item = first
+                else:
+                    return False, f"API вернул неожиданный формат: {type(data).__name__}", {}
+
                 return True, "Подарок успешно куплен", item
             elif resp.status_code == 400:
                 err_text = resp.text
