@@ -1078,7 +1078,13 @@ async def main() -> None:
     init_min_turnover = float(saved_settings.get("min_turnover_ratio", MIN_TURNOVER_RATIO))
     init_filter_balance = bool(saved_settings.get("filter_by_balance", FILTER_BY_BALANCE))
     init_autobuy = bool(saved_settings.get("auto_buy", False))
-    init_use_direct = bool(saved_settings.get("use_direct", pool.use_direct))
+    # Если в proxies.txt прямой IP отключён (все слоты строго через VPN),
+    # ни в коем случае не включаем direct из старых настроек settings.json
+    if not pool.use_direct:
+        init_use_direct = False
+    else:
+        init_use_direct = bool(saved_settings.get("use_direct", pool.use_direct))
+
     if pool.use_direct != init_use_direct:
         log.info("Режим прямого IP из settings.json: %s (ранее было %s)", init_use_direct, pool.use_direct)
         pool.set_use_direct(init_use_direct)
