@@ -1330,8 +1330,17 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
                 pass
 
             repo_dir = Path(__file__).resolve().parent
+            # Выполняем fetch и reset --hard, чтобы гарантированно синхронизироваться без конфликтов
+            fetch_proc = await asyncio.create_subprocess_exec(
+                "git", "fetch", "origin", "main",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(repo_dir),
+            )
+            await fetch_proc.communicate()
+
             proc = await asyncio.create_subprocess_exec(
-                "git", "pull", "origin", "main",
+                "git", "reset", "--hard", "origin/main",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(repo_dir),
