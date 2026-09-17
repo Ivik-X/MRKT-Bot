@@ -32,6 +32,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     CallbackQuery,
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
@@ -93,6 +94,8 @@ class ScannerState:
     penalties_429: list[float] = field(default_factory=list)  # таймстампы 429 за последний час
     use_direct: bool = False  # 1 слот без VPN на прямом IP сервера
     proxy_failures: list[float] = field(default_factory=list)  # таймстампы сбоев прокси за последние 2 часа
+    is_analyzing_feed: bool = False  # Флаг режима анализа ленты
+    feed_analysis_cancel: Optional[asyncio.Event] = None  # Сигнал отмены анализа ленты
 
     def record_proxy_failure(self, ts: Optional[float] = None) -> None:
         """Регистрирует факт сбоя прокси и очищает записи старше 2 часов."""
@@ -152,6 +155,7 @@ class BotStates(StatesGroup):
     waiting_for_turnover_ratio = State()
     waiting_for_log_time = State()
     waiting_for_custom_proxies = State()
+    waiting_for_feed_analysis_pages = State()
 
 
 # ─────────────────────────────────────────────
@@ -228,6 +232,9 @@ def main_keyboard(state: ScannerState) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [status_btn, InlineKeyboardButton(text="🔄 Обновить статус", callback_data="nav_main")],
             [
+                InlineKeyboardButton(text="⚡ Анализ истории ленты (<2с)", callback_data="fast_buys_menu"),
+            ],
+            [
                 InlineKeyboardButton(text="🔍 Поиск дешёвых", callback_data="find_cheap_feed"),
                 InlineKeyboardButton(text="🎯 Выкупы под фильтры", callback_data="find_filter_feed"),
             ],
@@ -246,6 +253,31 @@ def main_keyboard(state: ScannerState) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(text="📋 Просмотр логов", callback_data="nav_logs"),
                 InlineKeyboardButton(text="🚀 Загрузить обновление", callback_data="btn_git_update"),
+            ],
+        ]
+    )
+
+
+def fast_buys_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="50 стр (~1k)", callback_data="fb_pages_50"),
+                InlineKeyboardButton(text="200 стр (~4k)", callback_data="fb_pages_200"),
+            ],
+            [
+                InlineKeyboardButton(text="500 стр (~10k)", callback_data="fb_pages_500"),
+                InlineKeyboardButton(text="1000 стр (~20k)", callback_data="fb_pages_1000"),
+            ],
+            [
+                InlineKeyboardButton(text="2500 стр (~50k)", callback_data="fb_pages_2500"),
+                InlineKeyboardButton(text="5000 стр (~100k)", callback_data="fb_pages_5000"),
+            ],
+            [
+                InlineKeyboardButton(text="⌨️ Ввести своё число страниц", callback_data="fb_pages_custom"),
+            ],
+            [
+                InlineKeyboardButton(text="⬅️ Главное меню", callback_data="nav_main"),
             ],
         ]
     )
@@ -381,7 +413,12 @@ def back_to_menu_keyboard(target: str = "nav_main") -> InlineKeyboardMarkup:
 # ─────────────────────────────────────────────
 
 def format_main_text(state: ScannerState) -> str:
-    status_icon = "⏸ <b>НА ПАУЗЕ</b>" if state.is_paused else "🟢 <b>СКАНИРУЕТ</b>"
+    if getattr(state, "is_analyzing_feed", False):
+        status_icon = "⏳ <b>АНАЛИЗ ЛЕНТЫ (&le; 2с)</b>"
+    elif state.is_paused:
+        status_icon = "⏸ <b>НА ПАУЗЕ</b>"
+    else:
+        status_icon = "🟢 <b>СКАНИРУЕТ</b>"
     bf_str = f"{state.black_floor_nano / 1e9:.2f} TON" if state.black_floor_nano else "не определён"
 
     active_tokens = len(state.pool.get_tokens()) if state.pool else 0
@@ -506,6 +543,24 @@ def format_settings_text(state: ScannerState) -> str:
         f"   <i>(Пауза между запросами; при установке вручную авто-адаптация отключается)</i>"
     )
 
+
+
+def format_fast_buys_menu() -> str:
+    return (
+        "⚡ <b>Глубокий анализ истории выкупов (&le; 2 сек)</b>\n\n"
+        "Этот режим сканирует историю ленты <code>/feed</code> и находит все подарки, "
+        "которые были мгновенно выкуплены ботами или снайперами менее чем за <b>2.0 секунды</b> "
+        "после их выставления или снижения цены.\n\n"
+        "📝 <b>Что записывается в отчёт:</b>\n"
+        "• Время выставления и выкупа\n"
+        "• Скорость выкупа в <b>миллисекундах</b> (например, <code>350 мс</code>)\n"
+        "• Цена в TON, коллекция, модель, фон, номер и ID\n"
+        "• Рыночные данные: флор коллекции, скидка в %, флор черного фона, оборот, редкий номер\n\n"
+        "⚠️ <b>Внимание:</b> на время анализа основной сканер будет <b>автоматически приостановлен</b>, "
+        "а запросы будут распределяться по всем вашим токенам и прокси с безопасными задержками.\n\n"
+        "По итогу бот пришлёт вам <b>краткий отчёт</b> и полный <b>JSON-файл</b> со всеми данными.\n\n"
+        "Выберите количество страниц истории для анализа или введите своё:"
+    )
 
 
 def format_tokens_text(tokens: list[str], verified_info: Optional[dict] = None) -> str:
@@ -762,6 +817,232 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
         except Exception as e:
             log.error("Ошибка поиска по фильтрам в ленте: %s", e, exc_info=True)
             await status_msg.edit_text(f"❌ Ошибка при поиске по ленте: {e}")
+
+    # ── Режим глубокого анализа истории ленты (/feed <= 2с) ──────────────
+    async def _safe_edit_status(
+        bot: Bot,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        reply_markup: Optional[InlineKeyboardMarkup] = None,
+    ) -> None:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            pass
+
+    async def run_feed_analysis_session(
+        pages: int,
+        bot: Bot,
+        chat_id: int,
+        scanner_state: ScannerState,
+    ) -> None:
+        from feed_analyzer import FeedAnalyzer
+
+        if getattr(scanner_state, "is_analyzing_feed", False):
+            await bot.send_message(chat_id, "⚠️ Анализ ленты уже выполняется в данный момент!")
+            return
+
+        pool = scanner_state.pool
+        if not pool or not pool.slots:
+            await bot.send_message(chat_id, "❌ В пуле нет доступных токенов для запуска анализа.")
+            return
+
+        cancel_event = asyncio.Event()
+        scanner_state.feed_analysis_cancel = cancel_event
+
+        status_msg = await bot.send_message(
+            chat_id,
+            f"⏳ <b>Запуск анализа истории ленты...</b>\n\n"
+            f"• Страниц к анализу: <code>{pages:,}</code> (~{pages * 20:,} событий)\n"
+            f"• Порог выкупа: <code>&le; 2000 мс</code>\n\n"
+            f"⏸ <i>Основной сканер временно приостановлен.</i>\n"
+            f"🌐 <i>Запросы распределяются по пулу токенов и прокси...</i>",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="❌ Прервать анализ", callback_data="fb_cancel")]
+                ]
+            ),
+            parse_mode="HTML",
+        )
+
+        last_update_ts = 0.0
+
+        def on_progress(p_done: int, p_total: int, events: int, found: int) -> None:
+            nonlocal last_update_ts
+            now = time.monotonic()
+            if now - last_update_ts < 3.0:
+                return
+            last_update_ts = now
+            pct = int(p_done / p_total * 100) if p_total > 0 else 0
+            filled = int(pct / 10)
+            bar = "█" * filled + "░" * (10 - filled)
+            text = (
+                f"⏳ <b>Анализ ленты в процессе...</b>\n\n"
+                f"[{bar}] <b>{pct}%</b> (<code>{p_done:,}</code> / <code>{p_total:,}</code> стр)\n\n"
+                f"📦 Обработано событий: <code>{events:,}</code>\n"
+                f"⚡ Найдено выкупов &le; 2с: <b>{found:,}</b> шт.\n\n"
+                f"⏸ <i>Основной сканер приостановлен</i>"
+            )
+            asyncio.create_task(
+                _safe_edit_status(
+                    bot,
+                    chat_id,
+                    status_msg.message_id,
+                    text,
+                    reply_markup=InlineKeyboardMarkup(
+                        inline_keyboard=[
+                            [InlineKeyboardButton(text="❌ Прервать анализ", callback_data="fb_cancel")]
+                        ]
+                    ),
+                )
+            )
+
+        analyzer = FeedAnalyzer(pool=pool, scanner_state=scanner_state)
+        res = await analyzer.analyze_history(
+            max_pages=pages,
+            threshold_ms=2000,
+            on_progress=on_progress,
+            cancel_event=cancel_event,
+        )
+
+        status_word = "прерван пользователем" if res.cancelled else "успешно завершён"
+        status_icon = "🛑" if res.cancelled else "✅"
+
+        summary_lines = [
+            f"{status_icon} <b>Анализ истории {status_word}!</b>\n",
+            f"⏱ Время выполнения: <code>{res.elapsed_sec:.1f} с</code>",
+            f"📄 Проверено страниц: <code>{res.total_pages:,}</code> из {pages:,}",
+            f"📦 Обработано событий ленты: <code>{res.total_events:,}</code>",
+            f"⚡ <b>Найдено быстрых выкупов (&le; 2 сек):</b> <code>{len(res.matched_buys):,}</code> шт.\n",
+        ]
+
+        if res.matched_buys:
+            avg_dur = sum(r.duration_ms for r in res.matched_buys) / len(res.matched_buys)
+            fastest = min(r.duration_ms for r in res.matched_buys)
+            summary_lines.append("📊 <b>Статистика скорости:</b>")
+            summary_lines.append(f"• Самый быстрый выкуп: <b>{fastest} мс</b>")
+            summary_lines.append(f"• Среднее время выкупа: <b>{avg_dur:.0f} мс</b>\n")
+
+            top_fastest = sorted(res.matched_buys, key=lambda x: x.duration_ms)[:5]
+            summary_lines.append("🏆 <b>Топ-5 самых быстрых выкупов:</b>")
+            for i, r in enumerate(top_fastest, 1):
+                disc_str = f" (скидка {r.discount_pct:+.0f}%)" if r.discount_pct is not None else ""
+                summary_lines.append(
+                    f"{i}. <a href=\"{r.nft_url}\"><b>{html.escape(r.collection)} #{r.number}</b></a>\n"
+                    f"   ⚡ <code>{r.duration_ms} мс</code> | 💰 <b>{r.price_ton:.2f} TON</b>{disc_str}"
+                )
+            summary_lines.append("\n📎 <i>Полный отчёт в формате JSON отправлен файлом ниже.</i>")
+        else:
+            summary_lines.append("ℹ️ <i>Выкупов быстрее 2 секунд в просмотренном отрезке ленты не обнаружено.</i>")
+
+        summary_lines.append("\n▶️ <i>Основной сканер автоматически вернулся в штатный режим.</i>")
+
+        await _safe_edit_status(
+            bot,
+            chat_id,
+            status_msg.message_id,
+            "\n".join(summary_lines),
+            reply_markup=back_to_menu_keyboard("nav_main"),
+        )
+
+        # Присылаем JSON с полными данными пользователю
+        if res.matched_buys and res.json_path.exists():
+            try:
+                await bot.send_document(
+                    chat_id=chat_id,
+                    document=FSInputFile(str(res.json_path)),
+                    caption=f"📋 Полные данные быстрых выкупов ({len(res.matched_buys)} шт., JSON)",
+                )
+            except Exception as e:
+                log.warning("Не удалось отправить JSON файл: %s", e)
+
+        # Присылаем также CSV для удобного просмотра в Excel
+        if res.matched_buys and res.csv_path.exists():
+            try:
+                await bot.send_document(
+                    chat_id=chat_id,
+                    document=FSInputFile(str(res.csv_path)),
+                    caption=f"📊 Таблица быстрых выкупов (CSV для Excel)",
+                )
+            except Exception as e:
+                log.warning("Не удалось отправить CSV файл: %s", e)
+
+    @dp.callback_query(F.data == "fast_buys_menu")
+    async def cb_fast_buys_menu(cb: CallbackQuery, state: FSMContext):
+        await state.clear()
+        text = format_fast_buys_menu()
+        await cb.message.edit_text(text, reply_markup=fast_buys_keyboard(), parse_mode="HTML")
+        await cb.answer()
+
+    @dp.callback_query(F.data.startswith("fb_pages_"))
+    async def cb_fb_pages(cb: CallbackQuery, state: FSMContext):
+        val = cb.data.replace("fb_pages_", "")
+        if val == "custom":
+            await state.set_state(BotStates.waiting_for_feed_analysis_pages)
+            await cb.message.edit_text(
+                "⌨️ <b>Введите количество страниц истории для анализа:</b>\n\n"
+                "<i>(Каждая страница содержит 20 событий ленты. Например, <code>500</code> = 10 000 событий)</i>\n\n"
+                "Допустимое число: от <code>1</code> до <code>50 000</code>.",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="fast_buys_menu")]]
+                ),
+                parse_mode="HTML",
+            )
+            await cb.answer()
+            return
+
+        if not val.isdigit():
+            await cb.answer()
+            return
+
+        pages = int(val)
+        await cb.answer(f"🚀 Запуск анализа {pages:,} страниц...")
+        asyncio.create_task(
+            run_feed_analysis_session(
+                pages=pages,
+                bot=cb.bot,
+                chat_id=cb.message.chat.id,
+                scanner_state=scanner_state,
+            )
+        )
+
+    @dp.message(BotStates.waiting_for_feed_analysis_pages)
+    async def msg_feed_analysis_pages(msg: types.Message, state: FSMContext):
+        raw = (msg.text or "").strip().replace(" ", "").replace("_", "")
+        if not raw.isdigit():
+            await msg.answer("❌ Пожалуйста, введите целое положительное число (например, <code>500</code>):", parse_mode="HTML")
+            return
+
+        pages = int(raw)
+        if pages < 1 or pages > 50000:
+            await msg.answer("❌ Число страниц должно быть от 1 до 50 000. Введите корректное число:")
+            return
+
+        await state.clear()
+        asyncio.create_task(
+            run_feed_analysis_session(
+                pages=pages,
+                bot=msg.bot,
+                chat_id=msg.chat.id,
+                scanner_state=scanner_state,
+            )
+        )
+
+    @dp.callback_query(F.data == "fb_cancel")
+    async def cb_fb_cancel(cb: CallbackQuery):
+        if scanner_state.feed_analysis_cancel and not scanner_state.feed_analysis_cancel.is_set():
+            scanner_state.feed_analysis_cancel.set()
+            await cb.answer("🛑 Останавливаем анализ, сохраняю результаты и формирую JSON...", show_alert=True)
+        else:
+            await cb.answer("Анализ не запущен или уже завершается")
 
     # ── Раздел: Уведомления по категориям ────────────────────────────────
     @dp.callback_query(F.data == "nav_categories")
