@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Optional, Union
 
 from aiogram import Bot, Dispatcher, F, types
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -408,6 +409,27 @@ def back_to_menu_keyboard(target: str = "nav_main") -> InlineKeyboardMarkup:
     )
 
 
+
+async def safe_edit_text(
+    message: Message,
+    text: str,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+    parse_mode: str = "HTML",
+) -> bool:
+    """Безопасное редактирование сообщения Telegram с защитой от ошибки 'message is not modified'."""
+    try:
+        await message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+        return True
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e).lower():
+            return False
+        log.warning("safe_edit_text TelegramBadRequest: %s", e)
+        return False
+    except Exception as e:
+        log.warning("safe_edit_text ошибка: %s", e)
+        return False
+
+
 # ─────────────────────────────────────────────
 #  Формирование текста экранов
 # ─────────────────────────────────────────────
@@ -613,10 +635,7 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
         await state.clear()
         await cb.answer("🔄 Статус обновлен")
         text = format_main_text(scanner_state)
-        try:
-            await cb.message.edit_text(text, reply_markup=main_keyboard(scanner_state), parse_mode="HTML")
-        except Exception:
-            pass
+        await safe_edit_text(cb.message, text, reply_markup=main_keyboard(scanner_state), parse_mode="HTML")
 
     # ── Управление сканером (Пауза/Старт) ─────────────────────────────────
     @dp.callback_query(F.data == "scanner_pause")
@@ -624,14 +643,14 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
         scanner_state.is_paused = True
         await cb.answer("⏸ Сканер поставлен на паузу")
         text = format_main_text(scanner_state)
-        await cb.message.edit_text(text, reply_markup=main_keyboard(scanner_state), parse_mode="HTML")
+        await safe_edit_text(cb.message, text, reply_markup=main_keyboard(scanner_state), parse_mode="HTML")
 
     @dp.callback_query(F.data == "scanner_resume")
     async def cb_scanner_resume(cb: CallbackQuery):
         scanner_state.is_paused = False
         await cb.answer("▶️ Сканер возобновил работу")
         text = format_main_text(scanner_state)
-        await cb.message.edit_text(text, reply_markup=main_keyboard(scanner_state), parse_mode="HTML")
+        await safe_edit_text(cb.message, text, reply_markup=main_keyboard(scanner_state), parse_mode="HTML")
 
     @dp.callback_query(F.data == "refresh_floors")
     async def cb_refresh_floors(cb: CallbackQuery):
@@ -981,16 +1000,18 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
     @dp.callback_query(F.data == "fast_buys_menu")
     async def cb_fast_buys_menu(cb: CallbackQuery, state: FSMContext):
         await state.clear()
-        text = format_fast_buys_menu()
-        await cb.message.edit_text(text, reply_markup=fast_buys_keyboard(), parse_mode="HTML")
         await cb.answer()
+        text = format_fast_buys_menu()
+        await safe_edit_text(cb.message, text, reply_markup=fast_buys_keyboard(), parse_mode="HTML")
 
     @dp.callback_query(F.data.startswith("fb_pages_"))
     async def cb_fb_pages(cb: CallbackQuery, state: FSMContext):
         val = cb.data.replace("fb_pages_", "")
         if val == "custom":
             await state.set_state(BotStates.waiting_for_feed_analysis_pages)
-            await cb.message.edit_text(
+            await cb.answer()
+            await safe_edit_text(
+                cb.message,
                 "⌨️ <b>Введите количество страниц истории для анализа:</b>\n\n"
                 "<i>(Каждая страница содержит 20 событий ленты. Например, <code>500</code> = 10 000 событий)</i>\n\n"
                 "Допустимое число: от <code>1</code> до <code>50 000</code>.",
@@ -999,7 +1020,6 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
                 ),
                 parse_mode="HTML",
             )
-            await cb.answer()
             return
 
         if not val.isdigit():
@@ -1051,9 +1071,9 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
     @dp.callback_query(F.data == "nav_categories")
     async def cb_nav_categories(cb: CallbackQuery, state: FSMContext):
         await state.clear()
-        text = format_categories_text(scanner_state)
-        await cb.message.edit_text(text, reply_markup=categories_keyboard(scanner_state), parse_mode="HTML")
         await cb.answer()
+        text = format_categories_text(scanner_state)
+        await safe_edit_text(cb.message, text, reply_markup=categories_keyboard(scanner_state), parse_mode="HTML")
 
     @dp.callback_query(F.data.startswith("toggle_cat_"))
     async def cb_toggle_cat(cb: CallbackQuery):
@@ -1065,15 +1085,15 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
 
         await cb.answer(f"{cat}: {status}")
         text = format_categories_text(scanner_state)
-        await cb.message.edit_text(text, reply_markup=categories_keyboard(scanner_state), parse_mode="HTML")
+        await safe_edit_text(cb.message, text, reply_markup=categories_keyboard(scanner_state), parse_mode="HTML")
 
     # ── Раздел: Хранилище (Vault) ─────────────────────────────────────────
     @dp.callback_query(F.data == "nav_vault")
     async def cb_nav_vault(cb: CallbackQuery, state: FSMContext):
         await state.clear()
-        text = format_vault_text(scanner_state)
-        await cb.message.edit_text(text, reply_markup=vault_keyboard(scanner_state), parse_mode="HTML")
         await cb.answer()
+        text = format_vault_text(scanner_state)
+        await safe_edit_text(cb.message, text, reply_markup=vault_keyboard(scanner_state), parse_mode="HTML")
 
     @dp.callback_query(F.data == "vault_send_all")
     async def cb_vault_send_all(cb: CallbackQuery):
@@ -1084,7 +1104,8 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
 
         scanner_state.vault.clear()
         await cb.answer(f"Отправка {len(vault_deals)} сделок...")
-        await cb.message.edit_text(
+        await safe_edit_text(
+            cb.message,
             f"📤 <i>Отправка {len(vault_deals)} сделок из Хранилища в чат...</i>",
             parse_mode="HTML",
         )
@@ -1094,7 +1115,7 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
             await asyncio.sleep(0.08)
 
         text = format_vault_text(scanner_state)
-        await cb.message.edit_text(text, reply_markup=vault_keyboard(scanner_state), parse_mode="HTML")
+        await safe_edit_text(cb.message, text, reply_markup=vault_keyboard(scanner_state), parse_mode="HTML")
         await cb.message.answer(
             f"✅ Все <b>{len(vault_deals)}</b> сделок из Хранилища успешно отправлены!",
             reply_markup=back_to_menu_keyboard("nav_vault"),
@@ -1107,16 +1128,16 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
         scanner_state.vault.clear()
         await cb.answer(f"Хранилище очищено ({count} удалено)", show_alert=True)
         text = format_vault_text(scanner_state)
-        await cb.message.edit_text(text, reply_markup=vault_keyboard(scanner_state), parse_mode="HTML")
+        await safe_edit_text(cb.message, text, reply_markup=vault_keyboard(scanner_state), parse_mode="HTML")
 
     # ── Раздел: Токены ───────────────────────────────────────────────────
     @dp.callback_query(F.data == "nav_tokens")
     async def cb_nav_tokens(cb: CallbackQuery, state: FSMContext):
         await state.clear()
+        await cb.answer()
         tokens = scanner_state.pool.get_tokens() if scanner_state.pool else []
         text = format_tokens_text(tokens)
-        await cb.message.edit_text(text, reply_markup=tokens_keyboard(), parse_mode="HTML")
-        await cb.answer()
+        await safe_edit_text(cb.message, text, reply_markup=tokens_keyboard(), parse_mode="HTML")
 
     @dp.callback_query(F.data == "tokens_verify_all")
     async def cb_tokens_verify_all(cb: CallbackQuery):
@@ -1126,7 +1147,7 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
             return
 
         await cb.answer("🔍 Проверяем токены через MRKT API...")
-        await cb.message.edit_text("⏳ <i>Проверка токенов через MRKT API...</i>", parse_mode="HTML")
+        await safe_edit_text(cb.message, "⏳ <i>Проверка токенов через MRKT API...</i>", parse_mode="HTML")
 
         verified: dict[str, tuple[bool, str]] = {}
         for tok in tokens:
@@ -1134,18 +1155,18 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
             verified[tok] = (ok, msg)
 
         text = format_tokens_text(tokens, verified_info=verified)
-        await cb.message.edit_text(text, reply_markup=tokens_keyboard(), parse_mode="HTML")
+        await safe_edit_text(cb.message, text, reply_markup=tokens_keyboard(), parse_mode="HTML")
 
     @dp.callback_query(F.data == "tokens_add")
     async def cb_tokens_add(cb: CallbackQuery, state: FSMContext):
         await state.set_state(BotStates.waiting_for_add_token)
+        await cb.answer()
         text = (
             "➕ <b>Добавление токена</b>\n\n"
             "Отправьте токен (UUID) в ответном сообщении.\n"
             "<i>(Можно скопировать токен целиком, curl-запрос или строку авторизации — бот сам найдёт UUID).</i>"
         )
-        await cb.message.edit_text(text, reply_markup=back_to_menu_keyboard("nav_tokens"), parse_mode="HTML")
-        await cb.answer()
+        await safe_edit_text(cb.message, text, reply_markup=back_to_menu_keyboard("nav_tokens"), parse_mode="HTML")
 
     @dp.message(BotStates.waiting_for_add_token)
     async def msg_add_token(msg: Message, state: FSMContext):
@@ -1187,13 +1208,13 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
     @dp.callback_query(F.data == "tokens_replace")
     async def cb_tokens_replace(cb: CallbackQuery, state: FSMContext):
         await state.set_state(BotStates.waiting_for_replace_tokens)
+        await cb.answer()
         text = (
             "📝 <b>Полная замена токенов</b>\n\n"
             "Отправьте список новых токенов (по одному на строку, либо общий текст с токенами).\n"
             "⚠️ <i>Все старые токены будут заменены новыми!</i>"
         )
-        await cb.message.edit_text(text, reply_markup=back_to_menu_keyboard("nav_tokens"), parse_mode="HTML")
-        await cb.answer()
+        await safe_edit_text(cb.message, text, reply_markup=back_to_menu_keyboard("nav_tokens"), parse_mode="HTML")
 
     @dp.message(BotStates.waiting_for_replace_tokens)
     async def msg_replace_tokens(msg: Message, state: FSMContext):
@@ -1223,7 +1244,7 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
             return
 
         await cb.answer("🧹 Проверяем и удаляем протухшие токены...")
-        await cb.message.edit_text("⏳ <i>Идёт проверка токенов для очистки...</i>", parse_mode="HTML")
+        await safe_edit_text(cb.message, "⏳ <i>Идёт проверка токенов для очистки...</i>", parse_mode="HTML")
 
         valid_tokens = []
         removed = []
@@ -1238,7 +1259,8 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
                 valid_tokens.append(tok)
 
         if not valid_tokens and removed:
-            await cb.message.edit_text(
+            await safe_edit_text(
+                cb.message,
                 "⚠️ <b>Внимание!</b> Все токены вернули ошибку 401. Они не были удалены, чтобы сканер не остался без токенов.\n"
                 "Пожалуйста, добавьте новый токен через кнопку «Добавить токен».",
                 reply_markup=tokens_keyboard(),
@@ -1258,15 +1280,15 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
         else:
             text = "✅ <b>Протухших токенов (401) не обнаружено!</b> Все токены работают."
 
-        await cb.message.edit_text(text, reply_markup=tokens_keyboard(), parse_mode="HTML")
+        await safe_edit_text(cb.message, text, reply_markup=tokens_keyboard(), parse_mode="HTML")
 
     # ── Раздел: Настройки ────────────────────────────────────────────────
     @dp.callback_query(F.data == "nav_settings")
     async def cb_nav_settings(cb: CallbackQuery, state: FSMContext):
         await state.clear()
-        text = format_settings_text(scanner_state)
-        await cb.message.edit_text(text, reply_markup=settings_keyboard(scanner_state), parse_mode="HTML")
         await cb.answer()
+        text = format_settings_text(scanner_state)
+        await safe_edit_text(cb.message, text, reply_markup=settings_keyboard(scanner_state), parse_mode="HTML")
 
     @dp.callback_query(F.data == "toggle_autobuy")
     async def cb_toggle_autobuy(cb: CallbackQuery):
@@ -1275,7 +1297,7 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
         status_text = "включена 🟢" if scanner_state.auto_buy else "выключена 🔴"
         await cb.answer(f"Авто-покупка {status_text}")
         text = format_settings_text(scanner_state)
-        await cb.message.edit_text(text, reply_markup=settings_keyboard(scanner_state), parse_mode="HTML")
+        await safe_edit_text(cb.message, text, reply_markup=settings_keyboard(scanner_state), parse_mode="HTML")
 
     @dp.callback_query(F.data == "toggle_use_direct")
     async def cb_toggle_use_direct(cb: CallbackQuery):
@@ -1286,7 +1308,7 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
         status_text = "включён 🟢 (1 слот напрямую)" if scanner_state.use_direct else "выключен 🔴 (все через VPN)"
         await cb.answer(f"Прямой IP: {status_text}")
         text = format_settings_text(scanner_state)
-        await cb.message.edit_text(text, reply_markup=settings_keyboard(scanner_state), parse_mode="HTML")
+        await safe_edit_text(cb.message, text, reply_markup=settings_keyboard(scanner_state), parse_mode="HTML")
 
     @dp.callback_query(F.data == "toggle_balance_filter")
     async def cb_toggle_balance_filter(cb: CallbackQuery):
@@ -1301,14 +1323,16 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
                 if ok and "hard" in bdata:
                     scanner_state.primary_balance_nano = int(bdata["hard"])
         text = format_settings_text(scanner_state)
-        await cb.message.edit_text(text, reply_markup=settings_keyboard(scanner_state), parse_mode="HTML")
+        await safe_edit_text(cb.message, text, reply_markup=settings_keyboard(scanner_state), parse_mode="HTML")
 
 
     @dp.callback_query(F.data == "set_turnover_ratio")
     async def cb_set_turnover_ratio(cb: CallbackQuery, state: FSMContext):
         await state.set_state(BotStates.waiting_for_turnover_ratio)
+        await cb.answer()
         cur = f"{scanner_state.min_turnover_ratio:.1f}x" if scanner_state.min_turnover_ratio > 0 else "выключен (0.0)"
-        await cb.message.edit_text(
+        await safe_edit_text(
+            cb.message,
             f"📊 <b>Фильтр по обороту (оборот / цена) для NFT</b>\n\n"
             f"Текущий порог: <code>{cur}</code>\n\n"
             f"Отсекает «мёртвый груз» — лоты из непопулярных коллекций с низким оборотом.\n"
@@ -1341,6 +1365,7 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
             await cb.answer("В пуле нет токенов", show_alert=True)
             return
 
+        await cb.answer()
         kb_rows = []
         for i, tok in enumerate(tokens):
             is_prim = (i == 0)
@@ -1357,8 +1382,7 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
             "• Будут совершаться покупки\n\n"
             "Выберите аккаунт из списка ниже:"
         )
-        await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-        await cb.answer()
+        await safe_edit_text(cb.message, text, reply_markup=kb, parse_mode="HTML")
 
     @dp.callback_query(F.data.startswith("set_primary_"))
     async def cb_set_primary_token(cb: CallbackQuery):
@@ -1379,20 +1403,20 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
             log.error("Ошибка смены основного токена: %s", e)
             await cb.answer("Ошибка смены токена", show_alert=True)
 
-
         text = format_settings_text(scanner_state)
-        await cb.message.edit_text(text, reply_markup=settings_keyboard(scanner_state), parse_mode="HTML")
+        await safe_edit_text(cb.message, text, reply_markup=settings_keyboard(scanner_state), parse_mode="HTML")
 
     @dp.callback_query(F.data == "set_min_diff")
     async def cb_set_min_diff(cb: CallbackQuery, state: FSMContext):
         await state.set_state(BotStates.waiting_for_min_ton_diff)
-        await cb.message.edit_text(
+        await cb.answer()
+        await safe_edit_text(
+            cb.message,
             f"✏️ Текущий порог выгоды: <code>{scanner_state.min_ton_diff:.2f} TON</code>\n\n"
             f"Введите новое значение в TON (например <code>2.0</code> или <code>3.5</code>):",
             reply_markup=back_to_menu_keyboard("nav_settings"),
             parse_mode="HTML",
         )
-        await cb.answer()
 
     @dp.message(BotStates.waiting_for_min_ton_diff)
     async def msg_set_min_diff(msg: Message, state: FSMContext):
@@ -1410,13 +1434,14 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
     @dp.callback_query(F.data == "set_cheap")
     async def cb_set_cheap(cb: CallbackQuery, state: FSMContext):
         await state.set_state(BotStates.waiting_for_cheap_threshold)
-        await cb.message.edit_text(
+        await cb.answer()
+        await safe_edit_text(
+            cb.message,
             f"✏️ Текущий порог дешёвых подарков: <code>{scanner_state.cheap_price_threshold:.2f} TON</code>\n\n"
             f"Введите новое значение в TON (например <code>3.0</code>):",
             reply_markup=back_to_menu_keyboard("nav_settings"),
             parse_mode="HTML",
         )
-        await cb.answer()
 
     @dp.message(BotStates.waiting_for_cheap_threshold)
     async def msg_set_cheap(msg: Message, state: FSMContext):
@@ -1441,14 +1466,12 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
         scanner_state.scan_interval = new_val
         save_settings(scanner_state)
         mode_str = "авто" if (adaptor and adaptor.is_auto) else "ручной"
-        try:
-            await cb.message.edit_text(
-                format_settings_text(scanner_state),
-                reply_markup=settings_keyboard(scanner_state),
-                parse_mode="HTML",
-            )
-        except Exception:
-            pass
+        await safe_edit_text(
+            cb.message,
+            format_settings_text(scanner_state),
+            reply_markup=settings_keyboard(scanner_state),
+            parse_mode="HTML",
+        )
         await cb.answer(f"Интервал: {new_val:.2f}с ({mode_str})")
 
     @dp.callback_query(F.data == "interval_plus_005")
@@ -1461,24 +1484,24 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
         scanner_state.scan_interval = new_val
         save_settings(scanner_state)
         mode_str = "авто" if (adaptor and adaptor.is_auto) else "ручной"
-        try:
-            await cb.message.edit_text(
-                format_settings_text(scanner_state),
-                reply_markup=settings_keyboard(scanner_state),
-                parse_mode="HTML",
-            )
-        except Exception:
-            pass
+        await safe_edit_text(
+            cb.message,
+            format_settings_text(scanner_state),
+            reply_markup=settings_keyboard(scanner_state),
+            parse_mode="HTML",
+        )
         await cb.answer(f"Интервал: {new_val:.2f}с ({mode_str})")
 
     @dp.callback_query(F.data == "set_interval")
     async def cb_set_interval(cb: CallbackQuery, state: FSMContext):
         await state.set_state(BotStates.waiting_for_scan_interval)
+        await cb.answer()
         adaptor = getattr(scanner_state, "rate_adaptor", None)
         mode_str = "авто" if (adaptor and adaptor.is_auto) else "ручной"
         p429 = scanner_state.get_429_count_last_hour()
         p429_text = f"⚠️ Штрафов 429 за последний час: <b>{p429}</b>\n\n" if p429 > 0 else "Штрафов 429 за последний час: <code>0</code>\n\n"
-        await cb.message.edit_text(
+        await safe_edit_text(
+            cb.message,
             f"✏️ Текущий интервал: <code>{scanner_state.scan_interval:.2f} с</code> ({mode_str})\n"
             f"{p429_text}"
             f"Введите новый интервал в секундах (например <code>0.5</code>).\n"
@@ -1487,7 +1510,6 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
             reply_markup=back_to_menu_keyboard("nav_settings"),
             parse_mode="HTML",
         )
-        await cb.answer()
 
     @dp.message(BotStates.waiting_for_scan_interval)
     async def msg_set_interval(msg: Message, state: FSMContext):
@@ -1570,6 +1592,7 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
     @dp.callback_query(F.data == "nav_logs")
     async def cb_nav_logs(cb: CallbackQuery, state: FSMContext):
         await state.set_state(BotStates.waiting_for_log_time)
+        await cb.answer()
         now = datetime.now()
         now_str = now.strftime("%H:%M:%S")
         text = (
@@ -1580,8 +1603,7 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
             "• Время <code>11:04:53</code> или <code>11:04</code> — поиск (±30с)\n"
             "• Слово: <code>buy</code>, <code>429</code>, <code>error</code> — фильтр"
         )
-        await cb.message.edit_text(text, reply_markup=logs_keyboard(), parse_mode="HTML")
-        await cb.answer()
+        await safe_edit_text(cb.message, text, reply_markup=logs_keyboard(), parse_mode="HTML")
 
     @dp.callback_query(F.data == "logs_tail_30")
     async def cb_logs_tail_30(cb: CallbackQuery, state: FSMContext):
@@ -1657,7 +1679,16 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(repo_dir),
             )
-            await fetch_proc.communicate()
+            out_fetch, err_fetch = await fetch_proc.communicate()
+            if fetch_proc.returncode != 0:
+                err_msg = err_fetch.decode("utf-8", errors="replace").strip() or out_fetch.decode("utf-8", errors="replace").strip()
+                await status_msg.edit_text(
+                    f"❌ <b>Ошибка при связи с GitHub (git fetch):</b>\n\n"
+                    f"<code>{html.escape(err_msg or 'Не удалось подключиться к GitHub')}</code>",
+                    parse_mode="HTML",
+                    reply_markup=back_to_menu_keyboard("nav_main"),
+                )
+                return
 
             # Проверяем удаленный коммит
             p_remote = await asyncio.create_subprocess_exec(
@@ -1725,6 +1756,7 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
     # ── Раздел: Прокси и Пинг ────────────────────────────────────────────
     @dp.callback_query(F.data == "nav_proxies")
     async def cb_nav_proxies(cb: CallbackQuery):
+        await cb.answer()
         pool = scanner_state.pool
         proxies = pool.get_proxies() if pool else []
         reserves = getattr(pool, "_reserve_proxies", []) if pool else []
@@ -1763,8 +1795,7 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
             lines.append("\n💡 <i>Нажмите «🔍 Автопоиск», чтобы спарсить свежие прокси и отобрать топ с наименьшим пингом.</i>")
             text = "\n".join(lines)
 
-        await cb.message.edit_text(text, reply_markup=proxies_keyboard(), parse_mode="HTML")
-        await cb.answer()
+        await safe_edit_text(cb.message, text, reply_markup=proxies_keyboard(), parse_mode="HTML")
 
     @dp.callback_query(F.data == "proxies_reping")
     async def cb_proxies_reping(cb: CallbackQuery):
@@ -1774,7 +1805,7 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
             return
 
         await cb.answer("⚡ Замеряем пинг прокси...")
-        await cb.message.edit_text("⏳ <i>Замер пинга всех прокси к api.tgmrkt.io...</i>", parse_mode="HTML")
+        await safe_edit_text(cb.message, "⏳ <i>Замер пинга всех прокси к api.tgmrkt.io...</i>", parse_mode="HTML")
 
         tasks = [ping_proxy_async(p, timeout=2.5) for p in proxies]
         results = await asyncio.gather(*tasks)
@@ -1784,7 +1815,7 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
             status = f"⚡ <code>{lat:.0f} мс</code> (OK)" if ok else f"❌ {err}"
             lines.append(f"• <b>[{p.cfg.name}]</b>: {status}")
 
-        await cb.message.edit_text("\n".join(lines), reply_markup=proxies_keyboard(), parse_mode="HTML")
+        await safe_edit_text(cb.message, "\n".join(lines), reply_markup=proxies_keyboard(), parse_mode="HTML")
 
     @dp.callback_query(F.data == "proxies_autosearch")
     async def cb_proxies_autosearch(cb: CallbackQuery):
@@ -1794,7 +1825,8 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
             return
 
         await cb.answer("🔍 Запущен автопоиск прокси...")
-        await cb.message.edit_text(
+        await safe_edit_text(
+            cb.message,
             "⏳ <b>Автопоиск и замер быстрых прокси (≤800 мс)...</b>\n\n"
             "• Проверяем ваши личные сохранённые прокси (custom)...\n"
             "• Скачиваем базы <b>Databay</b> и <b>Proxifly</b> (SOCKS5 / HTTP)...\n"
@@ -1815,7 +1847,8 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
                 include_custom=True,
             )
         except Exception as e:
-            await cb.message.edit_text(
+            await safe_edit_text(
+                cb.message,
                 f"❌ <b>Ошибка при автопоиске:</b> {e}",
                 reply_markup=proxies_keyboard(),
                 parse_mode="HTML",
@@ -1824,7 +1857,8 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
 
         all_fast = custom_fast + public_fast
         if not all_fast:
-            await cb.message.edit_text(
+            await safe_edit_text(
+                cb.message,
                 "⚠️ <b>Ни один публичный прокси не прошёл порог скорости (≤800 мс).</b>\n\n"
                 "Серверы с пингом выше 800 мс были отбракованы. "
                 "Вы можете повторить поиск через пару минут или добавить свои приватные прокси кнопкой ниже.",
@@ -1856,13 +1890,15 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
 
         lines.append("\n💡 <i>Ваши личные прокси сохранены и всегда имеют приоритет. При сбоях бот моментально берёт следующий прокси из резерва.</i>")
 
-        await cb.message.edit_text("\n".join(lines), reply_markup=proxies_keyboard(), parse_mode="HTML")
+        await safe_edit_text(cb.message, "\n".join(lines), reply_markup=proxies_keyboard(), parse_mode="HTML")
 
     # ── Ручное управление своими прокси ──────────────────────────────────
     @dp.callback_query(F.data == "proxies_add_custom")
     async def cb_proxies_add_custom(cb: CallbackQuery, state: FSMContext):
         await state.set_state(BotStates.waiting_for_custom_proxies)
-        await cb.message.edit_text(
+        await cb.answer()
+        await safe_edit_text(
+            cb.message,
             "➕ <b>Добавление собственных прокси</b>\n\n"
             "Отправьте список ваших прокси (по одному на строку).\n\n"
             "<b>Поддерживаемые форматы:</b>\n"
@@ -1876,7 +1912,6 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
             reply_markup=back_to_menu_keyboard("nav_proxies"),
             parse_mode="HTML",
         )
-        await cb.answer()
 
     @dp.message(BotStates.waiting_for_custom_proxies)
     async def msg_add_custom_proxies(msg: Message, state: FSMContext):
@@ -1926,6 +1961,7 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
 
     @dp.callback_query(F.data == "proxies_list_custom")
     async def cb_proxies_list_custom(cb: CallbackQuery):
+        await cb.answer()
         from proxy_finder import load_custom_proxies
         custom_lines = load_custom_proxies()
         if not custom_lines:
@@ -1955,8 +1991,7 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
                 ]
             )
 
-        await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-        await cb.answer()
+        await safe_edit_text(cb.message, text, reply_markup=kb, parse_mode="HTML")
 
     @dp.callback_query(F.data == "proxies_clear_custom")
     async def cb_proxies_clear_custom(cb: CallbackQuery):
@@ -1970,7 +2005,7 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
                 [InlineKeyboardButton(text="⬅️ К списку прокси", callback_data="nav_proxies")],
             ]
         )
-        await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        await safe_edit_text(cb.message, text, reply_markup=kb, parse_mode="HTML")
 
     # ── Ручная покупка подарка из уведомления ─────────────────────────────
     @dp.callback_query(F.data.startswith("buy:"))
