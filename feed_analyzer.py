@@ -237,7 +237,7 @@ class FeedAnalyzer:
                 slot = await self.pool.next_async()
                 payload: dict[str, Any] = {
                     "count": DEFAULT_PAGE_SIZE,
-                    "type": ["sale", "listing", "change_price"],
+                    "type": ["sale", "listing"],
                 }
                 if cursor:
                     payload["cursor"] = cursor
@@ -280,10 +280,11 @@ class FeedAnalyzer:
                             continue
 
                         log.warning(
-                            "FeedAnalyzer: статус %s на странице %d (попытка %d)",
+                            "FeedAnalyzer: статус %s на странице %d (попытка %d): %s",
                             r.status_code,
                             page,
                             attempt + 1,
+                            r.text[:200],
                         )
                     except Exception as exc:
                         slot.record_timeout()
@@ -310,7 +311,7 @@ class FeedAnalyzer:
                     itype = item.get("type")
                     gift = item.get("gift") or {}
                     gid = gift.get("id")
-                    if not gid or gift.get("luckyBuy") or itype not in ("sale", "listing", "change_price"):
+                    if not gid or gift.get("luckyBuy") or itype not in ("sale", "listing"):
                         continue
 
                     # Парсим дату
