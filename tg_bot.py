@@ -66,6 +66,7 @@ class ScannerState:
     auto_buy: bool = False
     min_ton_diff: float = 2.5
     cheap_price_threshold: float = 3.0
+    min_margin_pct: float = 5.0
     scan_interval: float = 0.8
     scans_count: int = 0
     deals_count: int = 0
@@ -162,6 +163,7 @@ class BotStates(StatesGroup):
     waiting_for_add_token = State()
     waiting_for_replace_tokens = State()
     waiting_for_min_ton_diff = State()
+    waiting_for_min_margin = State()
     waiting_for_cheap_threshold = State()
     waiting_for_max_price = State()
     waiting_for_scan_interval = State()
@@ -382,6 +384,7 @@ def settings_keyboard(state: ScannerState) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="📊 Мин. оборот/цена (NFT)", callback_data="set_turnover_ratio")],
             [InlineKeyboardButton(text="👑 Сменить основной аккаунт", callback_data="nav_select_primary")],
             [InlineKeyboardButton(text="✏️ Порог выгоды (MIN_TON_DIFF)", callback_data="set_min_diff")],
+            [InlineKeyboardButton(text=f"📈 Мин. маржа: {getattr(state, 'min_margin_pct', 5.0):.1f}%", callback_data="set_min_margin")],
             [InlineKeyboardButton(text="✏️ Порог дешёвых (CHEAP_THRESHOLD)", callback_data="set_cheap")],
             [
                 InlineKeyboardButton(text="➖ 0.05с", callback_data="interval_minus_005"),
@@ -522,7 +525,7 @@ def format_main_text(state: ScannerState) -> str:
         f"📦 В хранилище: <b>{vault_count}</b> сделок\n\n"
         f"⚙️ <b>Параметры:</b>\n"
         f"• 🤖 AutoBuy: <b>{'🟢 ВКЛ' if state.auto_buy else '🔴 ВЫКЛ'}</b>\n"
-        f"• Порог выгоды: <code>{state.min_ton_diff:.2f} TON</code>\n"
+        f"• Порог выгоды: <code>{state.min_ton_diff:.2f} TON</code> (маржа: <code>{getattr(state, 'min_margin_pct', 5.0):.1f}%</code>)\n"
         f"• Дешёвые подарки: &lt; <code>{state.cheap_price_threshold:.2f} TON</code>\n"
         f"• Мин. оборот/цена: <code>{turnover_str}</code>\n"
         f"• Фильтр по балансу: <b>{filter_bal_str}</b>\n"
@@ -609,12 +612,14 @@ def format_settings_text(state: ScannerState) -> str:
         f"4. <b>Основной аккаунт:</b> <code>{primary_str}</code>\n"
         f"   <i>(Текущий баланс: <code>{bal_str}</code>; используется для покупок)</i>\n\n"
         f"5. <b>Порог выгоды (MIN_TON_DIFF):</b> <code>{state.min_ton_diff:.2f} TON</code>\n"
-        f"   <i>(Подарок покупается, если он дешевле флора минимум на это значение)</i>\n\n"
-        f"6. <b>Порог дешёвых (CHEAP_THRESHOLD):</b> <code>{state.cheap_price_threshold:.2f} TON</code>\n"
+        f"   <i>(Подарок покупается, если чистая прибыль после 2% комиссии и 0.1 TON за ордер ≥ этого значения)</i>\n\n"
+        f"6. <b>Минимальная маржа (%):</b> <code>{getattr(state, 'min_margin_pct', 5.0):.1f}%</code>\n"
+        f"   <i>(Защита капитала: чистый ROI после комиссий должен быть ≥ X%, отсекает дорогие зависшие лоты)</i>\n\n"
+        f"7. <b>Порог дешёвых (CHEAP_THRESHOLD):</b> <code>{state.cheap_price_threshold:.2f} TON</code>\n"
         f"   <i>(Любой подарок с ценой ниже этого порога считается выгодным)</i>\n\n"
-        f"7. <b>⚡ Интервал сканирования ({interval_mode}):</b> <code>{state.scan_interval:.2f} с</code>{p429_badge}\n"
+        f"8. <b>⚡ Интервал сканирования ({interval_mode}):</b> <code>{state.scan_interval:.2f} с</code>{p429_badge}\n"
         f"   <i>(Пауза между запросами; при установке вручную авто-адаптация отключается)</i>\n\n"
-        f"8. <b>🛑 Фильтр макс. цены подарка:</b> <code>{max_price_str}</code>\n"
+        f"9. <b>🛑 Фильтр макс. цены подарка:</b> <code>{max_price_str}</code>\n"
         f"   <i>(Подарки с ценой выше этого значения сканер сразу игнорирует)</i>"
     )
 
@@ -1611,6 +1616,39 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
         except ValueError:
             await msg.answer("❌ Пожалуйста, введите корректное положительное число (например 2.5):")
 
+    @dp.callback_query(F.data == "set_min_margin")
+    async def cb_set_min_margin(cb: CallbackQuery, state: FSMContext):
+        await state.set_state(BotStates.waiting_for_min_margin)
+        await cb.answer()
+        cur_m = getattr(scanner_state, "min_margin_pct", 5.0)
+        await safe_edit_text(
+            cb.message,
+            f"📈 <b>Минимальная чистая маржа (ROI)</b>\n\n"
+            f"Текущий порог: <code>{cur_m:.1f}%</code>\n\n"
+            f"Защищает от покупки дорогих подарков с небольшой разницей в цене, "
+            f"где комиссии биржи (2% с продажи + 0.1 TON за выставление) съедают прибыль или ведут к убытку.\n\n"
+            f"Введите новое значение в процентах (например <code>5.0</code> или <code>7.5</code>):",
+            reply_markup=back_to_menu_keyboard("nav_settings"),
+            parse_mode="HTML",
+        )
+
+    @dp.message(BotStates.waiting_for_min_margin)
+    async def msg_set_min_margin(msg: Message, state: FSMContext):
+        try:
+            val = float(msg.text.replace(",", ".").replace("%", "").strip())
+            if val < 0:
+                raise ValueError
+            scanner_state.min_margin_pct = val
+            save_settings(scanner_state)
+            await msg.answer(
+                f"✅ Минимальная чистая маржа изменена на <code>{val:.1f}%</code>",
+                reply_markup=back_to_menu_keyboard("nav_settings"),
+                parse_mode="HTML",
+            )
+            await state.clear()
+        except ValueError:
+            await msg.answer("❌ Пожалуйста, введите корректный процент (например 5.0):")
+
     @dp.callback_query(F.data == "set_cheap")
     async def cb_set_cheap(cb: CallbackQuery, state: FSMContext):
         await state.set_state(BotStates.waiting_for_cheap_threshold)
@@ -2562,8 +2600,12 @@ async def send_deal_notification(
         f"💰 <b>Цена:</b> <code>{price_ton:.2f} TON</code>\n"
         f"🎯 <b>Флор:</b> <code>{floor_ton:.2f} TON</code>\n"
         f"💵 <b>Выгода:</b> <code>{diff_ton:.2f} TON</code> (<b>{pct:.1f}%</b> скидка)\n"
-        f"🎨 <b>Фон:</b> {backdrop}\n"
     )
+    if deal.get("net_profit_ton") is not None:
+        net_profit = deal["net_profit_ton"]
+        margin_pct = deal.get("margin_pct", 0.0)
+        text += f"📈 <b>Чистыми (после 2% + 0.1 TON):</b> <code>+{net_profit:.2f} TON</code> (ROI: <b>{margin_pct:+.1f}%</b>)\n"
+    text += f"🎨 <b>Фон:</b> {backdrop}\n"
 
     if deal.get("turnover_ratio") is not None:
         tr = deal["turnover_ratio"]
@@ -2654,6 +2696,12 @@ async def send_autobuy_success_report(
         f"💰 <b>Куплено за:</b> <code>{price_ton:.2f} TON</code>\n"
         f"🎯 <b>Флор:</b> <code>{floor_ton:.2f} TON</code>\n"
         f"💵 <b>Выгода:</b> <code>{diff_ton:.2f} TON</code>\n"
+    )
+    if deal.get("net_profit_ton") is not None:
+        net_profit = deal["net_profit_ton"]
+        margin_pct = deal.get("margin_pct", 0.0)
+        text += f"📈 <b>Чистыми (после 2% + 0.1 TON):</b> <code>+{net_profit:.2f} TON</code> (ROI: <b>{margin_pct:+.1f}%</b>)\n"
+    text += (
         f"🎨 <b>Фон:</b> {backdrop}\n"
         f"📦 <b>Хранилище:</b> {vault_str}\n"
         f"💳 <b>Остаток баланса:</b> ~<code>{bal_str}</code>\n"

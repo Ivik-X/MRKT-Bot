@@ -75,7 +75,21 @@ RATE_ADAPT_WINDOW     = int(os.getenv("RATE_ADAPT_WINDOW", 30))
 RATE_UP_THRESHOLD     = float(os.getenv("RATE_UP_THRESHOLD", 0.15))
 RATE_DOWN_THRESHOLD   = float(os.getenv("RATE_DOWN_THRESHOLD", 0.04))
 
-BLACK_BACKDROPS = {"Black"}
+BLACK_BACKDROPS       = {"Black", "Onyx Black"}
+MRKT_FEE_PCT          = float(os.getenv("MRKT_FEE_PCT", 0.02))        # 2% маркетплейса
+MRKT_ORDER_FEE_TON    = float(os.getenv("MRKT_ORDER_FEE_TON", 0.10))  # 0.10 TON за выставление
+MIN_MARGIN_PCT        = float(os.getenv("MIN_MARGIN_PCT", 5.0))       # 5% минимальная чистая маржинальность
+
+def calc_net_profit(price_ton: float, floor_ton: float) -> tuple[float, float]:
+    """
+    Рассчитывает чистую прибыль (TON) и чистый ROI (%) после комиссий:
+    - 2% комиссия маркетплейса со стоимости продажи
+    - 0.10 TON комиссия за выставление ордера
+    """
+    net_proceeds = floor_ton * (1.0 - MRKT_FEE_PCT) - MRKT_ORDER_FEE_TON
+    net_profit = net_proceeds - price_ton
+    margin_pct = (net_profit / price_ton * 100.0) if price_ton > 0 else 0.0
+    return round(net_profit, 2), round(margin_pct, 1)
 
 TG_BOT_TOKEN     = os.getenv("TG_BOT_TOKEN", "").strip()
 TG_ADMIN_ID_RAW  = os.getenv("TG_ADMIN_ID", "").strip()
@@ -635,14 +649,14 @@ def check_gift(
     cheap_threshold: float = CHEAP_PRICE_THRESHOLD,
     min_turnover_ratio: float = 0.0,
     max_price_nano: int | None = None,
+    min_margin_pct: float = MIN_MARGIN_PCT,
 ) -> list[dict]:
     """
-    Три условия покупки:
-    1. Черный фон + цена ниже флора черного на min_ton_diff.
-    2. Цена < cheap_threshold (абсолютно дёшево).
-    3. Цена ниже флора коллекции (NFT floor) на min_ton_diff.
-
-    Доп. фильтры: баланс, оборот.
+    Три условия покупки (с защитой реального капитала):
+    1. Черный фон: чистая прибыль >= min_ton_diff И маржинальность >= min_margin_pct
+       (с учетом 2% комиссии маркета и 0.1 TON комиссии за ордер).
+    2. Цена < cheap_threshold И цена <= текущему флору коллекции (защита от оверпрайса).
+    3. Цена ниже флора коллекции: чистая прибыль >= min_ton_diff И маржинальность >= min_margin_pct.
     """
     deals: list[dict] = []
     price = gift.get("salePrice")
@@ -673,10 +687,11 @@ def check_gift(
     if not is_turnover_exempt and min_turnover_ratio > 0 and turnover_ratio < min_turnover_ratio:
         return deals
 
-    # 1. Чёрный фон
+    # 1. Чёрный фон (чистая выгода после 2% + 0.1 TON)
     if backdrop_name in BLACK_BACKDROPS and black_floor:
         diff_ton = tons(black_floor - price)
-        if diff_ton >= min_ton_diff:
+        net_profit, margin_pct = calc_net_profit(price_ton, tons(black_floor))
+        if net_profit >= min_ton_diff and margin_pct >= min_margin_pct:
             pct = (black_floor - price) / black_floor * 100
             deals.append({
                 "type": "BLACK",
@@ -685,27 +700,33 @@ def check_gift(
                 "floor": black_floor,
                 "pct": pct,
                 "diff_ton": diff_ton,
-                "floor_src": "черный фон",
+                "net_profit_ton": net_profit,
+                "margin_pct": margin_pct,
+                "floor_src": f"черный фон (чистыми: +{net_profit:.2f} TON, ROI: {margin_pct:+.1f}%)",
                 "turnover_ratio": turnover_ratio,
                 "collection_volume": col_vol,
             })
 
-    # 2. Абсолютно дёшево
+    # 2. Абсолютно дёшево (< cheap_threshold И цена <= флору коллекции)
     if price_ton < cheap_threshold:
         col_floor = collection_floors.get(collection_name, price)
-        diff_ton = tons(col_floor - price) if col_floor > price else 0.0
-        pct = (col_floor - price) / col_floor * 100 if col_floor > 0 else 0.0
-        deals.append({
-            "type": "CHEAP",
-            "gift": gift,
-            "price": price,
-            "floor": col_floor,
-            "pct": pct,
-            "diff_ton": diff_ton,
-            "floor_src": f"дешевле {cheap_threshold:.2f} TON",
-            "turnover_ratio": turnover_ratio,
-            "collection_volume": col_vol,
-        })
+        if price <= col_floor:
+            diff_ton = tons(col_floor - price) if col_floor > price else 0.0
+            pct = (col_floor - price) / col_floor * 100 if col_floor > 0 else 0.0
+            net_profit, margin_pct = calc_net_profit(price_ton, tons(col_floor))
+            deals.append({
+                "type": "CHEAP",
+                "gift": gift,
+                "price": price,
+                "floor": col_floor,
+                "pct": pct,
+                "diff_ton": diff_ton,
+                "net_profit_ton": net_profit,
+                "margin_pct": margin_pct,
+                "floor_src": f"дешевле {cheap_threshold:.2f} TON (чистыми: +{net_profit:.2f} TON)",
+                "turnover_ratio": turnover_ratio,
+                "collection_volume": col_vol,
+            })
 
     # 3. Флор коллекции (NFT) или редкий ID
     col_floor = collection_floors.get(collection_name)
@@ -715,6 +736,7 @@ def check_gift(
         max_allowed_low_id = int(col_floor * LOW_ID_MAX_FLOOR_RATIO) if is_low_id else -1
 
         if is_low_id and price <= max_allowed_low_id:
+            net_profit, margin_pct = calc_net_profit(price_ton, tons(col_floor))
             deals.append({
                 "type": "LOW_ID",
                 "gift": gift,
@@ -722,22 +744,28 @@ def check_gift(
                 "floor": col_floor,
                 "pct": pct,
                 "diff_ton": diff_ton,
+                "net_profit_ton": net_profit,
+                "margin_pct": margin_pct,
                 "floor_src": f"редкий ID #{low_id_val} (<=  {LOW_ID_MAX_FLOOR_RATIO*100:.0f}% флора)",
                 "turnover_ratio": turnover_ratio,
                 "collection_volume": col_vol,
             })
-        elif diff_ton >= min_ton_diff:
-            deals.append({
-                "type": "NFT",
-                "gift": gift,
-                "price": price,
-                "floor": col_floor,
-                "pct": pct,
-                "diff_ton": diff_ton,
-                "floor_src": f"флор коллекции {collection_name}",
-                "turnover_ratio": turnover_ratio,
-                "collection_volume": col_vol,
-            })
+        else:
+            net_profit, margin_pct = calc_net_profit(price_ton, tons(col_floor))
+            if net_profit >= min_ton_diff and margin_pct >= min_margin_pct:
+                deals.append({
+                    "type": "NFT",
+                    "gift": gift,
+                    "price": price,
+                    "floor": col_floor,
+                    "pct": pct,
+                    "diff_ton": diff_ton,
+                    "net_profit_ton": net_profit,
+                    "margin_pct": margin_pct,
+                    "floor_src": f"флор коллекции {collection_name} (чистыми: +{net_profit:.2f} TON, ROI: {margin_pct:+.1f}%)",
+                    "turnover_ratio": turnover_ratio,
+                    "collection_volume": col_vol,
+                })
 
     return deals
 
@@ -1082,6 +1110,7 @@ async def main() -> None:
     init_min_ton_diff = float(saved_settings.get("min_ton_diff", MIN_TON_DIFF))
     init_cheap_threshold = float(saved_settings.get("cheap_price_threshold", CHEAP_PRICE_THRESHOLD))
     init_max_price = float(saved_settings.get("max_gift_price_ton", 0.0))
+    init_min_margin = float(saved_settings.get("min_margin_pct", MIN_MARGIN_PCT))
     init_min_turnover = float(saved_settings.get("min_turnover_ratio", MIN_TURNOVER_RATIO))
     init_filter_balance = bool(saved_settings.get("filter_by_balance", FILTER_BY_BALANCE))
     init_autobuy = bool(saved_settings.get("auto_buy", False))
@@ -1115,6 +1144,7 @@ async def main() -> None:
         min_ton_diff=init_min_ton_diff,
         cheap_price_threshold=init_cheap_threshold,
         max_gift_price_ton=init_max_price,
+        min_margin_pct=init_min_margin,
         min_turnover_ratio=init_min_turnover,
         filter_by_balance=init_filter_balance,
         scan_interval=adaptor.interval,
@@ -1347,6 +1377,7 @@ async def main() -> None:
                                     cheap_threshold=scanner_state.cheap_price_threshold,
                                     min_turnover_ratio=scanner_state.min_turnover_ratio,
                                     max_price_nano=max_price_nano,
+                                    min_margin_pct=getattr(scanner_state, "min_margin_pct", MIN_MARGIN_PCT),
                                 )
                             )
 

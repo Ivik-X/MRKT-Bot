@@ -26,6 +26,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "min_ton_diff": 2.5,
     "cheap_price_threshold": 3.0,
     "max_gift_price_ton": 0.0,
+    "min_margin_pct": 5.0,
     "min_turnover_ratio": 0.0,
     "scan_interval": 0.8,
     "notify_categories": {
@@ -115,6 +116,11 @@ def load_settings() -> dict[str, Any]:
                                 data["max_gift_price_ton"] = float(data["max_gift_price_ton"])
                             except (ValueError, TypeError):
                                 data["max_gift_price_ton"] = 0.0
+                        if "min_margin_pct" in data:
+                            try:
+                                data["min_margin_pct"] = float(data["min_margin_pct"])
+                            except (ValueError, TypeError):
+                                data["min_margin_pct"] = 5.0
                         log.info("Загружены персистентные настройки из %s", path)
                         return data
             except Exception as e:
@@ -140,6 +146,7 @@ def save_settings(state_or_dict: Any) -> bool:
             "min_ton_diff": float(getattr(state, "min_ton_diff", 2.5)),
             "cheap_price_threshold": float(getattr(state, "cheap_price_threshold", 3.0)),
             "max_gift_price_ton": float(getattr(state, "max_gift_price_ton", 0.0)),
+            "min_margin_pct": float(getattr(state, "min_margin_pct", 5.0)),
             "min_turnover_ratio": float(getattr(state, "min_turnover_ratio", 0.0)),
             "scan_interval": float(getattr(state, "scan_interval", 0.5)),
             "notify_categories": norm_cats,
@@ -155,6 +162,11 @@ def save_settings(state_or_dict: Any) -> bool:
                 data["max_gift_price_ton"] = float(data["max_gift_price_ton"])
             except (ValueError, TypeError):
                 data["max_gift_price_ton"] = 0.0
+        if "min_margin_pct" in data:
+            try:
+                data["min_margin_pct"] = float(data["min_margin_pct"])
+            except (ValueError, TypeError):
+                data["min_margin_pct"] = 5.0
     else:
         log.error("save_settings: недопустимый тип %s", type(state_or_dict))
         return False
