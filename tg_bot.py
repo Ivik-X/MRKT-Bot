@@ -77,13 +77,14 @@ class ScannerState:
     last_deal: Optional[dict] = None
     primary_balance_nano: Optional[int] = None
     filter_by_balance: bool = False
+    max_gift_price_ton: float = 0.0
     min_turnover_ratio: float = 0.0
     collection_volumes: dict[str, int] = field(default_factory=dict)
-    notify_categories: dict[str, bool] = field(default_factory=lambda: {
-        "BLACK":  os.getenv("NOTIFY_BLACK",  "true").lower() in ("1", "true", "yes"),
-        "CHEAP":  os.getenv("NOTIFY_CHEAP",  "true").lower() in ("1", "true", "yes"),
-        "NFT":    os.getenv("NOTIFY_NFT",    "true").lower() in ("1", "true", "yes"),
-        "LOW_ID": os.getenv("NOTIFY_LOW_ID", "true").lower() in ("1", "true", "yes"),
+    notify_categories: dict[str, str] = field(default_factory=lambda: {
+        "BLACK":  "autobuy",
+        "CHEAP":  "autobuy",
+        "NFT":    "autobuy",
+        "LOW_ID": "autobuy",
     })
     vault: list[dict] = field(default_factory=list)
     # Хранилище отправленных алертов для пометки выкупленных
@@ -97,6 +98,16 @@ class ScannerState:
     proxy_failures: list[float] = field(default_factory=list)  # таймстампы сбоев прокси за последние 2 часа
     is_analyzing_feed: bool = False  # Флаг режима анализа ленты
     feed_analysis_cancel: Optional[asyncio.Event] = None  # Сигнал отмены анализа ленты
+
+    def get_category_mode(self, cat: str) -> str:
+        """Возвращает режим категории: 'autobuy' | 'notify' | 'off'."""
+        val = self.notify_categories.get(cat, "autobuy")
+        if isinstance(val, bool):
+            return "autobuy" if val else "off"
+        val_str = str(val).lower()
+        if val_str in ("autobuy", "notify", "off"):
+            return val_str
+        return "autobuy"
 
     def record_proxy_failure(self, ts: Optional[float] = None) -> None:
         """Регистрирует факт сбоя прокси и очищает записи старше 2 часов."""
@@ -152,11 +163,13 @@ class BotStates(StatesGroup):
     waiting_for_replace_tokens = State()
     waiting_for_min_ton_diff = State()
     waiting_for_cheap_threshold = State()
+    waiting_for_max_price = State()
     waiting_for_scan_interval = State()
     waiting_for_turnover_ratio = State()
     waiting_for_log_time = State()
     waiting_for_custom_proxies = State()
     waiting_for_feed_analysis_pages = State()
+    waiting_for_full_history_pages = State()
 
 
 # ─────────────────────────────────────────────
@@ -233,7 +246,8 @@ def main_keyboard(state: ScannerState) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [status_btn, InlineKeyboardButton(text="🔄 Обновить статус", callback_data="nav_main")],
             [
-                InlineKeyboardButton(text="⚡ Анализ истории ленты (<2с)", callback_data="fast_buys_menu"),
+                InlineKeyboardButton(text="⚡ Быстрые выкупы (<2с)", callback_data="fast_buys_menu"),
+                InlineKeyboardButton(text="📋 Вся история ленты", callback_data="full_history_menu"),
             ],
             [
                 InlineKeyboardButton(text="🔍 Поиск дешёвых", callback_data="find_cheap_feed"),
@@ -276,6 +290,31 @@ def fast_buys_keyboard() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(text="⌨️ Ввести своё число страниц", callback_data="fb_pages_custom"),
+            ],
+            [
+                InlineKeyboardButton(text="⬅️ Главное меню", callback_data="nav_main"),
+            ],
+        ]
+    )
+
+
+def full_history_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="50 стр (~1k)", callback_data="fh_pages_50"),
+                InlineKeyboardButton(text="200 стр (~4k)", callback_data="fh_pages_200"),
+            ],
+            [
+                InlineKeyboardButton(text="500 стр (~10k)", callback_data="fh_pages_500"),
+                InlineKeyboardButton(text="1000 стр (~20k)", callback_data="fh_pages_1000"),
+            ],
+            [
+                InlineKeyboardButton(text="2500 стр (~50k)", callback_data="fh_pages_2500"),
+                InlineKeyboardButton(text="5000 стр (~100k)", callback_data="fh_pages_5000"),
+            ],
+            [
+                InlineKeyboardButton(text="⌨️ Ввести своё число страниц", callback_data="fh_pages_custom"),
             ],
             [
                 InlineKeyboardButton(text="⬅️ Главное меню", callback_data="nav_main"),
@@ -329,6 +368,8 @@ def settings_keyboard(state: ScannerState) -> InlineKeyboardMarkup:
     bal_toggle_text = "🟢 ВКЛ" if state.filter_by_balance else "🔴 ВЫКЛ"
     autobuy_toggle_text = "🟢 ВКЛ" if state.auto_buy else "🔴 ВЫКЛ"
     direct_toggle_text = "🟢 ВКЛ" if getattr(state, "use_direct", False) else "🔴 ВЫКЛ"
+    max_p = getattr(state, "max_gift_price_ton", 0.0)
+    max_p_btn = f"🛑 Макс. цена: {max_p:.1f} TON" if max_p > 0 else "🛑 Макс. цена: ВЫКЛ"
     p429 = state.get_429_count_last_hour()
     p429_badge = f" (429: {p429}/ч)" if p429 > 0 else " (429: 0)"
     interval_btn_text = f"✏️ {state.scan_interval:.2f}с{p429_badge}"
@@ -337,6 +378,7 @@ def settings_keyboard(state: ScannerState) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text=f"🤖 Авто-покупка (AutoBuy): {autobuy_toggle_text}", callback_data="toggle_autobuy")],
             [InlineKeyboardButton(text=f"🌐 Прямой IP сервера: {direct_toggle_text}", callback_data="toggle_use_direct")],
             [InlineKeyboardButton(text=f"💰 Фильтр по балансу: {bal_toggle_text}", callback_data="toggle_balance_filter")],
+            [InlineKeyboardButton(text=max_p_btn, callback_data="set_max_price")],
             [InlineKeyboardButton(text="📊 Мин. оборот/цена (NFT)", callback_data="set_turnover_ratio")],
             [InlineKeyboardButton(text="👑 Сменить основной аккаунт", callback_data="nav_select_primary")],
             [InlineKeyboardButton(text="✏️ Порог выгоды (MIN_TON_DIFF)", callback_data="set_min_diff")],
@@ -371,13 +413,18 @@ def categories_keyboard(state: ScannerState) -> InlineKeyboardMarkup:
     cat_names = {
         "BLACK":  "🖤 Чёрный фон",
         "CHEAP":  "💸 Сверхдешёвые",
-        "NFT":    "🎯 Ниже флора коллекции",
+        "NFT":    "🎯 Ниже флора",
         "LOW_ID": "🏷️ Редкий ID (<100)",
+    }
+    mode_labels = {
+        "autobuy": "⚡ Автопокупка",
+        "notify":  "🔔 Только уведомл.",
+        "off":     "🔴 Отключено",
     }
     rows = []
     for cat_key, cat_label in cat_names.items():
-        is_on = state.notify_categories.get(cat_key, True)
-        status = "🟢 ВКЛ" if is_on else "🔴 ВЫКЛ (в хранилище)"
+        mode = state.get_category_mode(cat_key)
+        status = mode_labels.get(mode, "⚡ Автопокупка")
         rows.append([
             InlineKeyboardButton(
                 text=f"{cat_label}: {status}",
@@ -496,12 +543,14 @@ def format_main_text(state: ScannerState) -> str:
 
 def format_categories_text(state: ScannerState) -> str:
     vault_len = len(state.vault) if state.vault else 0
+    autobuy_status = "🟢 ВКЛ" if state.auto_buy else "🔴 ВЫКЛ"
     return (
-        f"🔔 <b>Уведомления по категориям</b>\n\n"
-        f"Нажмите на категорию, чтобы включить или выключить моментальные алерты в чат:\n\n"
-        f"• <b>ВКЛ 🟢</b> — алерты сразу приходят в этот чат.\n"
-        f"• <b>ВЫКЛ 🔴</b> — алерты не спамят в чат, а бережно сохраняются в 📦 <b>Хранилище</b> (сейчас там: <b>{vault_len}</b> шт.). "
-        f"Вы можете выгрузить их все одной кнопкой в любой удобный момент.\n"
+        f"🔔 <b>Управление категориями подарков</b>\n\n"
+        f"Глобальный AutoBuy: <b>{autobuy_status}</b>\n\n"
+        f"Нажмите на категорию, чтобы переключить режим:\n\n"
+        f"• ⚡ <b>Автопокупка</b> — мгновенный выкуп с основного аккаунта (если глобальный AutoBuy включен), либо алерт в чат с кнопкой покупки.\n"
+        f"• 🔔 <b>Только уведомления</b> — присылает алерт в чат с кнопкой ручной покупки <code>[💳 Купить]</code>, <b>никогда не выкупает автоматически</b>.\n"
+        f"• 🔴 <b>Отключено</b> — полностью глушит алерты в чат, сделки сохраняются в 📦 <b>Хранилище</b> (сейчас там: <b>{vault_len}</b> шт.).\n"
     )
 
 
@@ -536,6 +585,8 @@ def format_settings_text(state: ScannerState) -> str:
     direct_str = "🟢 ВКЛ (1 слот напрямую)" if getattr(state, "use_direct", False) else "🔴 ВЫКЛ (все через VPN)"
     bal_str = f"{state.primary_balance_nano / 1e9:.2f} TON" if state.primary_balance_nano is not None else "не проверен"
     filter_bal_str = "🟢 ВКЛ" if state.filter_by_balance else "🔴 ВЫКЛ"
+    max_p = getattr(state, "max_gift_price_ton", 0.0)
+    max_price_str = f"≤ {max_p:.2f} TON" if max_p > 0 else "без ограничений (выключен)"
     turnover_str = f"≥ {state.min_turnover_ratio:.1f}x" if state.min_turnover_ratio > 0 else "выключен (0.0)"
     primary_tok = state.pool.primary_token if state.pool else None
     primary_str = _mask_token(primary_tok) if primary_tok else "не задан"
@@ -562,7 +613,9 @@ def format_settings_text(state: ScannerState) -> str:
         f"6. <b>Порог дешёвых (CHEAP_THRESHOLD):</b> <code>{state.cheap_price_threshold:.2f} TON</code>\n"
         f"   <i>(Любой подарок с ценой ниже этого порога считается выгодным)</i>\n\n"
         f"7. <b>⚡ Интервал сканирования ({interval_mode}):</b> <code>{state.scan_interval:.2f} с</code>{p429_badge}\n"
-        f"   <i>(Пауза между запросами; при установке вручную авто-адаптация отключается)</i>"
+        f"   <i>(Пауза между запросами; при установке вручную авто-адаптация отключается)</i>\n\n"
+        f"8. <b>🛑 Фильтр макс. цены подарка:</b> <code>{max_price_str}</code>\n"
+        f"   <i>(Подарки с ценой выше этого значения сканер сразу игнорирует)</i>"
     )
 
 
@@ -582,6 +635,23 @@ def format_fast_buys_menu() -> str:
         "а запросы будут распределяться по всем вашим токенам и прокси с безопасными задержками.\n\n"
         "По итогу бот пришлёт вам <b>краткий отчёт</b> и полный <b>JSON-файл</b> со всеми данными.\n\n"
         "Выберите количество страниц истории для анализа или введите своё:"
+    )
+
+
+def format_full_history_menu() -> str:
+    return (
+        "📋 <b>Полная выгрузка всей истории ленты (/feed)</b>\n\n"
+        "Этот режим сканирует историю ленты и сохраняет <b>все события продаж и листингов</b>, "
+        "с детальной информацией о каждом подарке, флорах, объемах и скорости выкупа.\n\n"
+        "📝 <b>Каждая запись содержит:</b>\n"
+        "• <code>fast_buy</code>: <code>true</code> (если выкуплен &le; 2 сек) или <code>false</code>\n"
+        "• Время выставления, время покупки и дельту в миллисекундах (если листинг найден)\n"
+        "• Цену в TON, коллекцию, модель, фон, номер и ID\n"
+        "• Рыночные флоры, процент скидки, оборот коллекции\n\n"
+        "⚠️ <b>Внимание:</b> на время выгрузки основной сканер будет <b>автоматически приостановлен</b>, "
+        "а запросы будут распределяться по всем вашим токенам и прокси с безопасными задержками.\n\n"
+        "По итогу бот пришлёт вам <b>краткий отчёт</b>, а также полные файлы <b>JSON</b> и <b>CSV</b> со всеми данными.\n\n"
+        "Выберите количество страниц истории для выгрузки или введите своё:"
     )
 
 
@@ -865,6 +935,7 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
         bot: Bot,
         chat_id: int,
         scanner_state: ScannerState,
+        mode: str = "fast_buys",
     ) -> None:
         from feed_analyzer import FeedAnalyzer
 
@@ -880,11 +951,15 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
         cancel_event = asyncio.Event()
         scanner_state.feed_analysis_cancel = cancel_event
 
+        is_full = (mode == "full_history")
+        header_title = "📋 <b>Запуск выгрузки всей истории ленты...</b>" if is_full else "⚡ <b>Запуск анализа истории ленты (&le; 2с)...</b>"
+        mode_note = "• Режим: <b>все события (с флагом fast_buy)</b>\n\n" if is_full else "• Порог выкупа: <code>&le; 2000 мс</code>\n\n"
+
         status_msg = await bot.send_message(
             chat_id,
-            f"⏳ <b>Запуск анализа истории ленты...</b>\n\n"
+            f"{header_title}\n\n"
             f"• Страниц к анализу: <code>{pages:,}</code> (~{pages * 20:,} событий)\n"
-            f"• Порог выкупа: <code>&le; 2000 мс</code>\n\n"
+            f"{mode_note}"
             f"⏸ <i>Основной сканер временно приостановлен.</i>\n"
             f"🌐 <i>Запросы распределяются по пулу токенов и прокси...</i>",
             reply_markup=InlineKeyboardMarkup(
@@ -906,11 +981,12 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
             pct = int(p_done / p_total * 100) if p_total > 0 else 0
             filled = int(pct / 10)
             bar = "█" * filled + "░" * (10 - filled)
+            found_label = f"💾 Сохранено записей: <b>{found:,}</b> шт." if is_full else f"⚡ Найдено выкупов &le; 2с: <b>{found:,}</b> шт."
             text = (
                 f"⏳ <b>Анализ ленты в процессе...</b>\n\n"
                 f"[{bar}] <b>{pct}%</b> (<code>{p_done:,}</code> / <code>{p_total:,}</code> стр)\n\n"
                 f"📦 Обработано событий: <code>{events:,}</code>\n"
-                f"⚡ Найдено выкупов &le; 2с: <b>{found:,}</b> шт.\n\n"
+                f"{found_label}\n\n"
                 f"⏸ <i>Основной сканер приостановлен</i>"
             )
             asyncio.create_task(
@@ -931,6 +1007,7 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
         res = await analyzer.analyze_history(
             max_pages=pages,
             threshold_ms=2000,
+            mode=mode,
             on_progress=on_progress,
             cancel_event=cancel_event,
         )
@@ -938,32 +1015,55 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
         status_word = "прерван пользователем" if res.cancelled else "успешно завершён"
         status_icon = "🛑" if res.cancelled else "✅"
 
-        summary_lines = [
-            f"{status_icon} <b>Анализ истории {status_word}!</b>\n",
-            f"⏱ Время выполнения: <code>{res.elapsed_sec:.1f} с</code>",
-            f"📄 Проверено страниц: <code>{res.total_pages:,}</code> из {pages:,}",
-            f"📦 Обработано событий ленты: <code>{res.total_events:,}</code>",
-            f"⚡ <b>Найдено быстрых выкупов (&le; 2 сек):</b> <code>{len(res.matched_buys):,}</code> шт.\n",
-        ]
+        total_saved = len(res.matched_buys)
+        fast_buys_only = [r for r in res.matched_buys if r.fast_buy]
 
-        if res.matched_buys:
-            avg_dur = sum(r.duration_ms for r in res.matched_buys) / len(res.matched_buys)
-            fastest = min(r.duration_ms for r in res.matched_buys)
-            summary_lines.append("📊 <b>Статистика скорости:</b>")
-            summary_lines.append(f"• Самый быстрый выкуп: <b>{fastest} мс</b>")
-            summary_lines.append(f"• Среднее время выкупа: <b>{avg_dur:.0f} мс</b>\n")
-
-            top_fastest = sorted(res.matched_buys, key=lambda x: x.duration_ms)[:5]
-            summary_lines.append("🏆 <b>Топ-5 самых быстрых выкупов:</b>")
-            for i, r in enumerate(top_fastest, 1):
-                disc_str = f" (скидка {r.discount_pct:+.0f}%)" if r.discount_pct is not None else ""
-                summary_lines.append(
-                    f"{i}. <a href=\"{r.nft_url}\"><b>{html.escape(r.collection)} #{r.number}</b></a>\n"
-                    f"   ⚡ <code>{r.duration_ms} мс</code> | 💰 <b>{r.price_ton:.2f} TON</b>{disc_str}"
-                )
-            summary_lines.append("\n📎 <i>Полный отчёт в формате JSON отправлен файлом ниже.</i>")
+        if is_full:
+            summary_lines = [
+                f"{status_icon} <b>Выгрузка всей истории {status_word}!</b>\n",
+                f"⏱ Время выполнения: <code>{res.elapsed_sec:.1f} с</code>",
+                f"📄 Проверено страниц: <code>{res.total_pages:,}</code> из {pages:,}",
+                f"📦 Обработано событий ленты: <code>{res.total_events:,}</code>",
+                f"💾 <b>Всего сохранено записей:</b> <code>{total_saved:,}</code> шт.",
+                f"⚡ <b>Из них быстрых выкупов (&le; 2 сек):</b> <code>{len(fast_buys_only):,}</code> шт.\n",
+            ]
+            timed = [r for r in res.matched_buys if r.duration_ms is not None]
+            if timed:
+                avg_dur = sum(r.duration_ms for r in timed) / len(timed)
+                fastest = min(r.duration_ms for r in timed)
+                summary_lines.append("📊 <b>Статистика скорости (где найден листинг):</b>")
+                summary_lines.append(f"• Самый быстрый выкуп: <b>{fastest} мс</b>")
+                summary_lines.append(f"• Среднее время выкупа: <b>{avg_dur:.0f} мс</b>\n")
+            summary_lines.append("📎 <i>Файлы JSON и CSV со всеми данными отправлены ниже.</i>")
         else:
-            summary_lines.append("ℹ️ <i>Выкупов быстрее 2 секунд в просмотренном отрезке ленты не обнаружено.</i>")
+            summary_lines = [
+                f"{status_icon} <b>Анализ истории {status_word}!</b>\n",
+                f"⏱ Время выполнения: <code>{res.elapsed_sec:.1f} с</code>",
+                f"📄 Проверено страниц: <code>{res.total_pages:,}</code> из {pages:,}",
+                f"📦 Обработано событий ленты: <code>{res.total_events:,}</code>",
+                f"⚡ <b>Найдено быстрых выкупов (&le; 2 сек):</b> <code>{total_saved:,}</code> шт.\n",
+            ]
+            if res.matched_buys:
+                valid_durations = [r.duration_ms for r in res.matched_buys if r.duration_ms is not None]
+                if valid_durations:
+                    avg_dur = sum(valid_durations) / len(valid_durations)
+                    fastest = min(valid_durations)
+                    summary_lines.append("📊 <b>Статистика скорости:</b>")
+                    summary_lines.append(f"• Самый быстрый выкуп: <b>{fastest} мс</b>")
+                    summary_lines.append(f"• Среднее время выкупа: <b>{avg_dur:.0f} мс</b>\n")
+
+                top_fastest = sorted([r for r in res.matched_buys if r.duration_ms is not None], key=lambda x: x.duration_ms)[:5]
+                if top_fastest:
+                    summary_lines.append("🏆 <b>Топ самых быстрых выкупов:</b>")
+                    for i, r in enumerate(top_fastest, 1):
+                        disc_str = f" (скидка {r.discount_pct:+.0f}%)" if r.discount_pct is not None else ""
+                        summary_lines.append(
+                            f"{i}. <a href=\"{r.nft_url}\"><b>{html.escape(r.collection)} #{r.number}</b></a>\n"
+                            f"   ⚡ <code>{r.duration_ms} мс</code> | 💰 <b>{r.price_ton:.2f} TON</b>{disc_str}"
+                        )
+                summary_lines.append("\n📎 <i>Полный отчёт в формате JSON и CSV отправлен файлами ниже.</i>")
+            else:
+                summary_lines.append("ℹ️ <i>Выкупов быстрее 2 секунд в просмотренном отрезке ленты не обнаружено.</i>")
 
         summary_lines.append("\n▶️ <i>Основной сканер автоматически вернулся в штатный режим.</i>")
 
@@ -975,13 +1075,15 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
             reply_markup=back_to_menu_keyboard("nav_main"),
         )
 
+        prefix_title = "Вся история ленты" if is_full else "Быстрые выкупы (<2с)"
+
         # Присылаем JSON с полными данными пользователю
         if res.matched_buys and res.json_path.exists():
             try:
                 await bot.send_document(
                     chat_id=chat_id,
                     document=FSInputFile(str(res.json_path)),
-                    caption=f"📋 Полные данные быстрых выкупов ({len(res.matched_buys)} шт., JSON)",
+                    caption=f"📋 {prefix_title} ({len(res.matched_buys)} записей, JSON)",
                 )
             except Exception as e:
                 log.warning("Не удалось отправить JSON файл: %s", e)
@@ -992,7 +1094,7 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
                 await bot.send_document(
                     chat_id=chat_id,
                     document=FSInputFile(str(res.csv_path)),
-                    caption=f"📊 Таблица быстрых выкупов (CSV для Excel)",
+                    caption=f"📊 {prefix_title} (CSV для Excel)",
                 )
             except Exception as e:
                 log.warning("Не удалось отправить CSV файл: %s", e)
@@ -1012,7 +1114,7 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
             await cb.answer()
             await safe_edit_text(
                 cb.message,
-                "⌨️ <b>Введите количество страниц истории для анализа:</b>\n\n"
+                "⌨️ <b>Введите количество страниц истории для анализа быстрых выкупов:</b>\n\n"
                 "<i>(Каждая страница содержит 20 событий ленты. Например, <code>500</code> = 10 000 событий)</i>\n\n"
                 "Допустимое число: от <code>1</code> до <code>50 000</code>.",
                 reply_markup=InlineKeyboardMarkup(
@@ -1034,6 +1136,7 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
                 bot=cb.bot,
                 chat_id=cb.message.chat.id,
                 scanner_state=scanner_state,
+                mode="fast_buys",
             )
         )
 
@@ -1056,6 +1159,72 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
                 bot=msg.bot,
                 chat_id=msg.chat.id,
                 scanner_state=scanner_state,
+                mode="fast_buys",
+            )
+        )
+
+    # ── Режим всей истории ленты (/feed) ──────────────────────────────────
+    @dp.callback_query(F.data == "full_history_menu")
+    async def cb_full_history_menu(cb: CallbackQuery, state: FSMContext):
+        await state.clear()
+        await cb.answer()
+        text = format_full_history_menu()
+        await safe_edit_text(cb.message, text, reply_markup=full_history_keyboard(), parse_mode="HTML")
+
+    @dp.callback_query(F.data.startswith("fh_pages_"))
+    async def cb_fh_pages(cb: CallbackQuery, state: FSMContext):
+        val = cb.data.replace("fh_pages_", "")
+        if val == "custom":
+            await state.set_state(BotStates.waiting_for_full_history_pages)
+            await cb.answer()
+            await safe_edit_text(
+                cb.message,
+                "⌨️ <b>Введите количество страниц истории для выгрузки всей истории:</b>\n\n"
+                "<i>(Каждая страница содержит 20 событий ленты. Например, <code>500</code> = 10 000 событий)</i>\n\n"
+                "Допустимое число: от <code>1</code> до <code>50 000</code>.",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="full_history_menu")]]
+                ),
+                parse_mode="HTML",
+            )
+            return
+
+        if not val.isdigit():
+            await cb.answer()
+            return
+
+        pages = int(val)
+        await cb.answer(f"🚀 Запуск выгрузки {pages:,} страниц...")
+        asyncio.create_task(
+            run_feed_analysis_session(
+                pages=pages,
+                bot=cb.bot,
+                chat_id=cb.message.chat.id,
+                scanner_state=scanner_state,
+                mode="full_history",
+            )
+        )
+
+    @dp.message(BotStates.waiting_for_full_history_pages)
+    async def msg_full_history_pages(msg: types.Message, state: FSMContext):
+        raw = (msg.text or "").strip().replace(" ", "").replace("_", "")
+        if not raw.isdigit():
+            await msg.answer("❌ Пожалуйста, введите целое положительное число (например, <code>500</code>):", parse_mode="HTML")
+            return
+
+        pages = int(raw)
+        if pages < 1 or pages > 50000:
+            await msg.answer("❌ Число страниц должно быть от 1 до 50 000. Введите корректное число:")
+            return
+
+        await state.clear()
+        asyncio.create_task(
+            run_feed_analysis_session(
+                pages=pages,
+                bot=msg.bot,
+                chat_id=msg.chat.id,
+                scanner_state=scanner_state,
+                mode="full_history",
             )
         )
 
@@ -1063,7 +1232,7 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
     async def cb_fb_cancel(cb: CallbackQuery):
         if scanner_state.feed_analysis_cancel and not scanner_state.feed_analysis_cancel.is_set():
             scanner_state.feed_analysis_cancel.set()
-            await cb.answer("🛑 Останавливаем анализ, сохраняю результаты и формирую JSON...", show_alert=True)
+            await cb.answer("🛑 Останавливаем анализ, сохраняю результаты и формирую файлы...", show_alert=True)
         else:
             await cb.answer("Анализ не запущен или уже завершается")
 
@@ -1078,11 +1247,22 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
     @dp.callback_query(F.data.startswith("toggle_cat_"))
     async def cb_toggle_cat(cb: CallbackQuery):
         cat = cb.data.replace("toggle_cat_", "")
-        current = scanner_state.notify_categories.get(cat, True)
-        scanner_state.notify_categories[cat] = not current
+        current = scanner_state.get_category_mode(cat)
+        # Циклическое переключение: autobuy -> notify -> off -> autobuy
+        next_mode = {
+            "autobuy": "notify",
+            "notify": "off",
+            "off": "autobuy",
+        }.get(current, "autobuy")
+        scanner_state.notify_categories[cat] = next_mode
         save_settings(scanner_state)
-        status = "ВКЛ 🟢" if not current else "ВЫКЛ 🔴"
 
+        mode_names = {
+            "autobuy": "⚡ Автопокупка",
+            "notify": "🔔 Только уведомления",
+            "off": "🔴 Отключено",
+        }
+        status = mode_names.get(next_mode, next_mode)
         await cb.answer(f"{cat}: {status}")
         text = format_categories_text(scanner_state)
         await safe_edit_text(cb.message, text, reply_markup=categories_keyboard(scanner_state), parse_mode="HTML")
@@ -1455,6 +1635,39 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
             await state.clear()
         except ValueError:
             await msg.answer("❌ Пожалуйста, введите корректное положительное число (например 3.0):")
+
+    @dp.callback_query(F.data == "set_max_price")
+    async def cb_set_max_price(cb: CallbackQuery, state: FSMContext):
+        await state.set_state(BotStates.waiting_for_max_price)
+        await cb.answer()
+        cur_p = getattr(scanner_state, "max_gift_price_ton", 0.0)
+        cur_str = f"{cur_p:.2f} TON" if cur_p > 0 else "выключен (0)"
+        await safe_edit_text(
+            cb.message,
+            f"🛑 <b>Фильтр максимальной стоимости подарка</b>\n\n"
+            f"Текущее ограничение: <code>{cur_str}</code>\n\n"
+            f"Сканер будет полностью игнорировать любые подарки дороже этого порога.\n\n"
+            f"Введите максимальную цену в TON (например <code>15.0</code>) или <code>0</code> для отключения ограничения:",
+            reply_markup=back_to_menu_keyboard("nav_settings"),
+            parse_mode="HTML",
+        )
+
+    @dp.message(BotStates.waiting_for_max_price)
+    async def msg_set_max_price(msg: Message, state: FSMContext):
+        try:
+            val = float(msg.text.replace(",", ".").strip())
+            if val < 0:
+                raise ValueError
+            scanner_state.max_gift_price_ton = val
+            save_settings(scanner_state)
+            if val == 0:
+                resp = "✅ Фильтр максимальной цены <b>отключён</b> (все подарки рассматриваются)"
+            else:
+                resp = f"✅ Максимальная цена подарка ограничена: <code>{val:.2f} TON</code> (дороже игнорируются)"
+            await msg.answer(resp, reply_markup=back_to_menu_keyboard("nav_settings"), parse_mode="HTML")
+            await state.clear()
+        except ValueError:
+            await msg.answer("❌ Введите положительное число (например <code>15.0</code>) или <code>0</code> для выключения:")
 
     @dp.callback_query(F.data == "interval_minus_005")
     async def cb_interval_minus_005(cb: CallbackQuery):

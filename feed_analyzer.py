@@ -52,8 +52,8 @@ class FastBuyRecord:
     backdrop: str
     listed_at: str
     sold_at: str
-    duration_ms: int
-    duration_sec: float
+    duration_ms: Optional[int]
+    duration_sec: Optional[float]
     price_ton: float
     price_nano: int
     collection_floor_ton: Optional[float]
@@ -65,6 +65,7 @@ class FastBuyRecord:
     collection_volume_ton: Optional[float]
     turnover_ratio: Optional[float]
     nft_url: str
+    fast_buy: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -77,6 +78,7 @@ class FastBuyRecord:
             "sold_at": self.sold_at,
             "duration_ms": self.duration_ms,
             "duration_sec": self.duration_sec,
+            "fast_buy": self.fast_buy,
             "price_ton": self.price_ton,
             "price_nano": self.price_nano,
             "market_data": {
@@ -101,8 +103,9 @@ class FastBuyRecord:
             "backdrop": self.backdrop,
             "listed_at": self.listed_at,
             "sold_at": self.sold_at,
-            "duration_ms": self.duration_ms,
-            "duration_sec": self.duration_sec,
+            "duration_ms": self.duration_ms if self.duration_ms is not None else "",
+            "duration_sec": self.duration_sec if self.duration_sec is not None else "",
+            "fast_buy": "true" if self.fast_buy else "false",
             "price_ton": self.price_ton,
             "price_nano": self.price_nano,
             "collection_floor_ton": self.collection_floor_ton or "",
@@ -127,6 +130,7 @@ CSV_FIELDNAMES = [
     "sold_at",
     "duration_ms",
     "duration_sec",
+    "fast_buy",
     "price_ton",
     "price_nano",
     "collection_floor_ton",
@@ -150,6 +154,8 @@ class AnalysisResult:
     jsonl_path: Path
     csv_path: Path
     elapsed_sec: float
+    mode: str = "fast_buys"
+    fast_buys_count: int = 0
     cancelled: bool = False
     error: Optional[str] = None
 
@@ -161,9 +167,101 @@ def make_nft_url(collection_name: str, number: Any) -> str:
     return f"https://t.me/nft/{slug}-{number}"
 
 
+def _build_record(
+    sale_item: dict[str, Any],
+    listing_item: Optional[dict[str, Any]],
+    col_floors: dict[str, int],
+    black_floor_nano: Optional[int],
+    col_volumes: dict[str, int],
+    threshold_ms: int = 2000,
+) -> FastBuyRecord:
+    gift = sale_item.get("gift") or {}
+    gid = gift.get("id", "")
+    num_val = int(gift.get("number") or 0)
+    col_name = (
+        gift.get("collectionName")
+        or gift.get("collectionTitle")
+        or gift.get("title")
+        or "NFT"
+    )
+    mod_name = gift.get("modelName") or gift.get("modelTitle") or ""
+    bd_name = gift.get("backdropName") or ""
+    amount_nano = int(sale_item.get("amount") or gift.get("salePrice") or 0)
+    price_ton = round(amount_nano / 1e9, 2)
+
+    sale_date_str = sale_item.get("date", "")
+    listed_date_str = listing_item.get("date", "") if listing_item else ""
+
+    delta_ms: Optional[int] = None
+    delta_sec: Optional[float] = None
+    is_fast = False
+
+    if listing_item and "_dt" in listing_item and "_dt" in sale_item:
+        d = int((sale_item["_dt"] - listing_item["_dt"]).total_seconds() * 1000)
+        if d >= 0:
+            delta_ms = d
+            delta_sec = round(d / 1000, 2)
+            is_fast = (0 <= d <= threshold_ms)
+
+    # Рыночные данные
+    col_floor = col_floors.get(col_name)
+    col_floor_ton = round(col_floor / 1e9, 2) if col_floor else None
+    diff_to_floor_ton = (
+        round(col_floor_ton - price_ton, 2) if col_floor_ton else None
+    )
+    discount_pct = (
+        round(
+            ((col_floor_ton - price_ton) / col_floor_ton) * 100, 1
+        )
+        if (col_floor_ton and col_floor_ton > 0)
+        else None
+    )
+
+    bf_ton = round(black_floor_nano / 1e9, 2) if black_floor_nano else None
+    is_black = bd_name.lower().strip() == "black"
+    is_rare_num = 1 <= num_val <= 100 or str(num_val) in (
+        "777", "888", "999", "111", "222", "333", "444", "555", "666"
+    )
+
+    vol_nano = col_volumes.get(col_name)
+    vol_ton = round(vol_nano / 1e9, 1) if vol_nano else None
+    turnover_ratio = (
+        round(vol_ton / price_ton, 1)
+        if (vol_ton and price_ton > 0)
+        else None
+    )
+
+    return FastBuyRecord(
+        gift_id=gid,
+        number=num_val,
+        collection=col_name,
+        model=mod_name,
+        backdrop=bd_name,
+        listed_at=listed_date_str,
+        sold_at=sale_date_str,
+        duration_ms=delta_ms,
+        duration_sec=delta_sec,
+        price_ton=price_ton,
+        price_nano=amount_nano,
+        collection_floor_ton=col_floor_ton,
+        diff_to_floor_ton=diff_to_floor_ton,
+        discount_pct=discount_pct,
+        black_floor_ton=bf_ton,
+        is_black=is_black,
+        is_rare_number=is_rare_num,
+        collection_volume_ton=vol_ton,
+        turnover_ratio=turnover_ratio,
+        nft_url=make_nft_url(col_name, num_val),
+        fast_buy=is_fast if delta_ms is not None else False,
+    )
+
+
 class FeedAnalyzer:
     """
-    Класс для управления процессом извлечения и анализа быстрых выкупов из ленты MRKT.
+    Класс для управления процессом извлечения и анализа истории ленты MRKT (/feed).
+    Поддерживает:
+      - Режим быстрых выкупов ("fast_buys"): сохраняются только выкупы <= threshold_ms (fast_buy=True).
+      - Режим всей истории ("full_history"): сохраняются все выкупы/события с флагом fast_buy=bool.
     """
 
     def __init__(
@@ -181,6 +279,7 @@ class FeedAnalyzer:
         self,
         max_pages: int = 100,
         threshold_ms: int = 2000,
+        mode: str = "fast_buys",
         on_progress: Optional[Callable[[int, int, int, int], None]] = None,
         cancel_event: Optional[asyncio.Event] = None,
     ) -> AnalysisResult:
@@ -195,17 +294,20 @@ class FeedAnalyzer:
             self.scanner_state.is_paused = True
             self.scanner_state.is_analyzing_feed = True
 
+        mode_name = "БЫСТРЫЕ ВЫКУПЫ (<= 2с)" if mode == "fast_buys" else "ВСЯ ИСТОРИЯ ЛЕНТЫ"
         log.info(
-            "🚀 Старт анализа истории ленты (/feed): страниц=%d, порог=%.2fс",
+            "🚀 Старт анализа ленты (/feed): режим=%s, страниц=%d, порог=%.2fс",
+            mode_name,
             max_pages,
             threshold_ms / 1000,
         )
 
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        json_path = self.log_dir / f"fast_buys_{timestamp_str}.json"
-        jsonl_path = self.log_dir / f"fast_buys_{timestamp_str}.jsonl"
-        csv_path = self.log_dir / f"fast_buys_{timestamp_str}.csv"
-        cumulative_path = self.log_dir / "fast_buys_history.jsonl"
+        prefix = "fast_buys" if mode == "fast_buys" else "feed_history"
+        json_path = self.log_dir / f"{prefix}_{timestamp_str}.json"
+        jsonl_path = self.log_dir / f"{prefix}_{timestamp_str}.jsonl"
+        csv_path = self.log_dir / f"{prefix}_{timestamp_str}.csv"
+        cumulative_path = self.log_dir / f"{prefix}_cumulative.jsonl"
 
         # Инициализируем CSV файл с заголовками
         with open(csv_path, "w", encoding="utf-8", newline="") as cf:
@@ -221,11 +323,26 @@ class FeedAnalyzer:
 
         cancelled = False
         error_msg: Optional[str] = None
+        consecutive_errors = 0
 
         # Кэш флоров и рынка из scanner_state
         col_floors = getattr(self.scanner_state, "collection_floors", {}) or {}
         black_floor_nano = getattr(self.scanner_state, "black_floor_nano", None)
         col_volumes = getattr(self.scanner_state, "collection_volumes", {}) or {}
+
+        def _append_record(rec: FastBuyRecord):
+            matched_records.append(rec)
+            try:
+                json_line = json.dumps(rec.to_dict(), ensure_ascii=False)
+                with open(jsonl_path, "a", encoding="utf-8") as jf:
+                    jf.write(json_line + "\n")
+                with open(cumulative_path, "a", encoding="utf-8") as cumf:
+                    cumf.write(json_line + "\n")
+                with open(csv_path, "a", encoding="utf-8", newline="") as cf:
+                    writer = csv.DictWriter(cf, fieldnames=CSV_FIELDNAMES)
+                    writer.writerow(rec.to_csv_row())
+            except Exception as e:
+                log.warning("Ошибка потоковой записи: %s", e)
 
         try:
             for page in range(1, max_pages + 1):
@@ -234,7 +351,6 @@ class FeedAnalyzer:
                     cancelled = True
                     break
 
-                slot = await self.pool.next_async()
                 payload: dict[str, Any] = {
                     "count": DEFAULT_PAGE_SIZE,
                     "type": ["sale", "listing"],
@@ -243,10 +359,14 @@ class FeedAnalyzer:
                     payload["cursor"] = cursor
 
                 page_items = []
-                retry_attempts = 3
+                retry_attempts = 6
+                success_fetch = False
+                last_err = None
+
                 for attempt in range(retry_attempts):
                     if cancel_event and cancel_event.is_set():
                         break
+                    slot = await self.pool.next_async()
                     try:
                         proxies = slot.proxies
                         headers = slot.headers
@@ -257,7 +377,7 @@ class FeedAnalyzer:
                                 FEED_API_URL,
                                 headers=headers,
                                 json=payload,
-                                timeout=7.0,
+                                timeout=8.0,
                                 discard_cookies=True,
                             )
 
@@ -266,17 +386,25 @@ class FeedAnalyzer:
                             data = r.json()
                             if isinstance(data, dict):
                                 page_items = data.get("items", [])
-                                cursor = data.get("cursor")
+                                new_cursor = data.get("cursor")
+                                if new_cursor:
+                                    cursor = new_cursor
+                                elif page_items:
+                                    # Fallback: курсор как ID последнего элемента страницы
+                                    last_id = page_items[-1].get("id")
+                                    if last_id and last_id != cursor:
+                                        cursor = last_id
+                                    else:
+                                        cursor = None
+                                else:
+                                    cursor = None
+                            success_fetch = True
                             break
 
                         if r.status_code == 429:
                             slot.penalize(15.0)
-                            log.warning(
-                                "FeedAnalyzer: 429 на слоте [%s], переключаем слот...",
-                                slot.token[:8],
-                            )
-                            slot = await self.pool.next_async()
-                            await asyncio.sleep(0.6)
+                            log.warning("FeedAnalyzer: 429 на слоте [%s] (попытка %d)...", slot.token[:8], attempt + 1)
+                            await asyncio.sleep(0.5 + attempt * 0.3)
                             continue
 
                         log.warning(
@@ -284,23 +412,27 @@ class FeedAnalyzer:
                             r.status_code,
                             page,
                             attempt + 1,
-                            r.text[:200],
+                            r.text[:150],
                         )
                     except Exception as exc:
                         slot.record_timeout()
-                        log.debug(
-                            "FeedAnalyzer: сетевая ошибка на слоте [%s]: %s",
-                            slot.token[:8],
-                            exc,
-                        )
-                        slot = await self.pool.next_async()
-                        await asyncio.sleep(0.5)
+                        last_err = exc
+                        log.debug("FeedAnalyzer: сетевая ошибка на слоте [%s]: %s", slot.token[:8], exc)
+                        await asyncio.sleep(0.4 + attempt * 0.2)
+
+                if not success_fetch:
+                    log.warning("FeedAnalyzer: не удалось загрузить страницу %d после %d попыток: %s", page, retry_attempts, last_err)
+                    consecutive_errors += 1
+                    if consecutive_errors >= 3:
+                        log.info("FeedAnalyzer: 3 сбоя подряд, останавливаем анализ на странице %d", page)
+                        break
+                    await asyncio.sleep(1.5)
+                    continue
+
+                consecutive_errors = 0
 
                 if not page_items:
-                    log.info(
-                        "FeedAnalyzer: лента пуста или достигнут конец истории на странице %d",
-                        page,
-                    )
+                    log.info("FeedAnalyzer: лента пуста или достигнут конец истории на странице %d", page)
                     break
 
                 pages_processed = page
@@ -314,7 +446,6 @@ class FeedAnalyzer:
                     if not gid or gift.get("luckyBuy") or itype not in ("sale", "listing"):
                         continue
 
-                    # Парсим дату
                     date_str = item.get("date")
                     if not date_str:
                         continue
@@ -339,119 +470,44 @@ class FeedAnalyzer:
                             continue
 
                         sale_dt: datetime = s["_dt"]
-                        # Ищем листинг, который предшествовал этой продаже
                         prev_listings = [l for l in listings if l["_dt"] <= sale_dt]
                         if not prev_listings:
+                            # Листинг пока не встретился (может быть на следующей, более старой странице)
                             continue
 
                         best_listing = prev_listings[-1]
                         list_dt: datetime = best_listing["_dt"]
                         delta_ms = int((sale_dt - list_dt).total_seconds() * 1000)
+                        is_fast = (0 <= delta_ms <= threshold_ms)
 
-                        if 0 <= delta_ms <= threshold_ms:
-                            recorded_keys.add((gid, sale_id))
+                        if mode == "fast_buys" and not is_fast:
+                            # В режиме быстрых выкупов пропускаем лоты > threshold_ms
+                            continue
 
-                            amount_nano = int(s.get("amount") or gift.get("salePrice") or 0)
-                            price_ton = round(amount_nano / 1e9, 2)
+                        recorded_keys.add((gid, sale_id))
+                        rec = _build_record(
+                            sale_item=s,
+                            listing_item=best_listing,
+                            col_floors=col_floors,
+                            black_floor_nano=black_floor_nano,
+                            col_volumes=col_volumes,
+                            threshold_ms=threshold_ms,
+                        )
+                        _append_record(rec)
 
-                            col_name = (
-                                gift.get("collectionName")
-                                or gift.get("collectionTitle")
-                                or gift.get("title")
-                                or "NFT"
-                            )
-                            mod_name = gift.get("modelName") or gift.get("modelTitle") or ""
-                            bd_name = gift.get("backdropName") or ""
-                            num_val = int(gift.get("number") or 0)
-
-                            # Рыночные данные
-                            col_floor = col_floors.get(col_name)
-                            col_floor_ton = round(col_floor / 1e9, 2) if col_floor else None
-                            diff_to_floor_ton = (
-                                round(col_floor_ton - price_ton, 2) if col_floor_ton else None
-                            )
-                            discount_pct = (
-                                round(
-                                    ((col_floor_ton - price_ton) / col_floor_ton) * 100, 1
-                                )
-                                if (col_floor_ton and col_floor_ton > 0)
-                                else None
-                            )
-
-                            bf_ton = (
-                                round(black_floor_nano / 1e9, 2) if black_floor_nano else None
-                            )
-                            is_black = bd_name.lower().strip() == "black"
-                            is_rare_num = 1 <= num_val <= 100 or str(num_val) in (
-                                "777",
-                                "888",
-                                "999",
-                                "111",
-                                "222",
-                                "333",
-                                "444",
-                                "555",
-                                "666",
-                            )
-
-                            vol_nano = col_volumes.get(col_name)
-                            vol_ton = round(vol_nano / 1e9, 1) if vol_nano else None
-                            turnover_ratio = (
-                                round(vol_ton / price_ton, 1)
-                                if (vol_ton and price_ton > 0)
-                                else None
-                            )
-
-                            rec = FastBuyRecord(
-                                gift_id=gid,
-                                number=num_val,
-                                collection=col_name,
-                                model=mod_name,
-                                backdrop=bd_name,
-                                listed_at=best_listing.get("date", ""),
-                                sold_at=s.get("date", ""),
-                                duration_ms=delta_ms,
-                                duration_sec=round(delta_ms / 1000, 2),
-                                price_ton=price_ton,
-                                price_nano=amount_nano,
-                                collection_floor_ton=col_floor_ton,
-                                diff_to_floor_ton=diff_to_floor_ton,
-                                discount_pct=discount_pct,
-                                black_floor_ton=bf_ton,
-                                is_black=is_black,
-                                is_rare_number=is_rare_num,
-                                collection_volume_ton=vol_ton,
-                                turnover_ratio=turnover_ratio,
-                                nft_url=make_nft_url(col_name, num_val),
-                            )
-
-                            matched_records.append(rec)
-
-                            # Потоковая запись в JSONL
-                            json_line = json.dumps(rec.to_dict(), ensure_ascii=False)
-                            with open(jsonl_path, "a", encoding="utf-8") as jf:
-                                jf.write(json_line + "\n")
-                            with open(cumulative_path, "a", encoding="utf-8") as cumf:
-                                cumf.write(json_line + "\n")
-
-                            # Потоковая запись в CSV
-                            with open(csv_path, "a", encoding="utf-8", newline="") as cf:
-                                writer = csv.DictWriter(cf, fieldnames=CSV_FIELDNAMES)
-                                writer.writerow(rec.to_csv_row())
-
+                        if is_fast:
                             log.info(
-                                "⚡ [FAST BUY] %s #%d | %.2f TON за %d мс (скидка: %s%%) | %s",
-                                col_name,
-                                num_val,
-                                price_ton,
-                                delta_ms,
-                                f"{discount_pct:+.0f}" if discount_pct is not None else "N/A",
+                                "⚡ [FAST BUY] %s #%d | %.2f TON за %d мс | %s",
+                                rec.collection,
+                                rec.number,
+                                rec.price_ton,
+                                rec.duration_ms,
                                 rec.nft_url,
                             )
 
-                # Очистка памяти: держим не более 3000 активных подарков в словаре
-                if len(events_by_gift) > 3000:
-                    oldest_keys = list(events_by_gift.keys())[:1000]
+                # Очистка старых данных из памяти, если словарь разросся
+                if len(events_by_gift) > 5000:
+                    oldest_keys = list(events_by_gift.keys())[:1500]
                     for k in oldest_keys:
                         events_by_gift.pop(k, None)
 
@@ -474,6 +530,24 @@ class FeedAnalyzer:
                 # Тактическая задержка между страницами
                 await asyncio.sleep(PAGE_PACING_DELAY)
 
+            # В режиме полной истории: сбрасываем оставшиеся продажи, для которых не было листинга в окне сканирования
+            if mode == "full_history":
+                for gid, ev_list in events_by_gift.items():
+                    for ev in ev_list:
+                        if ev.get("type") == "sale":
+                            sale_id = ev.get("id", "")
+                            if (gid, sale_id) not in recorded_keys:
+                                recorded_keys.add((gid, sale_id))
+                                rec = _build_record(
+                                    sale_item=ev,
+                                    listing_item=None,
+                                    col_floors=col_floors,
+                                    black_floor_nano=black_floor_nano,
+                                    col_volumes=col_volumes,
+                                    threshold_ms=threshold_ms,
+                                )
+                                _append_record(rec)
+
         except Exception as exc:
             error_msg = str(exc)
             log.error("FeedAnalyzer: критическая ошибка: %s", exc, exc_info=True)
@@ -483,14 +557,18 @@ class FeedAnalyzer:
                 self.scanner_state.is_analyzing_feed = False
                 self.scanner_state.is_paused = was_paused
 
+            fast_buys_count = sum(1 for r in matched_records if r.fast_buy)
+
             # Сохраняем полный форматированный JSON со всеми данными
             try:
                 full_json_data = {
                     "meta": {
+                        "mode": mode,
                         "generated_at": datetime.utcnow().isoformat() + "Z",
                         "total_pages_scanned": pages_processed,
                         "total_events_scanned": total_events,
-                        "fast_buys_count": len(matched_records),
+                        "total_records_count": len(matched_records),
+                        "fast_buys_count": fast_buys_count,
                         "threshold_ms": threshold_ms,
                         "elapsed_seconds": elapsed_sec,
                         "cancelled_early": cancelled,
@@ -503,10 +581,12 @@ class FeedAnalyzer:
                 log.warning("Не удалось сохранить итоговый JSON файл: %s", e)
 
             log.info(
-                "🏁 Анализ ленты завершён: страниц=%d, событий=%d, быстрых выкупов=%d (за %.1fс)",
+                "🏁 Анализ ленты завершён: режим=%s, страниц=%d, событий=%d, записей=%d (быстрых выкупов: %d) за %.1fс",
+                mode,
                 pages_processed,
                 total_events,
                 len(matched_records),
+                fast_buys_count,
                 elapsed_sec,
             )
 
@@ -518,6 +598,8 @@ class FeedAnalyzer:
             jsonl_path=jsonl_path,
             csv_path=csv_path,
             elapsed_sec=elapsed_sec,
+            mode=mode,
+            fast_buys_count=fast_buys_count,
             cancelled=cancelled,
             error=error_msg,
         )

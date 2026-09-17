@@ -25,17 +25,37 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "filter_by_balance": False,
     "min_ton_diff": 2.5,
     "cheap_price_threshold": 3.0,
+    "max_gift_price_ton": 0.0,
     "min_turnover_ratio": 0.0,
     "scan_interval": 0.8,
     "notify_categories": {
-        "BLACK": True,
-        "CHEAP": True,
-        "NFT": True,
-        "LOW_ID": True,
+        "BLACK": "autobuy",
+        "CHEAP": "autobuy",
+        "NFT": "autobuy",
+        "LOW_ID": "autobuy",
     },
     "primary_token": "",
     "use_direct": False,
 }
+
+
+def normalize_notify_categories(raw_cats: Any) -> dict[str, str]:
+    """Нормализует категории к строкам: 'autobuy' | 'notify' | 'off'."""
+    res = dict(DEFAULT_SETTINGS["notify_categories"])
+    if not isinstance(raw_cats, dict):
+        return res
+    for k, v in raw_cats.items():
+        if isinstance(v, bool):
+            res[k] = "autobuy" if v else "off"
+        elif isinstance(v, str) and v.lower() in ("autobuy", "notify", "off"):
+            res[k] = v.lower()
+        elif v in (1, "1", "true"):
+            res[k] = "autobuy"
+        elif v in (0, "0", "false"):
+            res[k] = "off"
+        else:
+            res[k] = "autobuy"
+    return res
 
 
 def get_settings_path() -> Path:
@@ -88,6 +108,13 @@ def load_settings() -> dict[str, Any]:
                 with open(path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     if isinstance(data, dict):
+                        if "notify_categories" in data:
+                            data["notify_categories"] = normalize_notify_categories(data["notify_categories"])
+                        if "max_gift_price_ton" in data:
+                            try:
+                                data["max_gift_price_ton"] = float(data["max_gift_price_ton"])
+                            except (ValueError, TypeError):
+                                data["max_gift_price_ton"] = 0.0
                         log.info("Загружены персистентные настройки из %s", path)
                         return data
             except Exception as e:
@@ -105,19 +132,29 @@ def save_settings(state_or_dict: Any) -> bool:
         state = state_or_dict
         pool = getattr(state, "pool", None)
         prim_tok = pool.primary_token if pool else ""
+        raw_cats = getattr(state, "notify_categories", DEFAULT_SETTINGS["notify_categories"])
+        norm_cats = normalize_notify_categories(raw_cats)
         data = {
             "auto_buy": bool(getattr(state, "auto_buy", False)),
             "filter_by_balance": bool(getattr(state, "filter_by_balance", False)),
             "min_ton_diff": float(getattr(state, "min_ton_diff", 2.5)),
             "cheap_price_threshold": float(getattr(state, "cheap_price_threshold", 3.0)),
+            "max_gift_price_ton": float(getattr(state, "max_gift_price_ton", 0.0)),
             "min_turnover_ratio": float(getattr(state, "min_turnover_ratio", 0.0)),
             "scan_interval": float(getattr(state, "scan_interval", 0.5)),
-            "notify_categories": dict(getattr(state, "notify_categories", DEFAULT_SETTINGS["notify_categories"])),
+            "notify_categories": norm_cats,
             "primary_token": str(prim_tok or ""),
             "use_direct": bool(getattr(state, "use_direct", False)),
         }
     elif isinstance(state_or_dict, dict):
-        data = state_or_dict
+        data = dict(state_or_dict)
+        if "notify_categories" in data:
+            data["notify_categories"] = normalize_notify_categories(data["notify_categories"])
+        if "max_gift_price_ton" in data:
+            try:
+                data["max_gift_price_ton"] = float(data["max_gift_price_ton"])
+            except (ValueError, TypeError):
+                data["max_gift_price_ton"] = 0.0
     else:
         log.error("save_settings: недопустимый тип %s", type(state_or_dict))
         return False

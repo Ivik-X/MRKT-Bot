@@ -908,13 +908,14 @@ async def process_deal_async(
     bot_token: str,
     admin_ids: set[int],
     pool: AccountPool,
+    bypass_autobuy: bool = False,
 ) -> None:
     """
     Обрабатывает найденную сделку:
-    - Если AutoBuy ВКЛ: мгновенно выкупает через POST /gifts/buy без лишних задержек,
+    - Если AutoBuy ВКЛ и bypass_autobuy ВЫКЛ: мгновенно выкупает через POST /gifts/buy без лишних задержек,
       сверяя перед этим с последним известным балансом, затем проверяет Хранилище
       и отправляет подробный отчёт.
-    - Если AutoBuy ВЫКЛ: отправляет стандартный алерт с кнопкой [💳 Купить за X.XX TON].
+    - Если AutoBuy ВЫКЛ или bypass_autobuy ВКЛ: отправляет стандартный алерт с кнопкой [💳 Купить за X.XX TON].
     """
     gift = deal.get("gift", {})
     deal_gid = gift.get("id", "")
@@ -923,7 +924,7 @@ async def process_deal_async(
     price_nano = deal.get("price", 0)
     price_ton = price_nano / 1e9
 
-    if scanner_state.auto_buy:
+    if scanner_state.auto_buy and not bypass_autobuy:
         known_balance = scanner_state.primary_balance_nano
 
         # Сверка с последним известным балансом (БЕЗ доп сетевого запроса!)
@@ -1080,6 +1081,7 @@ async def main() -> None:
     saved_settings = load_settings()
     init_min_ton_diff = float(saved_settings.get("min_ton_diff", MIN_TON_DIFF))
     init_cheap_threshold = float(saved_settings.get("cheap_price_threshold", CHEAP_PRICE_THRESHOLD))
+    init_max_price = float(saved_settings.get("max_gift_price_ton", 0.0))
     init_min_turnover = float(saved_settings.get("min_turnover_ratio", MIN_TURNOVER_RATIO))
     init_filter_balance = bool(saved_settings.get("filter_by_balance", FILTER_BY_BALANCE))
     init_autobuy = bool(saved_settings.get("auto_buy", False))
@@ -1112,6 +1114,7 @@ async def main() -> None:
         auto_buy=init_autobuy,
         min_ton_diff=init_min_ton_diff,
         cheap_price_threshold=init_cheap_threshold,
+        max_gift_price_ton=init_max_price,
         min_turnover_ratio=init_min_turnover,
         filter_by_balance=init_filter_balance,
         scan_interval=adaptor.interval,
@@ -1322,7 +1325,17 @@ async def main() -> None:
                     scan_deals_count = 0
                     if not first_run and new_gifts:
                         scan_deals: list[dict] = []
-                        max_price_nano = scanner_state.primary_balance_nano if scanner_state.filter_by_balance else None
+                        max_price_nano = None
+                        if scanner_state.filter_by_balance and scanner_state.primary_balance_nano is not None:
+                            max_price_nano = scanner_state.primary_balance_nano
+
+                        if getattr(scanner_state, "max_gift_price_ton", 0.0) > 0:
+                            limit_nano = int(scanner_state.max_gift_price_ton * 1_000_000_000)
+                            if max_price_nano is not None:
+                                max_price_nano = min(max_price_nano, limit_nano)
+                            else:
+                                max_price_nano = limit_nano
+
                         for gift in new_gifts:
                             scan_deals.extend(
                                 check_gift(
@@ -1345,7 +1358,16 @@ async def main() -> None:
                                 print_and_log_deal(deal)
                                 if TG_BOT_TOKEN and TG_ADMIN_IDS:
                                     deal_type = deal.get("type", "NFT")
-                                    if scanner_state.notify_categories.get(deal_type, True):
+                                    cat_mode = scanner_state.get_category_mode(deal_type)
+                                    if cat_mode == "off":
+                                        scanner_state.vault.append(deal)
+                                        log.info(
+                                            "Сделка [%s] #%s → Хранилище (отключено) (%d)",
+                                            deal_type,
+                                            deal.get("gift", {}).get("number"),
+                                            len(scanner_state.vault),
+                                        )
+                                    else:
                                         deal_gid = deal.get("gift", {}).get("id")
                                         older_ids = set()
                                         found = False
@@ -1357,6 +1379,7 @@ async def main() -> None:
                                             elif pg.get("id") == deal_gid:
                                                 found = True
 
+                                        bypass_autobuy = (cat_mode == "notify")
                                         asyncio.create_task(
                                             process_deal_async(
                                                 deal=deal,
@@ -1365,12 +1388,9 @@ async def main() -> None:
                                                 bot_token=TG_BOT_TOKEN,
                                                 admin_ids=TG_ADMIN_IDS,
                                                 pool=pool,
+                                                bypass_autobuy=bypass_autobuy,
                                             )
                                         )
-
-                                    else:
-                                        scanner_state.vault.append(deal)
-                                        log.info("Сделка [%s] #%s → Хранилище (%d)", deal_type, deal.get("gift", {}).get("number"), len(scanner_state.vault))
 
                     # Детектирование выкупленных лотов на основе текущей страницы
                     if not first_run and page_gifts:
