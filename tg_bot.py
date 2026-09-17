@@ -375,6 +375,7 @@ def settings_keyboard(state: ScannerState) -> InlineKeyboardMarkup:
     max_p_btn = f"🛑 Макс. цена: {max_p:.1f} TON" if max_p > 0 else "🛑 Макс. цена: ВЫКЛ"
     p429 = state.get_429_count_last_hour()
     p429_badge = f" (429: {p429}/ч)" if p429 > 0 else " (429: 0)"
+    interval_btn_text = f"✏️ {state.scan_interval:.2f}с{p429_badge}"
     em = getattr(state, "eval_mode", "tiered")
     eval_btn_text = "🪜 Оценка: Ступенчатая (3 тира)" if em == "tiered" else "📏 Оценка: Фиксированная"
     return InlineKeyboardMarkup(
