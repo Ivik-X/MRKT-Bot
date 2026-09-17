@@ -67,6 +67,7 @@ class ScannerState:
     min_ton_diff: float = 2.5
     cheap_price_threshold: float = 3.0
     min_margin_pct: float = 5.0
+    eval_mode: str = "tiered"
     scan_interval: float = 0.8
     scans_count: int = 0
     deals_count: int = 0
@@ -374,7 +375,8 @@ def settings_keyboard(state: ScannerState) -> InlineKeyboardMarkup:
     max_p_btn = f"🛑 Макс. цена: {max_p:.1f} TON" if max_p > 0 else "🛑 Макс. цена: ВЫКЛ"
     p429 = state.get_429_count_last_hour()
     p429_badge = f" (429: {p429}/ч)" if p429 > 0 else " (429: 0)"
-    interval_btn_text = f"✏️ {state.scan_interval:.2f}с{p429_badge}"
+    em = getattr(state, "eval_mode", "tiered")
+    eval_btn_text = "🪜 Оценка: Ступенчатая (3 тира)" if em == "tiered" else "📏 Оценка: Фиксированная"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=f"🤖 Авто-покупка (AutoBuy): {autobuy_toggle_text}", callback_data="toggle_autobuy")],
@@ -383,6 +385,7 @@ def settings_keyboard(state: ScannerState) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text=max_p_btn, callback_data="set_max_price")],
             [InlineKeyboardButton(text="📊 Мин. оборот/цена (NFT)", callback_data="set_turnover_ratio")],
             [InlineKeyboardButton(text="👑 Сменить основной аккаунт", callback_data="nav_select_primary")],
+            [InlineKeyboardButton(text=eval_btn_text, callback_data="toggle_eval_mode")],
             [InlineKeyboardButton(text="✏️ Порог выгоды (MIN_TON_DIFF)", callback_data="set_min_diff")],
             [InlineKeyboardButton(text=f"📈 Мин. маржа: {getattr(state, 'min_margin_pct', 5.0):.1f}%", callback_data="set_min_margin")],
             [InlineKeyboardButton(text="✏️ Порог дешёвых (CHEAP_THRESHOLD)", callback_data="set_cheap")],
@@ -517,6 +520,9 @@ def format_main_text(state: ScannerState) -> str:
     fail_cnt, fail_last = state.get_proxy_failures_stats()
     fail_str = f"<b>{fail_cnt}</b> (посл: <code>{fail_last}</code>)" if fail_cnt > 0 else "<code>0</code>"
 
+    em = getattr(state, "eval_mode", "tiered")
+    eval_main_str = "🪜 Ступенчатая (3 тира)" if em == "tiered" else f"📏 Фикс. ({state.min_ton_diff:.2f} TON / {getattr(state, 'min_margin_pct', 5.0):.1f}%)"
+
     return (
         f"🤖 <b>MRKT Scanner Manager</b>\n\n"
         f"Статус: {status_icon}\n"
@@ -525,7 +531,7 @@ def format_main_text(state: ScannerState) -> str:
         f"📦 В хранилище: <b>{vault_count}</b> сделок\n\n"
         f"⚙️ <b>Параметры:</b>\n"
         f"• 🤖 AutoBuy: <b>{'🟢 ВКЛ' if state.auto_buy else '🔴 ВЫКЛ'}</b>\n"
-        f"• Порог выгоды: <code>{state.min_ton_diff:.2f} TON</code> (маржа: <code>{getattr(state, 'min_margin_pct', 5.0):.1f}%</code>)\n"
+        f"• Оценка выгоды: <b>{eval_main_str}</b>\n"
         f"• Дешёвые подарки: &lt; <code>{state.cheap_price_threshold:.2f} TON</code>\n"
         f"• Мин. оборот/цена: <code>{turnover_str}</code>\n"
         f"• Фильтр по балансу: <b>{filter_bal_str}</b>\n"
@@ -599,6 +605,16 @@ def format_settings_text(state: ScannerState) -> str:
     p429 = state.get_429_count_last_hour()
     p429_badge = f" [штрафов 429: <b>{p429}</b>/ч]" if p429 > 0 else " [штрафов 429: 0/ч]"
 
+    em = getattr(state, "eval_mode", "tiered")
+    eval_mode_str = (
+        "🪜 <b>Ступенчатый (3 тира)</b>\n"
+        "   • 🥉 <i>&lt; 20 TON:</i> чистыми ≥ 1.5 TON, маржа ≥ 10%\n"
+        "   • 🥈 <i>20–100 TON:</i> чистыми ≥ 3.5 TON, маржа ≥ 5%\n"
+        "   • 🥇 <i>&gt; 100 TON:</i> чистыми ≥ 7.0 TON, маржа ≥ 2.5% (буфер демпинга)"
+        if em == "tiered" else
+        f"📏 <b>Фиксированный:</b> чистыми ≥ <code>{state.min_ton_diff:.2f} TON</code> И маржа ≥ <code>{getattr(state, 'min_margin_pct', 5.0):.1f}%</code>"
+    )
+
     return (
         f"⚙️ <b>Настройки сканера</b>\n\n"
         f"0. <b>Авто-покупка (AutoBuy):</b> {autobuy_str}\n"
@@ -611,15 +627,15 @@ def format_settings_text(state: ScannerState) -> str:
         f"   <i>(Отсекает мёртвый груз: оборот/цена ≥ X; кроме чёрного фона и подарков &lt; {state.cheap_price_threshold:.1f} TON)</i>\n\n"
         f"4. <b>Основной аккаунт:</b> <code>{primary_str}</code>\n"
         f"   <i>(Текущий баланс: <code>{bal_str}</code>; используется для покупок)</i>\n\n"
-        f"5. <b>Порог выгоды (MIN_TON_DIFF):</b> <code>{state.min_ton_diff:.2f} TON</code>\n"
-        f"   <i>(Подарок покупается, если чистая прибыль после 2% комиссии и 0.1 TON за ордер ≥ этого значения)</i>\n\n"
-        f"6. <b>Минимальная маржа (%):</b> <code>{getattr(state, 'min_margin_pct', 5.0):.1f}%</code>\n"
-        f"   <i>(Защита капитала: чистый ROI после комиссий должен быть ≥ X%, отсекает дорогие зависшие лоты)</i>\n\n"
-        f"7. <b>Порог дешёвых (CHEAP_THRESHOLD):</b> <code>{state.cheap_price_threshold:.2f} TON</code>\n"
+        f"5. <b>Режим оценки выгоды:</b> {eval_mode_str}\n\n"
+        f"6. <b>Базовый порог выгоды (MIN_TON_DIFF):</b> <code>{state.min_ton_diff:.2f} TON</code>\n"
+        f"   <i>(Используется в фиксированном режиме и масштабирует тиры)</i>\n\n"
+        f"7. <b>Базовая мин. маржа (%):</b> <code>{getattr(state, 'min_margin_pct', 5.0):.1f}%</code>\n\n"
+        f"8. <b>Порог дешёвых (CHEAP_THRESHOLD):</b> <code>{state.cheap_price_threshold:.2f} TON</code>\n"
         f"   <i>(Любой подарок с ценой ниже этого порога считается выгодным)</i>\n\n"
-        f"8. <b>⚡ Интервал сканирования ({interval_mode}):</b> <code>{state.scan_interval:.2f} с</code>{p429_badge}\n"
+        f"9. <b>⚡ Интервал сканирования ({interval_mode}):</b> <code>{state.scan_interval:.2f} с</code>{p429_badge}\n"
         f"   <i>(Пауза между запросами; при установке вручную авто-адаптация отключается)</i>\n\n"
-        f"9. <b>🛑 Фильтр макс. цены подарка:</b> <code>{max_price_str}</code>\n"
+        f"10. <b>🛑 Фильтр макс. цены подарка:</b> <code>{max_price_str}</code>\n"
         f"   <i>(Подарки с ценой выше этого значения сканер сразу игнорирует)</i>"
     )
 
@@ -1510,6 +1526,15 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
         text = format_settings_text(scanner_state)
         await safe_edit_text(cb.message, text, reply_markup=settings_keyboard(scanner_state), parse_mode="HTML")
 
+    @dp.callback_query(F.data == "toggle_eval_mode")
+    async def cb_toggle_eval_mode(cb: CallbackQuery):
+        cur = getattr(scanner_state, "eval_mode", "tiered")
+        scanner_state.eval_mode = "fixed" if cur == "tiered" else "tiered"
+        save_settings(scanner_state)
+        mode_label = "🪜 Ступенчатый (3 тира)" if scanner_state.eval_mode == "tiered" else "📏 Фиксированный"
+        await cb.answer(f"Режим оценки: {mode_label}")
+        text = format_settings_text(scanner_state)
+        await safe_edit_text(cb.message, text, reply_markup=settings_keyboard(scanner_state), parse_mode="HTML")
 
     @dp.callback_query(F.data == "set_turnover_ratio")
     async def cb_set_turnover_ratio(cb: CallbackQuery, state: FSMContext):
@@ -2605,6 +2630,10 @@ async def send_deal_notification(
         net_profit = deal["net_profit_ton"]
         margin_pct = deal.get("margin_pct", 0.0)
         text += f"📈 <b>Чистыми (после 2% + 0.1 TON):</b> <code>+{net_profit:.2f} TON</code> (ROI: <b>{margin_pct:+.1f}%</b>)\n"
+    if deal.get("tier"):
+        rp = deal.get("req_profit", 0.0)
+        rm = deal.get("req_margin", 0.0)
+        text += f"🪜 <b>Тир сделки:</b> {deal['tier']} (требовалось: ≥ <code>{rp:.1f} TON</code> и <code>{rm:.1f}%</code>)\n"
     text += f"🎨 <b>Фон:</b> {backdrop}\n"
 
     if deal.get("turnover_ratio") is not None:
@@ -2701,6 +2730,10 @@ async def send_autobuy_success_report(
         net_profit = deal["net_profit_ton"]
         margin_pct = deal.get("margin_pct", 0.0)
         text += f"📈 <b>Чистыми (после 2% + 0.1 TON):</b> <code>+{net_profit:.2f} TON</code> (ROI: <b>{margin_pct:+.1f}%</b>)\n"
+    if deal.get("tier"):
+        rp = deal.get("req_profit", 0.0)
+        rm = deal.get("req_margin", 0.0)
+        text += f"🪜 <b>Тир сделки:</b> {deal['tier']} (требовалось: ≥ <code>{rp:.1f} TON</code> и <code>{rm:.1f}%</code>)\n"
     text += (
         f"🎨 <b>Фон:</b> {backdrop}\n"
         f"📦 <b>Хранилище:</b> {vault_str}\n"

@@ -27,6 +27,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "cheap_price_threshold": 3.0,
     "max_gift_price_ton": 0.0,
     "min_margin_pct": 5.0,
+    "eval_mode": "tiered",
     "min_turnover_ratio": 0.0,
     "scan_interval": 0.8,
     "notify_categories": {
@@ -121,6 +122,9 @@ def load_settings() -> dict[str, Any]:
                                 data["min_margin_pct"] = float(data["min_margin_pct"])
                             except (ValueError, TypeError):
                                 data["min_margin_pct"] = 5.0
+                        if "eval_mode" in data:
+                            em = str(data["eval_mode"]).lower()
+                            data["eval_mode"] = em if em in ("tiered", "fixed") else "tiered"
                         log.info("Загружены персистентные настройки из %s", path)
                         return data
             except Exception as e:
@@ -140,6 +144,7 @@ def save_settings(state_or_dict: Any) -> bool:
         prim_tok = pool.primary_token if pool else ""
         raw_cats = getattr(state, "notify_categories", DEFAULT_SETTINGS["notify_categories"])
         norm_cats = normalize_notify_categories(raw_cats)
+        em = str(getattr(state, "eval_mode", "tiered")).lower()
         data = {
             "auto_buy": bool(getattr(state, "auto_buy", False)),
             "filter_by_balance": bool(getattr(state, "filter_by_balance", False)),
@@ -147,6 +152,7 @@ def save_settings(state_or_dict: Any) -> bool:
             "cheap_price_threshold": float(getattr(state, "cheap_price_threshold", 3.0)),
             "max_gift_price_ton": float(getattr(state, "max_gift_price_ton", 0.0)),
             "min_margin_pct": float(getattr(state, "min_margin_pct", 5.0)),
+            "eval_mode": em if em in ("tiered", "fixed") else "tiered",
             "min_turnover_ratio": float(getattr(state, "min_turnover_ratio", 0.0)),
             "scan_interval": float(getattr(state, "scan_interval", 0.5)),
             "notify_categories": norm_cats,
@@ -167,6 +173,9 @@ def save_settings(state_or_dict: Any) -> bool:
                 data["min_margin_pct"] = float(data["min_margin_pct"])
             except (ValueError, TypeError):
                 data["min_margin_pct"] = 5.0
+        if "eval_mode" in data:
+            em = str(data["eval_mode"]).lower()
+            data["eval_mode"] = em if em in ("tiered", "fixed") else "tiered"
     else:
         log.error("save_settings: недопустимый тип %s", type(state_or_dict))
         return False
