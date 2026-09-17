@@ -448,7 +448,7 @@ def format_main_text(state: ScannerState) -> str:
     return (
         f"🤖 <b>MRKT Scanner Manager</b>\n\n"
         f"Статус: {status_icon}\n"
-        f"⏱ Аптайм: <code>{state.uptime_str()}</code>\n"
+        f"⏱ Аптайм: <code>{state.uptime_str()}</code> | 🕒 <code>{datetime.now().strftime('%H:%M:%S')}</code>\n"
         f"📊 Сканов: <code>{state.scans_count:,}</code> | 🎯 Сделок: <code>{state.deals_count}</code>\n"
         f"📦 В хранилище: <b>{vault_count}</b> сделок\n\n"
         f"⚙️ <b>Параметры:</b>\n"
@@ -611,9 +611,12 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
     @dp.callback_query(F.data == "nav_main")
     async def cb_nav_main(cb: CallbackQuery, state: FSMContext):
         await state.clear()
+        await cb.answer("🔄 Статус обновлен")
         text = format_main_text(scanner_state)
-        await cb.message.edit_text(text, reply_markup=main_keyboard(scanner_state), parse_mode="HTML")
-        await cb.answer()
+        try:
+            await cb.message.edit_text(text, reply_markup=main_keyboard(scanner_state), parse_mode="HTML")
+        except Exception:
+            pass
 
     # ── Управление сканером (Пауза/Старт) ─────────────────────────────────
     @dp.callback_query(F.data == "scanner_pause")
@@ -1636,7 +1639,18 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
                 pass
 
             repo_dir = Path(__file__).resolve().parent
-            # Выполняем fetch и reset --hard, чтобы гарантированно синхронизироваться без конфликтов
+
+            # Проверяем текущий коммит
+            p_local = await asyncio.create_subprocess_exec(
+                "git", "rev-parse", "HEAD",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(repo_dir),
+            )
+            out_local, _ = await p_local.communicate()
+            current_head = out_local.decode("utf-8", errors="replace").strip()
+
+            # Выполняем fetch
             fetch_proc = await asyncio.create_subprocess_exec(
                 "git", "fetch", "origin", "main",
                 stdout=asyncio.subprocess.PIPE,
@@ -1644,6 +1658,26 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
                 cwd=str(repo_dir),
             )
             await fetch_proc.communicate()
+
+            # Проверяем удаленный коммит
+            p_remote = await asyncio.create_subprocess_exec(
+                "git", "rev-parse", "origin/main",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(repo_dir),
+            )
+            out_remote, _ = await p_remote.communicate()
+            remote_head = out_remote.decode("utf-8", errors="replace").strip()
+
+            if current_head and remote_head and current_head == remote_head:
+                await status_msg.edit_text(
+                    f"✅ <b>Бот уже обновлен до последней версии!</b>\n\n"
+                    f"Текущий коммит: <code>{current_head[:8]}</code>\n"
+                    f"Новых изменений в репозитории нет.",
+                    parse_mode="HTML",
+                    reply_markup=back_to_menu_keyboard("nav_main"),
+                )
+                return
 
             proc = await asyncio.create_subprocess_exec(
                 "git", "reset", "--hard", "origin/main",
@@ -1659,15 +1693,6 @@ async def run_telegram_bot(bot_token: str, admin_ids: set[int], scanner_state: S
                 await status_msg.edit_text(
                     f"❌ <b>Ошибка при обновлении git (код {proc.returncode}):</b>\n\n"
                     f"<code>{html.escape(err or out or 'Неизвестная ошибка')}</code>",
-                    parse_mode="HTML",
-                    reply_markup=back_to_menu_keyboard("nav_main"),
-                )
-                return
-
-            if "Already up to date" in out or "Уже обновлено" in out:
-                await status_msg.edit_text(
-                    f"✅ <b>Бот уже обновлен до последней версии!</b>\n\n"
-                    f"<code>{html.escape(out)}</code>",
                     parse_mode="HTML",
                     reply_markup=back_to_menu_keyboard("nav_main"),
                 )
